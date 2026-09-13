@@ -140,13 +140,27 @@ endif()
 
 list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
 
+# PAM and the systemd/seat session model are Linux-only. Windows gets
+# fail-closed implementations of the same interfaces until SSPI + the DUO Auth
+# API and a WTS session supervisor exist - see AUTH-AND-DUO.md.
+if(WIN32)
+    set(PLANK_PLATFORM_AUTH_SESSION_SOURCES
+            "${CMAKE_SOURCE_DIR}/src/auth/pam_client_win32.cpp"
+            "${CMAKE_SOURCE_DIR}/src/auth/second_factor.h"
+            "${CMAKE_SOURCE_DIR}/src/auth/second_factor.cpp"
+            "${CMAKE_SOURCE_DIR}/src/session/session_context_win32.cpp")
+else()
+    set(PLANK_PLATFORM_AUTH_SESSION_SOURCES
+            "${CMAKE_SOURCE_DIR}/src/auth/pam_client.cpp"
+            "${CMAKE_SOURCE_DIR}/src/session/session_context.cpp")
+endif()
+
 set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/auth/pam_broker_protocol.h"
-        "${CMAKE_SOURCE_DIR}/src/auth/pam_client.cpp"
         "${CMAKE_SOURCE_DIR}/src/auth/pam_client.h"
         "${CMAKE_SOURCE_DIR}/src/auth/web_auth.cpp"
         "${CMAKE_SOURCE_DIR}/src/auth/web_auth.h"
-        "${CMAKE_SOURCE_DIR}/src/session/session_context.cpp"
+        ${PLANK_PLATFORM_AUTH_SESSION_SOURCES}
         "${CMAKE_SOURCE_DIR}/src/session/session_context.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Limelight.h"

@@ -17,8 +17,10 @@
 #include <type_traits>
 #include <vector>
 
-#include <sys/socket.h>
-#include <unistd.h>
+#ifndef _WIN32
+  #include <sys/socket.h>
+  #include <unistd.h>
+#endif
 
 namespace plank::auth {
   constexpr std::uint32_t wire_magic = 0x504c4150U;  ///< ASCII `PLAP` in host notation.
@@ -241,6 +243,8 @@ namespace plank::auth {
     message.payload.assign(frame.begin() + sizeof(header), frame.end());
     return true;
   }
+#ifndef _WIN32
+  // Socket transport is POSIX-only; encode/decode above stays portable.
 
   /**
    * @brief Write every byte, retrying interrupted system calls.
@@ -338,4 +342,5 @@ namespace plank::auth {
     }
     return decode_message(frame, message);
   }
+#endif  // !_WIN32
 }  // namespace plank::auth

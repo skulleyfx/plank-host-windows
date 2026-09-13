@@ -96,5 +96,13 @@ namespace stream {
      * @return Current lifecycle state for the stream session.
      */
     state_e state(session_t &session);
+    /**
+     * @brief Record that the native setup reply has been delivered to the client.
+     *
+     * Control-channel data such as cursor shapes is held until this is called.
+     *
+     * @param session Active streaming session.
+     */
+    void mark_setup_response_sent(session_t &session);
   }  // namespace session
 }  // namespace stream

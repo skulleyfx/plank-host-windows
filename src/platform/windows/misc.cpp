@@ -38,6 +38,7 @@
  */
 #define NTDDI_VERSION NTDDI_WIN10
 #include <Shlwapi.h>
+#include <ShlObj.h>
 
 // local includes
 #include "misc.h"
@@ -137,6 +138,18 @@ namespace platf {
   decltype(WlanSetInterface) *fn_WlanSetInterface = nullptr;  ///< Fn wlan set interface.
 
   std::filesystem::path appdata() {
+#ifdef PLANK_PRODUCT_BUILD
+    // A packaged host runs as a service, so its state lives in one
+    // machine-wide, administrator-controlled location rather than beside the
+    // executable: %ProgramData%\PLANK.
+    PWSTR program_data = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, 0, nullptr, &program_data))) {
+      std::filesystem::path path {program_data};
+      CoTaskMemFree(program_data);
+      return path / L"PLANK"sv;
+    }
+    CoTaskMemFree(program_data);
+#endif
     WCHAR sunshine_path[MAX_PATH];
     GetModuleFileNameW(nullptr, sunshine_path, _countof(sunshine_path));
     return std::filesystem::path {sunshine_path}.remove_filename() / L"config"sv;

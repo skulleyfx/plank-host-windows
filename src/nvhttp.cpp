@@ -4,10 +4,14 @@
  */
 // macros
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
-#include "auth/pam_broker_channel.h"
+#ifdef __linux__
+  #include "auth/pam_broker_channel.h"  // POSIX sockets; Windows authenticates in-process
+#endif
 
 // standard includes
 #include <algorithm>
+
+#include "src/plank_win32_compat.h"
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -30,7 +34,9 @@
 #include <nlohmann/json.hpp>
 #include <Simple-Web-Server/server_http.hpp>
 
-#include <unistd.h>
+#ifndef _WIN32
+  #include <unistd.h>
+#endif
 
 #ifdef PLANK_TRANSPORT
 #include <openssl/crypto.h>
@@ -76,6 +82,35 @@ namespace nvhttp {
 
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
+
+  /**
+   * @brief PLANK capture sources this platform can offer.
+   *
+   * The set is platform-specific: NvFBC and the 10-bit X11 path exist only on
+   * Linux, DXGI Desktop Duplication and Windows.Graphics.Capture only on
+   * Windows. Availability of a named source is a separate runtime question
+   * answered by video::capture_source_available().
+   */
+  constexpr std::string_view plank_capture_sources() {
+#ifdef _WIN32
+    // "nvfbc" is advertised as an alias for 8-bit desktop capture so existing
+    // clients, which only know the Linux source names, can connect.
+    return "nvfbc,ddup,wgc";
+#else
+    return "nvfbc,x11-native10";
+#endif
+  }
+
+  /**
+   * @brief Whether a client-requested capture source is known to this platform.
+   */
+  bool plank_capture_source_supported(std::string_view source) {
+#ifdef _WIN32
+    return source == "nvfbc" || source == "ddup" || source == "wgc";
+#else
+    return source == "nvfbc" || source == "x11-native10";
+#endif
+  }
 
   constexpr std::string_view runtime_display_state =
     "/run/plank/host/display-state"sv;
@@ -890,8 +925,7 @@ namespace nvhttp {
                "PLANK capture-source negotiation is required");
       return false;
     }
-    if (session.capture_source != "nvfbc" &&
-        session.capture_source != "x11-native10") {
+    if (!plank_capture_source_supported(session.capture_source)) {
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message",
                "Unsupported PLANK capture source");
@@ -1196,7 +1230,8 @@ namespace nvhttp {
         video::nvenc_direct_supports_h264_444_8bit() ||
         video::nvenc_direct_supports_hevc_444_8bit() ||
         video::nvenc_direct_supports_hevc_444_10bit()) {
-#if defined(SUNSHINE_BUILD_CUDA)
+#if defined(SUNSHINE_BUILD_CUDA) || defined(_WIN32)
+      // Windows D3D11 conversion applies the identity-GBR colour vectors too.
       codec_mode_flags |= SCM_IDENTITY_GBR_444;
 #endif
     }
@@ -1275,7 +1310,7 @@ namespace nvhttp {
     tree.put("root.PlankWorkerInstance", worker_instance_id());
     tree.put("root.PlankTopologyVersion", plank_topology_version);
     tree.put("root.PlankFeatureFlags", plank_topology_features);
-    tree.put("root.PlankCaptureSources", "nvfbc,x11-native10");
+    tree.put("root.PlankCaptureSources", plank_capture_sources());
     tree.put("root.PlankEncoderBackends", "software-cuda,nvenc-direct");
     tree.put("root.PlankEncodingModes", get_plank_encoding_modes());
     tree.put("root.MaxLumaPixelsHEVC",
@@ -1684,6 +1719,7 @@ namespace nvhttp {
     // launch will store it in host_audio
     bool host_audio {};
 
+#ifdef __linux__
     const int broker_probe = plank::auth::broker_channel::request_connection();
     if (broker_probe < 0) {
       BOOST_LOG(fatal) << "PLANK PAM broker is unavailable; refusing to start session negotiation"sv;
@@ -1691,6 +1727,9 @@ namespace nvhttp {
       return;
     }
     close(broker_probe);
+#endif
+    // On Windows there is no broker: pam_client_win32.cpp authenticates
+    // in-process (LogonUser + second factor).
     web_auth = std::make_unique<plank::auth::web_auth_manager_t>(
       plank::auth::pam_conversation_factory(),
       plank::auth::secure_random_hex

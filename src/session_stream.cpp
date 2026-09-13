@@ -164,6 +164,7 @@ namespace session_stream {
     int status {PLANK_TRANSPORT_SETUP_STATUS_INTERNAL_ERROR};
     std::string message;
     nlohmann::json response;
+    std::shared_ptr<stream::session_t> session;  ///< Started stream, when status is OK.
   };
 
   std::optional<std::uint32_t> negotiated_video_format_for_mode(
@@ -209,6 +210,12 @@ namespace session_stream {
     config.monitor.encoder_backend = launch_session->encoder_backend;
     if (launch_session->capture_source == "nvfbc") {
       config.monitor.capture_source = video::capture_source_e::nvfbc_8bit;
+#ifdef _WIN32
+    } else if (launch_session->capture_source == "ddup" ||
+               launch_session->capture_source == "wgc") {
+      // Both are 8-bit desktop capture; the session path treats them alike.
+      config.monitor.capture_source = video::capture_source_e::nvfbc_8bit;
+#endif
     } else if (launch_session->capture_source == "x11-native10") {
       config.monitor.capture_source = video::capture_source_e::x11_native10;
     } else {
@@ -402,6 +409,7 @@ namespace session_stream {
     }
 
     result.status = PLANK_TRANSPORT_SETUP_STATUS_OK;
+    result.session = stream_session;
     const auto host_feature_flags =
       static_cast<std::uint32_t>(platf::get_capabilities() |
                                  platf::platform_caps::dynamic_video_bitrate |
@@ -501,6 +509,8 @@ namespace session_stream {
         plank_transport_native_data_send(endpoint, packet.data(), response_size) !=
           PLANK_TRANSPORT_OK) {
       BOOST_LOG(error) << "Unable to return native session negotiation result"sv;
+    } else if (start_result.session) {
+      stream::session::mark_setup_response_sent(*start_result.session);
     }
   }
 

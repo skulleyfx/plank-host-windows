@@ -4,6 +4,8 @@
  */
 #pragma once
 
+
+#include "src/plank_win32_compat.h"
 #include <cstdint>
 #include <functional>
 #include <memory>

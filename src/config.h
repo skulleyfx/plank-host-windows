@@ -267,6 +267,18 @@ namespace config {
   /**
    * @brief Top-level Sunshine configuration and credential state.
    */
+  /**
+   * @brief Host authentication policy.
+   *
+   * On Linux the PAM stack supplies second factor, so PLANK needs no setting.
+   * Windows has no PAM, so the provider is selected here. See AUTH-AND-DUO.md.
+   */
+  struct plank_auth_t {
+    std::string second_factor;  ///< Provider name, e.g. "none" or "duo".
+    std::string second_factor_failmode;  ///< "deny" (default) or "allow" when unreachable.
+    bool allow_remote_desktop_session;  ///< Attest an RDP session, not only the physical console. Default false.
+  };
+
   struct sunshine_t {
     int min_log_level;  ///< Minimum severity level written to the configured log sink.
     std::bitset<flag::FLAG_SIZE> flags;  ///< Runtime flags parsed from command-line options.
@@ -288,6 +300,7 @@ namespace config {
     std::string startup_layout;  ///< PLANK physical or virtual display policy applied before the display manager starts.
   };
 
+  extern plank_auth_t plank_auth;
   extern video_t video;
   extern audio_t audio;
   extern stream_t stream;

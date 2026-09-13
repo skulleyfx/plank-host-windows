@@ -707,6 +707,12 @@ namespace config {
   /**
    * @brief Default video configuration values used before file and CLI overrides.
    */
+  plank_auth_t plank_auth {
+    "none"s,  // no second factor unless configured; the provider logs loudly
+    "deny"s,  // fail closed when a provider is unreachable
+    false,  // physical console only unless explicitly enabled
+  };
+
   video_t video {
     28,  // qp
 
@@ -847,14 +853,18 @@ namespace config {
   sunshine_t sunshine {
     2,  // min_log_level
     0,  // flags
-#ifdef PLANK_PRODUCT_BUILD
+#if defined(PLANK_PRODUCT_BUILD) && defined(_WIN32)
+    (platf::appdata() / "host.conf").string(),  // config file: %ProgramData%\PLANK\host.conf
+#elif defined(PLANK_PRODUCT_BUILD)
     "/etc/plank/host.conf",  // config file
 #else
     platf::appdata().string() + "/sunshine.conf",  // config file
 #endif
     {},  // cmd args
     28989,  // Base port number
-#ifdef PLANK_PRODUCT_BUILD
+#if defined(PLANK_PRODUCT_BUILD) && defined(_WIN32)
+    (platf::appdata() / "host.log").string(),  // log file: %ProgramData%\PLANK\host.log
+#elif defined(PLANK_PRODUCT_BUILD)
     "/var/log/plank/host.log",  // log file
 #else
     platf::appdata().string() + "/sunshine.log",  // log file
@@ -1553,6 +1563,12 @@ namespace config {
     // media worker accepts the shared configuration without owning auth policy.
     bool broker_allow_root_login = false;
     bool_f(vars, "allow_root_login", broker_allow_root_login);
+
+    // Windows has no PAM stack, so the second-factor provider is named here.
+    // Unknown names fail closed in make_second_factor(); see AUTH-AND-DUO.md.
+    string_f(vars, "second_factor", plank_auth.second_factor);
+    string_f(vars, "second_factor_failmode", plank_auth.second_factor_failmode);
+    bool_f(vars, "allow_remote_desktop_session", plank_auth.allow_remote_desktop_session);
 
     string_f(vars, "audio_sink", audio.sink);
 

@@ -1113,13 +1113,52 @@ namespace platf {
     return display_names;
   }
 
+  /**
+   * @brief Report which PLANK capture sources this host can serve.
+   *
+   * DXGI Desktop Duplication and Windows.Graphics.Capture both require an
+   * interactive session with attached outputs, so availability is decided by
+   * whether any display enumerates - the same test display() performs.
+   */
+  bool plank_capture_source_available(std::string_view source_name) {
+    // "nvfbc" is accepted as the protocol name for 8-bit desktop capture,
+    // which Windows serves through DXGI; see plank_capture_sources().
+    if (source_name != "nvfbc" && source_name != "ddup" && source_name != "wgc") {
+      return false;
+    }
+    return !display_names(mem_type_e::dxgi).empty();
+  }
+
   std::vector<display_info_t> display_infos(mem_type_e hwdevice_type) {
     std::vector<display_info_t> outputs;
     for (const auto &name : display_names(hwdevice_type)) {
+      // PLANK clients reject outputs without geometry, so read the active mode
+      // for each GDI device name DXGI reported.
+      DEVMODEW mode {};
+      mode.dmSize = sizeof(mode);
+      const auto wide_name = utf_utils::from_utf8(name);
+      if (!EnumDisplaySettingsExW(wide_name.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0) ||
+          mode.dmPelsWidth == 0 || mode.dmPelsHeight == 0) {
+        BOOST_LOG(warning) << "Unable to read the active mode of "sv << name << "; omitting it from the PLANK topology"sv;
+        continue;
+      }
+      const int rotation = mode.dmDisplayOrientation == DMDO_90  ? 90 :
+                           mode.dmDisplayOrientation == DMDO_180 ? 180 :
+                           mode.dmDisplayOrientation == DMDO_270 ? 270 :
+                                                                   0;
       outputs.push_back(display_info_t {
         .id = "capture:"s + name,
         .name = name,
         .capture_name = name,
+        .x = mode.dmPosition.x,
+        .y = mode.dmPosition.y,
+        .width = static_cast<int>(mode.dmPelsWidth),
+        .height = static_cast<int>(mode.dmPelsHeight),
+        .rotation = rotation,
+        // dmDisplayFrequency of 0 or 1 means "hardware default", i.e. unknown.
+        .refresh_millihz = mode.dmDisplayFrequency > 1 ? static_cast<int>(mode.dmDisplayFrequency) * 1000 : 0,
+        // Windows places the primary monitor's origin at (0,0).
+        .primary = mode.dmPosition.x == 0 && mode.dmPosition.y == 0,
       });
     }
     return outputs;

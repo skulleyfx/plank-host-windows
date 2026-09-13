@@ -30,8 +30,7 @@ file(GLOB NVPREFS_FILES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/platform/windows/nvprefs/*.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/nvprefs/*.h")
 
-# vigem
-include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include")
+# vigem: removed - PLANK excludes gamepad/controller input (AGENTS.md)
 
 # sunshine icon
 if(NOT DEFINED SUNSHINE_ICON_PATH)
@@ -61,11 +60,6 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.h"
-        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
-        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
-        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"
-        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Util.h"
-        "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/km/BusShared.h"
         ${NVPREFS_FILES})
 
 set(OPENSSL_LIBRARIES
@@ -89,6 +83,7 @@ list(PREPEND PLATFORM_LIBRARIES
         shlwapi
         synchronization.lib
         userenv
+        wtsapi32
         ws2_32
         wsock32
 )

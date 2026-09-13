@@ -1,0 +1,258 @@
+/**
+ * @file src/auth/pam_client_win32.cpp
+ * @brief Windows host authentication: primary credential plus second factor.
+ *
+ * Mirrors the shape of the Linux PAM exchange behind the same `pam_client_t`
+ * interface, so `web_auth.cpp` and `nvhttp.cpp` need no platform knowledge:
+ *
+ *   1. begin()   -> challenge for the account password
+ *   2. respond() -> LogonUser() validates it, then the configured second-factor
+ *                   provider runs (see second_factor.h)
+ *   3. respond() -> provider result; approved yields `authenticated`
+ *
+ * The second factor is a pluggable provider rather than a specific vendor,
+ * matching how PAM lets any module participate on Linux. See AUTH-AND-DUO.md.
+ */
+
+#include "pam_client.h"
+
+#include <map>
+#include <mutex>
+
+#include <windows.h>
+
+#include "second_factor.h"
+#include "src/config.h"
+#include "src/logging.h"
+
+namespace plank::auth {
+  namespace {
+    constexpr std::int32_t prompt_style_password = 1;  ///< PAM_PROMPT_ECHO_OFF.
+
+    step_t denied(phase_e phase, int status, std::string_view reason) {
+      BOOST_LOG(warning) << "PLANK authentication denied: " << reason;
+      return {step_t::state_e::denied, {}, phase, status};
+    }
+
+    /**
+     * @brief Split "DOMAIN\\user" or "user@domain" into LogonUser arguments.
+     */
+    void split_account(const std::string &account, std::wstring &user, std::wstring &domain) {
+      auto widen = [](const std::string &value) {
+        if (value.empty()) {
+          return std::wstring {};
+        }
+        const int size = MultiByteToWideChar(CP_UTF8, 0, value.data(),
+                                             static_cast<int>(value.size()), nullptr, 0);
+        std::wstring result(static_cast<std::size_t>(size), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                            result.data(), size);
+        return result;
+      };
+
+      if (const auto slash = account.find('\\'); slash != std::string::npos) {
+        domain = widen(account.substr(0, slash));
+        user = widen(account.substr(slash + 1));
+        return;
+      }
+      if (const auto at = account.find('@'); at != std::string::npos) {
+        // LogonUser accepts a UPN with a null domain.
+        user = widen(account);
+        domain.clear();
+        return;
+      }
+      user = widen(account);
+      domain = L".";  // local account
+    }
+
+    /**
+     * @brief Validate an account password without creating a logon session.
+     *
+     * LOGON32_LOGON_NETWORK is a credential check only. It deliberately does
+     * NOT invoke Windows credential providers, which is exactly why a second
+     * factor must be applied separately here rather than assumed.
+     */
+    bool primary_credential_valid(const std::string &account, const std::string &password,
+                                  std::string &reason) {
+      std::wstring user;
+      std::wstring domain;
+      split_account(account, user, domain);
+
+      std::wstring secret;
+      if (!password.empty()) {
+        const int size = MultiByteToWideChar(CP_UTF8, 0, password.data(),
+                                             static_cast<int>(password.size()), nullptr, 0);
+        secret.resize(static_cast<std::size_t>(size), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, password.data(), static_cast<int>(password.size()),
+                            secret.data(), size);
+      }
+
+      HANDLE token = nullptr;
+      const BOOL ok = LogonUserW(user.c_str(), domain.empty() ? nullptr : domain.c_str(),
+                                 secret.c_str(), LOGON32_LOGON_NETWORK,
+                                 LOGON32_PROVIDER_DEFAULT, &token);
+      const DWORD last_error = ok ? ERROR_SUCCESS : GetLastError();
+
+      if (!secret.empty()) {
+        SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
+      }
+      if (token != nullptr) {
+        CloseHandle(token);
+      }
+      if (!ok) {
+        reason = "LogonUser failed (" + std::to_string(last_error) + ")";
+      }
+      return ok == TRUE;
+    }
+  }  // namespace
+
+  /**
+   * @brief Per-connection Windows authentication state.
+   */
+  struct win32_auth_state_t {
+    std::string account;
+    std::string remote_host;
+    std::unique_ptr<second_factor_t> factor;
+    bool awaiting_password {false};
+  };
+
+  namespace {
+    // One in-flight exchange per pam_client_t, keyed by object address, so the
+    // shared header needs no Windows-specific members. Guarded because
+    // nvhttp serves requests from multiple threads.
+    std::mutex &state_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
+    std::map<const void *, win32_auth_state_t> &state_table() {
+      static std::map<const void *, win32_auth_state_t> table;
+      return table;
+    }
+
+    win32_auth_state_t &state_for(const void *key) {
+      std::lock_guard lock {state_mutex()};
+      return state_table()[key];
+    }
+
+    void clear_state(const void *key) {
+      std::lock_guard lock {state_mutex()};
+      state_table().erase(key);
+    }
+
+    /**
+     * @brief Map a provider result onto the PAM-shaped step the callers expect.
+     */
+    step_t translate(const factor_step_t &factor) {
+      switch (factor.state) {
+        case factor_step_t::state_e::approved:
+          BOOST_LOG(info) << "PLANK second factor approved: " << factor.detail;
+          return {step_t::state_e::authenticated, {}, phase_e::authenticated, 0};
+        case factor_step_t::state_e::challenge:
+          return {step_t::state_e::challenge, factor.prompts, phase_e::authenticate, 0};
+        case factor_step_t::state_e::denied:
+        default:
+          return denied(phase_e::authenticate, -1,
+                        factor.detail.empty() ? "second factor denied" : factor.detail);
+      }
+    }
+  }  // namespace
+
+  pam_client_t::~pam_client_t() {
+    clear_state(this);
+  }
+
+  pam_client_t::pam_client_t(pam_client_t &&other) noexcept:
+      descriptor_ {other.descriptor_},
+      transaction_id_ {other.transaction_id_},
+      expected_responses_ {other.expected_responses_},
+      authenticated_ {other.authenticated_} {
+    other.descriptor_ = -1;
+  }
+
+  pam_client_t &pam_client_t::operator=(pam_client_t &&other) noexcept {
+    if (this != &other) {
+      descriptor_ = other.descriptor_;
+      transaction_id_ = other.transaction_id_;
+      expected_responses_ = other.expected_responses_;
+      authenticated_ = other.authenticated_;
+      other.descriptor_ = -1;
+    }
+    return *this;
+  }
+
+  step_t pam_client_t::begin(const std::filesystem::path &, std::uint64_t transaction_id,
+                             std::string_view username, std::string_view remote_host,
+                             std::string_view) {
+    transaction_id_ = transaction_id;
+    authenticated_ = false;
+
+    auto &state = state_for(this);
+    state.account.assign(username);
+    state.remote_host.assign(remote_host);
+    state.factor.reset();
+    state.awaiting_password = true;
+
+    expected_responses_ = 1;
+    return {step_t::state_e::challenge,
+            {prompt_t {prompt_style_password, "Password: "}},
+            phase_e::authenticate, 0};
+  }
+
+  step_t pam_client_t::respond(std::vector<std::string> responses) {
+    auto &state = state_for(this);
+
+    if (state.awaiting_password) {
+      if (responses.size() != 1) {
+        return denied(phase_e::protocol, -1, "expected exactly one password response");
+      }
+      std::string password = std::move(responses.front());
+      std::string reason;
+      const bool valid = primary_credential_valid(state.account, password, reason);
+      SecureZeroMemory(password.data(), password.size());
+      state.awaiting_password = false;
+
+      if (!valid) {
+        return denied(phase_e::authenticate, -1, reason);
+      }
+
+      std::string error_message;
+      state.factor = make_second_factor(config::plank_auth.second_factor,
+                                        parse_failmode(config::plank_auth.second_factor_failmode),
+                                        error_message);
+      if (!state.factor) {
+        // Unknown provider: deny rather than degrade to password-only.
+        return denied(phase_e::authenticate, -1, error_message);
+      }
+
+      const auto step = translate(state.factor->begin(state.account, state.remote_host));
+      authenticated_ = step.state == step_t::state_e::authenticated;
+      expected_responses_ = step.prompts.size();
+      return step;
+    }
+
+    if (!state.factor) {
+      return denied(phase_e::protocol, -1, "no second-factor exchange in progress");
+    }
+    const auto step = translate(state.factor->respond(std::move(responses)));
+    authenticated_ = step.state == step_t::state_e::authenticated;
+    expected_responses_ = step.prompts.size();
+    return step;
+  }
+
+  void pam_client_t::close() {
+    clear_state(this);
+    descriptor_ = -1;
+    transaction_id_ = 0;
+    expected_responses_ = 0;
+    authenticated_ = false;
+  }
+
+  bool pam_client_t::connected() const {
+    return transaction_id_ != 0;
+  }
+
+  step_t pam_client_t::read_step() {
+    return denied(phase_e::protocol, -1, "read_step is not used by the Windows broker");
+  }
+}  // namespace plank::auth

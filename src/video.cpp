@@ -1694,6 +1694,11 @@ namespace video {
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     return nvenc_direct_qualified && nvenc_direct.h264[encoder_t::PASSED] &&
            nvenc_direct.h264[encoder_t::YUV444];
+#elif defined(_WIN32)
+    // Windows has no CUDA nvenc-direct; the probed D3D11 NVENC encoder is the
+    // equivalent direct NVENC path.
+    return chosen_encoder == &nvenc && nvenc.h264[encoder_t::PASSED] &&
+           nvenc.h264[encoder_t::YUV444];
 #else
     return false;
 #endif
@@ -1703,6 +1708,9 @@ namespace video {
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     return nvenc_direct_qualified && nvenc_direct.hevc[encoder_t::PASSED] &&
            nvenc_direct.hevc[encoder_t::YUV444];
+#elif defined(_WIN32)
+    return chosen_encoder == &nvenc && nvenc.hevc[encoder_t::PASSED] &&
+           nvenc.hevc[encoder_t::YUV444];
 #else
     return false;
 #endif
@@ -1718,6 +1726,12 @@ namespace video {
   }
 
   bool encoder_backend_available(std::string_view backend) {
+#if defined(_WIN32)
+    if (backend == "nvenc-direct"sv) {
+      return nvenc_direct_supports_h264_444_8bit() ||
+             nvenc_direct_supports_hevc_444_8bit();
+    }
+#endif
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     if (backend == "nvenc-direct"sv) {
       return nvenc_direct_supports_h264_444_8bit() ||
@@ -1756,6 +1770,13 @@ namespace video {
     if (mode == "hevc-10-444-nvenc"sv) {
       return nvenc_direct_supports_hevc_444_10bit();
     }
+#elif defined(_WIN32)
+    if (mode == "h264-8-444-nvenc"sv) {
+      return nvenc_direct_supports_h264_444_8bit();
+    }
+    if (mode == "hevc-8-444-nvenc"sv) {
+      return nvenc_direct_supports_hevc_444_8bit();
+    }
 #else
     (void) mode;
 #endif
@@ -1763,7 +1784,7 @@ namespace video {
   }
 
   bool capture_source_available(std::string_view source) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     return platf::plank_capture_source_available(source);
 #else
     return false;
@@ -1778,6 +1799,11 @@ namespace video {
     chosen_encoder = backend == "nvenc-direct"sv ? &nvenc_direct : &software_cuda;
     BOOST_LOG(info) << "PLANK selected per-session encoder backend ["sv
                     << chosen_encoder->name << ']';
+    return true;
+#elif defined(_WIN32)
+    // encoder_backend_available() has confirmed the probe chose D3D11 NVENC.
+    BOOST_LOG(info) << "PLANK selected per-session encoder backend ["sv
+                    << chosen_encoder->name << "] for nvenc-direct"sv;
     return true;
 #else
     return false;

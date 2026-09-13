@@ -368,6 +368,26 @@ namespace raw_hid {
 #endif
     }
 
+    /**
+     * @brief Stop the UHID poller and remove endpoints without clearing a pending attach.
+     */
+    bool replace_group() {
+#ifdef __linux__
+      poll_thread_.request_stop();
+      if (poll_thread_.joinable() && poll_thread_.get_id() != std::this_thread::get_id()) {
+        poll_thread_.join();
+      }
+      std::lock_guard lock {mutex_};
+      destroy_interfaces();
+      retained_device_.reset();
+      retained_descriptors_.clear();
+      return create_group();
+#else
+      // No UHID endpoints exist on Windows; create_group() reports ENOTSUP.
+      return create_group();
+#endif
+    }
+
 #ifdef __linux__
     /**
      * @brief Write a complete event to a UHID endpoint.
@@ -396,21 +416,6 @@ namespace raw_hid {
         close(fd);
       }
       uhid_fds_.clear();
-    }
-
-    /**
-     * @brief Stop the UHID poller and remove endpoints without clearing a pending attach.
-     */
-    bool replace_group() {
-      poll_thread_.request_stop();
-      if (poll_thread_.joinable() && poll_thread_.get_id() != std::this_thread::get_id()) {
-        poll_thread_.join();
-      }
-      std::lock_guard lock {mutex_};
-      destroy_interfaces();
-      retained_device_.reset();
-      retained_descriptors_.clear();
-      return create_group();
     }
 
     /**

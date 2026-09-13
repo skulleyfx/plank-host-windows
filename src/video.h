@@ -31,6 +31,8 @@ namespace video {
     configured,
     nvfbc_8bit,
     x11_native10,
+    ddup,  ///< Windows DXGI Desktop Duplication.
+    wgc,  ///< Windows.Graphics.Capture.
   };
 
   struct software_rate_control_t {

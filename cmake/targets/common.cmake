@@ -35,8 +35,15 @@ if(PLANK_PRODUCT_BUILD)
 endif()
 
 if(PLANK_ENABLE_TRANSPORT)
-    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        message(FATAL_ERROR "The PLANK transport is Linux-only")
+    # The transport is portable Rust; it builds for linux-gnu, windows-msvc and
+    # windows-gnu from identical source. The host links MinGW, so Windows uses
+    # the *-gnu target.
+    if(WIN32)
+        set(PLANK_TRANSPORT_RUST_TARGET "x86_64-pc-windows-gnu")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(PLANK_TRANSPORT_RUST_TARGET "")
+    else()
+        message(FATAL_ERROR "No PLANK transport Rust target configured for ${CMAKE_SYSTEM_NAME}")
     endif()
     if(NOT PLANK_TRANSPORT_DIR)
         cmake_path(ABSOLUTE_PATH CMAKE_SOURCE_DIR
@@ -59,10 +66,20 @@ if(PLANK_ENABLE_TRANSPORT)
     endif()
 
     find_program(PLANK_CARGO_EXECUTABLE NAMES cargo REQUIRED)
+    if(PLANK_TRANSPORT_RUST_TARGET)
+        set(PLANK_TRANSPORT_CARGO_TARGET_ARGS --target "${PLANK_TRANSPORT_RUST_TARGET}")
+    else()
+        set(PLANK_TRANSPORT_CARGO_TARGET_ARGS)
+    endif()
     set(PLANK_TRANSPORT_CARGO_TARGET_DIR
             "${CMAKE_BINARY_DIR}/plank-transport-cargo")
-    set(PLANK_TRANSPORT_LIBRARY
-            "${PLANK_TRANSPORT_CARGO_TARGET_DIR}/release/libplank_transport.a")
+    if(PLANK_TRANSPORT_RUST_TARGET)
+        set(PLANK_TRANSPORT_LIBRARY
+                "${PLANK_TRANSPORT_CARGO_TARGET_DIR}/${PLANK_TRANSPORT_RUST_TARGET}/release/libplank_transport.a")
+    else()
+        set(PLANK_TRANSPORT_LIBRARY
+                "${PLANK_TRANSPORT_CARGO_TARGET_DIR}/release/libplank_transport.a")
+    endif()
     set(PLANK_TRANSPORT_CARGO_FEATURES "" CACHE STRING
             "Comma-separated PLANK transport Cargo features")
     set(PLANK_TRANSPORT_CARGO_FEATURE_ARGS)
@@ -77,6 +94,7 @@ if(PLANK_ENABLE_TRANSPORT)
                     "CARGO_TARGET_DIR=${PLANK_TRANSPORT_CARGO_TARGET_DIR}"
                     "${PLANK_CARGO_EXECUTABLE}" build
                     --locked --offline --release
+                    ${PLANK_TRANSPORT_CARGO_TARGET_ARGS}
                     ${PLANK_TRANSPORT_CARGO_FEATURE_ARGS}
                     --manifest-path "${PLANK_TRANSPORT_DIR}/Cargo.toml"
             WORKING_DIRECTORY "${PLANK_TRANSPORT_DIR}"
@@ -86,12 +104,19 @@ if(PLANK_ENABLE_TRANSPORT)
     target_include_directories(sunshine PRIVATE
             "${PLANK_TRANSPORT_DIR}/include")
     target_compile_definitions(sunshine PRIVATE PLANK_TRANSPORT=1)
-    target_link_libraries(sunshine
-            "${PLANK_TRANSPORT_LIBRARY}"
-            ${CMAKE_DL_LIBS}
-            Threads::Threads
-            m
-            rt)
+    if(WIN32)
+        # Rust std on windows-gnu pulls these; dl/rt/m are POSIX-only.
+        target_link_libraries(sunshine
+                "${PLANK_TRANSPORT_LIBRARY}"
+                ws2_32 userenv ntdll bcrypt advapi32 secur32)
+    else()
+        target_link_libraries(sunshine
+                "${PLANK_TRANSPORT_LIBRARY}"
+                ${CMAKE_DL_LIBS}
+                Threads::Threads
+                m
+                rt)
+    endif()
     set_property(TARGET sunshine APPEND PROPERTY LINK_DEPENDS
             "${PLANK_TRANSPORT_LIBRARY}")
 endif()

@@ -5,6 +5,8 @@
 
 #include "web_auth.h"
 
+
+#include "src/plank_win32_compat.h"
 #include "../session/session_context.h"
 
 #include <algorithm>
@@ -14,8 +16,13 @@
 
 #include <openssl/rand.h>
 
-#include <pwd.h>
-#include <unistd.h>
+#ifndef _WIN32
+  #include <pwd.h>
+  #include <unistd.h>
+#else
+  #include <windows.h>
+  #include <vector>
+#endif
 
 namespace plank::auth {
   namespace {
@@ -233,6 +240,40 @@ namespace plank::auth {
     const std::string account {username};
     constexpr std::size_t minimum_buffer_size = 1024;
     constexpr std::size_t maximum_buffer_size = 1024 * 1024;
+#ifdef _WIN32
+    // Windows has no POSIX uid. Use the relative identifier (RID) - the final
+    // sub-authority of the account SID - as a stable numeric identity. This
+    // MUST match session_context_win32.cpp's account_rid(), because the two are
+    // compared to decide whether an account owns the console session.
+    {
+      std::wstring wide(account.size(), L'\0');
+      if (!account.empty()) {
+        const int size = MultiByteToWideChar(CP_UTF8, 0, account.data(),
+                                             static_cast<int>(account.size()),
+                                             wide.data(), static_cast<int>(wide.size()));
+        wide.resize(static_cast<std::size_t>(size));
+      }
+      DWORD sid_size = 0;
+      DWORD domain_size = 0;
+      SID_NAME_USE use {};
+      LookupAccountNameW(nullptr, wide.c_str(), nullptr, &sid_size, nullptr, &domain_size, &use);
+      if (sid_size == 0) {
+        return std::nullopt;
+      }
+      std::vector<unsigned char> sid(sid_size);
+      std::wstring domain(domain_size, L'\0');
+      if (!LookupAccountNameW(nullptr, wide.c_str(), sid.data(), &sid_size,
+                              domain.data(), &domain_size, &use)) {
+        return std::nullopt;
+      }
+      auto *sid_pointer = reinterpret_cast<PSID>(sid.data());
+      const auto *count = GetSidSubAuthorityCount(sid_pointer);
+      if (count == nullptr || *count == 0) {
+        return std::nullopt;
+      }
+      return static_cast<uid_t>(*GetSidSubAuthority(sid_pointer, static_cast<DWORD>(*count - 1)));
+    }
+#else
     const long recommended_size = sysconf(_SC_GETPW_R_SIZE_MAX);
     std::size_t buffer_size = recommended_size > 0 ?
                                 static_cast<std::size_t>(recommended_size) :
@@ -255,6 +296,7 @@ namespace plank::auth {
       return std::nullopt;
     }
     return result->pw_uid;
+#endif
   }
 
   bool account_authorized_for_desktop(std::string_view username) {

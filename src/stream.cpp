@@ -113,6 +113,7 @@ namespace stream {
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
 
     std::atomic<session::state_e> state;  ///< Current lifecycle state observed by stream workers.
+    std::atomic_bool setup_response_sent {false};  ///< Native setup reply delivered; control data may follow.
   };
 
   /**
@@ -313,6 +314,9 @@ namespace stream {
     std::memcpy(&destination, &value, sizeof(value));
   }
 
+  // X11/EGL cursor capture; only localCursorThread (guarded below) calls these.
+  // The wire-format senders above stay portable.
+#if defined(__linux__) && defined(SUNSHINE_BUILD_X11)
   bool queue_cursor_shape(session_t *session, egl::cursor_t &image,
                           unsigned long &queued_serial) {
     if (image.serial == queued_serial) {
@@ -421,6 +425,105 @@ namespace stream {
     session->control.cursor_position_event->raise(position);
     return true;
   }
+#elif defined(_WIN32)
+  // Windows equivalents of the X11 helpers above: same wire format, with the
+  // pointer sampled through GetCursorInfo (see platform/windows/input.cpp).
+  bool queue_cursor_shape(session_t *session, const platf::win_cursor_image_t &image,
+                          std::uint64_t generation) {
+    const auto width = static_cast<std::uint32_t>(image.width);
+    const auto height = static_cast<std::uint32_t>(image.height);
+    const auto image_size_64 = static_cast<std::uint64_t>(width) * height * 4U;
+    if (width == 0 || height == 0 ||
+        width > PLANK_CURSOR_MAX_DIMENSION || height > PLANK_CURSOR_MAX_DIMENSION ||
+        image_size_64 > PLANK_CURSOR_MAX_IMAGE_SIZE ||
+        image_size_64 != image.pixels.size() ||
+        image.hotspot_x < 0 || image.hotspot_y < 0 ||
+        image.hotspot_x >= image.width || image.hotspot_y >= image.height) {
+      BOOST_LOG(error) << "Invalid Windows cursor geometry for PLANK local cursor transport: "sv
+                       << image.width << 'x' << image.height << " hotspot="sv
+                       << image.hotspot_x << ',' << image.hotspot_y;
+      return false;
+    }
+
+    const auto image_size = static_cast<std::uint32_t>(image_size_64);
+    std::vector<std::vector<std::uint8_t>> frames;
+    for (std::uint32_t offset = 0; offset < image_size;) {
+      const auto chunk_size = std::min<std::uint32_t>(
+        PLANK_CURSOR_MAX_CHUNK_SIZE, image_size - offset
+      );
+      std::vector<std::uint8_t> frame(sizeof(PLANK_CURSOR_WIRE_HEADER) + chunk_size);
+      PLANK_CURSOR_WIRE_HEADER header {};
+      write_cursor_little(header.magic, static_cast<std::uint32_t>(PLANK_CURSOR_WIRE_MAGIC));
+      write_cursor_little(header.version, static_cast<std::uint16_t>(PLANK_CURSOR_WIRE_VERSION));
+      write_cursor_little(header.pixelFormat, static_cast<std::uint16_t>(PLANK_CURSOR_PIXEL_FORMAT_ARGB8888));
+      std::uint32_t flags = image.visible ? PLANK_CURSOR_FLAG_VISIBLE : 0U;
+      if (offset == 0) flags |= PLANK_CURSOR_FLAG_FIRST_CHUNK;
+      if (offset + chunk_size == image_size) flags |= PLANK_CURSOR_FLAG_LAST_CHUNK;
+      write_cursor_little(header.flags, flags);
+      write_cursor_little(header.generation, generation);
+      write_cursor_little(header.width, width);
+      write_cursor_little(header.height, height);
+      write_cursor_little(header.hotspotX, static_cast<std::uint32_t>(image.hotspot_x));
+      write_cursor_little(header.hotspotY, static_cast<std::uint32_t>(image.hotspot_y));
+      write_cursor_little(header.imageSize, image_size);
+      write_cursor_little(header.chunkOffset, offset);
+      write_cursor_little(header.chunkSize, chunk_size);
+      std::memcpy(frame.data(), &header, sizeof(header));
+      std::memcpy(frame.data() + sizeof(header), image.pixels.data() + offset, chunk_size);
+      frames.emplace_back(std::move(frame));
+      offset += chunk_size;
+    }
+    session->control.cursor_shape_queue->raise(std::move(frames));
+    BOOST_LOG(debug) << "Queued PLANK local cursor generation "sv << generation << " ("sv
+                     << image.width << 'x' << image.height << ", hotspot "sv
+                     << image.hotspot_x << ',' << image.hotspot_y << ")"sv;
+    return true;
+  }
+
+  bool queue_cursor_position(session_t *session,
+                             const platf::win_cursor_position_t &root_position,
+                             std::uint64_t &position_sequence) {
+    if (root_position.desktop_width <= 0 || root_position.desktop_height <= 0 ||
+        session->config.monitor.width <= 0 || session->config.monitor.height <= 0) {
+      BOOST_LOG(error) << "Invalid desktop/video geometry for PLANK cursor position transport"sv;
+      return false;
+    }
+
+    const auto frame_width = session->config.monitor.width;
+    const auto frame_height = session->config.monitor.height;
+    const auto scale = std::min(
+      frame_width / static_cast<double>(root_position.desktop_width),
+      frame_height / static_cast<double>(root_position.desktop_height)
+    );
+    const auto content_width = std::max(
+      1, static_cast<int>(root_position.desktop_width * scale));
+    const auto content_height = std::max(
+      1, static_cast<int>(root_position.desktop_height * scale));
+    const auto content_x = (frame_width - content_width) / 2;
+    const auto content_y = (frame_height - content_height) / 2;
+    const auto root_x = std::clamp(
+      root_position.x, 0, root_position.desktop_width - 1);
+    const auto root_y = std::clamp(
+      root_position.y, 0, root_position.desktop_height - 1);
+    const auto frame_x = std::clamp(
+      content_x + static_cast<int>(std::lround(root_x * scale)), 0, frame_width - 1
+    );
+    const auto frame_y = std::clamp(
+      content_y + static_cast<int>(std::lround(root_y * scale)), 0, frame_height - 1
+    );
+
+    PLANK_CURSOR_POSITION_WIRE_MESSAGE position {};
+    write_cursor_little(position.magic, static_cast<std::uint32_t>(PLANK_CURSOR_POSITION_WIRE_MAGIC));
+    write_cursor_little(position.version, static_cast<std::uint16_t>(PLANK_CURSOR_POSITION_WIRE_VERSION));
+    write_cursor_little(position.sequence, ++position_sequence);
+    write_cursor_little(position.x, static_cast<std::uint32_t>(frame_x));
+    write_cursor_little(position.y, static_cast<std::uint32_t>(frame_y));
+    write_cursor_little(position.frameWidth, static_cast<std::uint32_t>(frame_width));
+    write_cursor_little(position.frameHeight, static_cast<std::uint32_t>(frame_height));
+    session->control.cursor_position_event->raise(position);
+    return true;
+  }
+#endif  // __linux__ && SUNSHINE_BUILD_X11 / _WIN32
 
   void localCursorThread(std::stop_token stop_token, session_t *session) {
     platf::set_thread_name("sc::cursor");
@@ -480,8 +583,52 @@ namespace stream {
       }
       std::this_thread::sleep_until(next_cursor_sample);
     }
+#elif defined(_WIN32)
+    platf::win_cursor_image_t image {};
+    std::uint64_t generation = 1;
+    if (!platf::win_cursor_capture(image) ||
+        !queue_cursor_shape(session, image, generation)) {
+      BOOST_LOG(error) << "Unable to capture the initial Windows cursor"sv;
+      session::stop(*session);
+      return;
+    }
+
+    BOOST_LOG(info) << "PLANK cursor position and shape use fixed-deadline GetCursorInfo sampling"sv;
+    std::uint64_t position_sequence = 0;
+    std::uintptr_t queued_shape = image.visible ? static_cast<std::uintptr_t>(image.serial) : 0;
+    constexpr auto cursor_sample_period = 16'666'667ns;
+    auto next_cursor_sample = std::chrono::steady_clock::now();
+
+    while (!stop_token.stop_requested()) {
+      platf::win_cursor_position_t root_position {};
+      if (!platf::win_cursor_query(root_position)) {
+        // GetCursorInfo fails transiently while the secure desktop is active
+        // (UAC, lock screen); keep the session and retry next sample.
+        BOOST_LOG(debug) << "GetCursorInfo failed; retrying"sv;
+      } else {
+        if (!queue_cursor_position(session, root_position, position_sequence)) {
+          session::stop(*session);
+          return;
+        }
+        if (root_position.shape != queued_shape) {
+          if (platf::win_cursor_capture(image) &&
+              queue_cursor_shape(session, image, ++generation)) {
+            queued_shape = root_position.shape;
+          }
+        }
+      }
+
+      next_cursor_sample += cursor_sample_period;
+      const auto now = std::chrono::steady_clock::now();
+      if (next_cursor_sample <= now) {
+        const auto missed_samples =
+          (now - next_cursor_sample) / cursor_sample_period + 1;
+        next_cursor_sample += cursor_sample_period * missed_samples;
+      }
+      std::this_thread::sleep_until(next_cursor_sample);
+    }
 #else
-    BOOST_LOG(error) << "PLANK local cursor transport requires the Linux X11 host backend"sv;
+    BOOST_LOG(error) << "PLANK local cursor transport requires the Linux X11 or Windows host backend"sv;
     session::stop(*session);
 #endif
   }
@@ -658,7 +805,10 @@ namespace stream {
             continue;
           }
 
-          if (!session->cursorThread.joinable()) {
+          // The client expects the native setup reply as the first data
+          // message, so cursor traffic must not start before it is sent.
+          if (!session->cursorThread.joinable() &&
+              session->setup_response_sent.load(std::memory_order_acquire)) {
             session->cursorThread = std::jthread(localCursorThread, session);
           }
 
@@ -1020,6 +1170,10 @@ namespace stream {
      */
     state_e state(session_t &session) {
       return session.state.load(std::memory_order_relaxed);
+    }
+
+    void mark_setup_response_sent(session_t &session) {
+      session.setup_response_sent.store(true, std::memory_order_release);
     }
 
     /**

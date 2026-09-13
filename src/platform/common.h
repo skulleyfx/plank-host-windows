@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -952,6 +953,42 @@ namespace platf {
    * @return `true` when the source is available for a negotiated session.
    */
   bool plank_capture_source_available(std::string_view source);
+
+#ifdef _WIN32
+  /**
+   * @brief Active Windows pointer image for PLANK local cursor transport.
+   */
+  struct win_cursor_image_t {
+    std::vector<std::uint8_t> pixels;  ///< Premultiplied ARGB8888, little-endian (B,G,R,A bytes).
+    int width {};  ///< Image width in pixels.
+    int height {};  ///< Image height in pixels.
+    int hotspot_x {};  ///< Hotspot column within the image.
+    int hotspot_y {};  ///< Hotspot row within the image.
+    bool visible {};  ///< Whether the pointer is currently shown.
+    std::uint64_t serial {};  ///< Changes whenever the shape or visibility changes.
+  };
+
+  /**
+   * @brief Active Windows pointer position in virtual-desktop coordinates.
+   */
+  struct win_cursor_position_t {
+    int x {};  ///< Pointer column relative to the virtual desktop origin.
+    int y {};  ///< Pointer row relative to the virtual desktop origin.
+    int desktop_width {};  ///< Virtual desktop width.
+    int desktop_height {};  ///< Virtual desktop height.
+    std::uintptr_t shape {};  ///< Opaque identity of the current cursor shape; 0 when hidden.
+  };
+
+  /**
+   * @brief Sample the pointer position and current shape identity.
+   */
+  bool win_cursor_query(win_cursor_position_t &position);
+
+  /**
+   * @brief Capture the current pointer image.
+   */
+  bool win_cursor_capture(win_cursor_image_t &image);
+#endif
 
   /**
    * @brief Check if GPUs/drivers have changed since the last call to this function.
