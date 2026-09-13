@@ -22,6 +22,8 @@
 #else
   #include <windows.h>
   #include <vector>
+
+  #include "second_factor.h"
 #endif
 
 namespace plank::auth {
@@ -237,14 +239,19 @@ namespace plank::auth {
       return std::nullopt;
     }
 
+#ifdef _WIN32
+    const std::string account = qualified_windows_account(username);
+#else
     const std::string account {username};
+#endif
     constexpr std::size_t minimum_buffer_size = 1024;
     constexpr std::size_t maximum_buffer_size = 1024 * 1024;
 #ifdef _WIN32
-    // Windows has no POSIX uid. Use the relative identifier (RID) - the final
-    // sub-authority of the account SID - as a stable numeric identity. This
-    // MUST match session_context_win32.cpp's account_rid(), because the two are
-    // compared to decide whether an account owns the console session.
+    // Windows has no POSIX uid. The relative identifier (RID) - the final
+    // sub-authority of the account SID - serves as the numeric identity for
+    // bookkeeping only. A RID is unique only within one domain or machine, so
+    // desktop authorization compares full SIDs by name instead; see
+    // supervisor_attests_account_name_for_active_seat0().
     {
       std::wstring wide(account.size(), L'\0');
       if (!account.empty()) {
@@ -300,7 +307,11 @@ namespace plank::auth {
   }
 
   bool account_authorized_for_desktop(std::string_view username) {
+#ifdef _WIN32
+    return plank::session::supervisor_attests_account_name_for_active_seat0(username);
+#else
     const auto uid = account_uid(username);
     return uid && plank::session::supervisor_attests_account_for_active_seat0(*uid);
+#endif
   }
 }  // namespace plank::auth

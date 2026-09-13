@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "src/auth/second_factor.h"
 #include "src/config.h"
 #include "src/logging.h"
 
@@ -60,40 +61,6 @@ namespace plank::session {
 
   namespace {
     /**
-     * @brief Resolve an account name to a stable numeric identifier.
-     *
-     * Windows has no uid. The relative identifier (RID) - the final
-     * sub-authority of the account SID - is the closest stable analogue and is
-     * unique within a domain or machine, which is the scope PLANK compares
-     * over. Returns 0 when the account cannot be resolved.
-     */
-    std::uint32_t account_rid(const std::wstring &account) {
-      if (account.empty()) {
-        return 0;
-      }
-      DWORD sid_size = 0;
-      DWORD domain_size = 0;
-      SID_NAME_USE use {};
-      LookupAccountNameW(nullptr, account.c_str(), nullptr, &sid_size,
-                         nullptr, &domain_size, &use);
-      if (sid_size == 0) {
-        return 0;
-      }
-      std::vector<unsigned char> sid(sid_size);
-      std::wstring domain(domain_size, L'\0');
-      if (!LookupAccountNameW(nullptr, account.c_str(), sid.data(), &sid_size,
-                              domain.data(), &domain_size, &use)) {
-        return 0;
-      }
-      auto *sid_pointer = reinterpret_cast<PSID>(sid.data());
-      const auto *count = GetSidSubAuthorityCount(sid_pointer);
-      if (count == nullptr || *count == 0) {
-        return 0;
-      }
-      return *GetSidSubAuthority(sid_pointer, static_cast<DWORD>(*count - 1));
-    }
-
-    /**
      * @brief Account name owning a WTS session, if anyone is logged in to it.
      */
     std::wstring session_account(DWORD session_id) {
@@ -125,10 +92,47 @@ namespace plank::session {
     }
   }  // namespace
 
-  bool supervisor_attests_account_for_active_seat0(uid_t account_uid) {
-    if (account_uid == 0) {
-      return false;
+  namespace {
+    /// Resolve an account name to its SID bytes; empty when it cannot be resolved.
+    std::vector<unsigned char> account_sid(const std::wstring &account) {
+      if (account.empty()) {
+        return {};
+      }
+      DWORD sid_size = 0;
+      DWORD domain_size = 0;
+      SID_NAME_USE use {};
+      LookupAccountNameW(nullptr, account.c_str(), nullptr, &sid_size, nullptr, &domain_size, &use);
+      if (sid_size == 0) {
+        return {};
+      }
+      std::vector<unsigned char> sid(sid_size);
+      std::wstring domain(domain_size, L'\0');
+      if (!LookupAccountNameW(nullptr, account.c_str(), sid.data(), &sid_size, domain.data(), &domain_size, &use) ||
+          use != SidTypeUser) {
+        return {};
+      }
+      return sid;
     }
+
+    std::wstring widen(std::string_view text) {
+      if (text.empty()) {
+        return {};
+      }
+      const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+      std::wstring wide(static_cast<std::size_t>(size), L'\0');
+      MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(), size);
+      return wide;
+    }
+  }  // namespace
+
+  bool supervisor_attests_account_for_active_seat0(uid_t) {
+    // A RID is unique only within one domain or machine, so it cannot decide
+    // desktop ownership on Windows. Callers use the account-name overload.
+    BOOST_LOG(error) << "RID-only desktop attestation is not supported on Windows; refusing.";
+    return false;
+  }
+
+  bool supervisor_attests_account_name_for_active_seat0(std::string_view account) {
     // The desktop PLANK captures is the one this process runs in, so that is
     // the session whose owner is attested.
     DWORD host_session = 0;
@@ -154,12 +158,13 @@ namespace plank::session {
       BOOST_LOG(warning) << "Nobody is logged in to the host's session; refusing.";
       return false;
     }
-    const auto owner_uid = account_rid(owner);
-    if (owner_uid == 0) {
-      BOOST_LOG(warning) << "Unable to resolve the host session account; refusing.";
+    auto owner_sid = account_sid(owner);
+    auto requested_sid = account_sid(widen(plank::auth::qualified_windows_account(account)));
+    if (owner_sid.empty() || requested_sid.empty()) {
+      BOOST_LOG(warning) << "Unable to resolve the session owner or the authenticated account; refusing.";
       return false;
     }
-    if (owner_uid != account_uid) {
+    if (!EqualSid(reinterpret_cast<PSID>(owner_sid.data()), reinterpret_cast<PSID>(requested_sid.data()))) {
       BOOST_LOG(warning)
         << "Authenticated account does not own the host's desktop session; refusing.";
       return false;

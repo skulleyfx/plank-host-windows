@@ -714,6 +714,7 @@ namespace config {
     {},  // duo_integration_key
     {},  // duo_secret_key
     {},  // duo_api_host
+    {},  // default_domain
   };
 
   video_t video {
@@ -1575,6 +1576,7 @@ namespace config {
     string_f(vars, "duo_integration_key", plank_auth.duo_integration_key);
     string_f(vars, "duo_secret_key", plank_auth.duo_secret_key);
     string_f(vars, "duo_api_host", plank_auth.duo_api_host);
+    string_f(vars, "default_domain", plank_auth.default_domain);
 
     string_f(vars, "audio_sink", audio.sink);
 

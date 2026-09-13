@@ -28,6 +28,7 @@
 namespace plank::auth {
   namespace {
     constexpr std::int32_t prompt_style_password = 1;  ///< PAM_PROMPT_ECHO_OFF.
+    constexpr std::int32_t prompt_style_text_info = 4;  ///< PAM_TEXT_INFO.
 
     step_t denied(phase_e phase, int status, std::string_view reason) {
       BOOST_LOG(warning) << "PLANK authentication denied: " << reason;
@@ -62,7 +63,7 @@ namespace plank::auth {
         return;
       }
       user = widen(account);
-      domain = L".";  // local account
+      domain = L".";  // local account; qualified_windows_account() adds default_domain first
     }
 
     /**
@@ -76,7 +77,7 @@ namespace plank::auth {
                                   std::string &reason) {
       std::wstring user;
       std::wstring domain;
-      split_account(account, user, domain);
+      split_account(qualified_windows_account(account), user, domain);
 
       std::wstring secret;
       if (!password.empty()) {
@@ -114,6 +115,7 @@ namespace plank::auth {
     std::string remote_host;
     std::unique_ptr<second_factor_t> factor;
     bool awaiting_password {false};
+    std::string pending_denial;  ///< Logged reason for a denial whose message has been shown.
   };
 
   namespace {
@@ -143,7 +145,15 @@ namespace plank::auth {
     /**
      * @brief Map a provider result onto the PAM-shaped step the callers expect.
      */
-    step_t translate(const factor_step_t &factor) {
+    step_t translate(win32_auth_state_t &state, const factor_step_t &factor) {
+      if (factor.state == factor_step_t::state_e::denied && !factor.user_message.empty()) {
+        // Denied responses carry no text, so send the reason as a final
+        // informational message and deny on the next round. The password was
+        // already accepted, so this discloses nothing a push would not.
+        state.pending_denial = factor.detail.empty() ? "second factor denied" : factor.detail;
+        return {step_t::state_e::challenge, {prompt_t {prompt_style_text_info, factor.user_message}},
+                phase_e::authenticate, 0};
+      }
       switch (factor.state) {
         case factor_step_t::state_e::approved:
           BOOST_LOG(info) << "PLANK second factor approved: " << factor.detail;
@@ -157,6 +167,14 @@ namespace plank::auth {
       }
     }
   }  // namespace
+
+  std::string qualified_windows_account(std::string_view account) {
+    if (account.find('\\') != std::string_view::npos || account.find('@') != std::string_view::npos ||
+        config::plank_auth.default_domain.empty()) {
+      return std::string {account};
+    }
+    return config::plank_auth.default_domain + "\\" + std::string {account};
+  }
 
   pam_client_t::~pam_client_t() {
     clear_state(this);
@@ -191,6 +209,7 @@ namespace plank::auth {
     state.account.assign(username);
     state.remote_host.assign(remote_host);
     state.factor.reset();
+    state.pending_denial.clear();
     state.awaiting_password = true;
 
     expected_responses_ = 1;
@@ -225,16 +244,22 @@ namespace plank::auth {
         return denied(phase_e::authenticate, -1, error_message);
       }
 
-      const auto step = translate(state.factor->begin(state.account, state.remote_host));
+      const auto step = translate(state, state.factor->begin(state.account, state.remote_host));
       authenticated_ = step.state == step_t::state_e::authenticated;
       expected_responses_ = step.prompts.size();
       return step;
     }
 
+    if (!state.pending_denial.empty()) {
+      const auto reason = std::move(state.pending_denial);
+      state.pending_denial.clear();
+      expected_responses_ = 0;
+      return denied(phase_e::authenticate, -1, reason);
+    }
     if (!state.factor) {
       return denied(phase_e::protocol, -1, "no second-factor exchange in progress");
     }
-    const auto step = translate(state.factor->respond(std::move(responses)));
+    const auto step = translate(state, state.factor->respond(std::move(responses)));
     authenticated_ = step.state == step_t::state_e::authenticated;
     expected_responses_ = step.prompts.size();
     return step;

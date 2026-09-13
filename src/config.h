@@ -29,7 +29,7 @@ namespace config {
   /**
    * @brief Configuration keys whose values must be hidden in logs.
    */
-  inline constexpr std::array<std::string_view, 1> redacted_config {"duo_secret_key"};
+  inline constexpr std::array<std::string_view, 2> redacted_config {"duo_secret_key", "duo_integration_key"};
 
   /**
    * @brief Log configuration entries and optionally mark them for persistence.
@@ -280,6 +280,7 @@ namespace config {
     std::string duo_integration_key;  ///< DUO Auth API integration key.
     std::string duo_secret_key;  ///< DUO Auth API secret key; redacted from logs.
     std::string duo_api_host;  ///< DUO API hostname, e.g. api-XXXXXXXX.duosecurity.com.
+    std::string default_domain;  ///< Domain applied to bare account names, e.g. SKULLEYFX.
   };
 
   struct sunshine_t {

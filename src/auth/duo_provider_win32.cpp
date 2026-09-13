@@ -289,6 +289,7 @@ namespace plank::auth {
       factor_step_t::state_e state {factor_step_t::state_e::challenge};
       std::string message {"Contacting DUO..."};
       std::string detail;
+      std::string user_message;
       std::atomic_bool cancelled {false};
     };
 
@@ -331,14 +332,16 @@ namespace plank::auth {
           return {factor_step_t::state_e::challenge,
                   {prompt_t {prompt_style_text_info, exchange_->message}}, "waiting for DUO"};
         }
-        return {exchange_->state, {}, exchange_->detail};
+        return {exchange_->state, {}, exchange_->detail, exchange_->user_message};
       }
 
-      static void finish(duo_exchange_t &exchange, factor_step_t::state_e state, std::string detail) {
+      static void finish(duo_exchange_t &exchange, factor_step_t::state_e state, std::string detail,
+                         std::string user_message = {}) {
         {
           std::lock_guard lock {exchange.mutex};
           exchange.state = state;
           exchange.detail = std::move(detail);
+          exchange.user_message = std::move(user_message);
         }
         exchange.changed.notify_all();
       }
@@ -357,7 +360,8 @@ namespace plank::auth {
           finish(exchange, factor_step_t::state_e::approved, "DUO unreachable; failmode allow");
           return;
         }
-        finish(exchange, factor_step_t::state_e::denied, "DUO unreachable: " + reason);
+        finish(exchange, factor_step_t::state_e::denied, "DUO unreachable: " + reason,
+               "DUO could not be reached, so sign-in was refused.");
       }
 
       static void run(std::shared_ptr<duo_exchange_t> exchange, std::string username, std::string remote_host,
@@ -384,7 +388,9 @@ namespace plank::auth {
         }
         if (result != "auth") {
           // deny or enroll: never fall through to password-only.
-          finish(*exchange, factor_step_t::state_e::denied, "DUO preauth " + result + ": " + message);
+          finish(*exchange, factor_step_t::state_e::denied, "DUO preauth " + result + ": " + message,
+                 result == "enroll" ? "This account is not enrolled in DUO. Enroll, then sign in again." :
+                                      "DUO denied this sign-in.");
           return;
         }
 
@@ -400,14 +406,19 @@ namespace plank::auth {
         }
         if (device.empty()) {
           finish(*exchange, factor_step_t::state_e::denied,
-                 "DUO user " + username + " has no push-capable device; passcode entry is not supported by the PLANK client");
+                 "DUO user " + username + " has no push-capable device; passcode entry is not supported by the PLANK client",
+                 "This account has no DUO Mobile device for push approval.");
           return;
         }
 
         params.emplace("factor", "push");
         params.emplace("device", device);
         params.emplace("async", "1");
-        params.emplace("type", "PLANK login");
+        // type replaces the push title; pushinfo adds form-encoded detail rows.
+        const auto computer = config::nvhttp.host_name;
+        params.emplace("type", "PLANK login to " + computer);
+        params.emplace("pushinfo", "Computer=" + duo_encode(computer) +
+                                     (remote_host.empty() ? "" : "&From=" + duo_encode(remote_host)));
         const auto auth = duo_response(client.call("POST", "/auth/v2/auth", params, 8s), reason);
         if (!auth || auth->value("txid", "").empty()) {
           unreachable(*exchange, failmode, username, auth ? "DUO did not return a transaction id" : reason);
@@ -436,7 +447,8 @@ namespace plank::auth {
           }
           if (state == "deny") {
             finish(*exchange, factor_step_t::state_e::denied,
-                   "DUO denied: " + status->value("status", "") + " " + status_msg);
+                   "DUO denied: " + status->value("status", "") + " " + status_msg,
+                   status_msg.empty() ? "The DUO push was denied." : "DUO: " + status_msg);
             return;
           }
           if (!status_msg.empty()) {
@@ -445,7 +457,8 @@ namespace plank::auth {
           std::this_thread::sleep_for(1s);
         }
         finish(*exchange, factor_step_t::state_e::denied,
-               exchange->cancelled ? "DUO exchange abandoned" : "DUO push timed out");
+               exchange->cancelled ? "DUO exchange abandoned" : "DUO push timed out",
+               "The DUO push was not approved in time.");
       }
 
       factor_failmode_e failmode_;

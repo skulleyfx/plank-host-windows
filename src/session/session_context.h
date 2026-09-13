@@ -106,6 +106,16 @@ namespace plank::session {
   /** Authorize an account against the supervisor-controlled active seat0 session. */
   bool supervisor_attests_account_for_active_seat0(uid_t account_uid);
 
+#ifdef _WIN32
+  /**
+   * @brief Windows attestation by full account SID.
+   *
+   * @param account Account name as authenticated; qualified with default_domain.
+   * @return True when the account owns the desktop session the host captures.
+   */
+  bool supervisor_attests_account_name_for_active_seat0(std::string_view account);
+#endif
+
   /** Encode or decode one bounded supervisor desktop-attachment update. */
   std::string session_update_message(const update_t &update);
   std::optional<update_t> parse_session_update(std::string_view message);

@@ -37,6 +37,7 @@ namespace plank::auth {
     state_e state {state_e::denied};  ///< Terminal or intermediate state.
     std::vector<prompt_t> prompts;  ///< Empty for out-of-band approval (push).
     std::string detail;  ///< Auditable reason; safe to log.
+    std::string user_message;  ///< Short reason safe to show the user on denial; may be empty.
   };
 
   /**
@@ -105,6 +106,19 @@ namespace plank::auth {
   factor_failmode_e parse_failmode(std::string_view value);
 
 #ifdef _WIN32
+  /**
+   * @brief Qualify an account name the way every Windows auth path must.
+   *
+   * "DOMAIN\\user" and "user@upn" are returned unchanged. A bare name gets
+   * security.default_domain when one is configured, and is otherwise returned
+   * bare. Password validation, identity lookup and console attestation all use
+   * this so they cannot disagree about which account a name means.
+   *
+   * @param account Account name as typed by the user.
+   * @return Qualified account name.
+   */
+  std::string qualified_windows_account(std::string_view account);
+
   /**
    * @brief Construct the DUO Auth API provider from security.duo_* settings.
    *

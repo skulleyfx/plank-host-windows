@@ -553,8 +553,13 @@ namespace nvhttp {
       return std::nullopt;
     }
     const auto uid = plank::auth::account_uid(*identity);
-    if (!uid ||
-        !plank::session::supervisor_attests_account_for_active_seat0(*uid)) {
+#ifdef _WIN32
+    // RIDs collide across domains; Windows authorizes by full SID.
+    const bool attested = uid && plank::session::supervisor_attests_account_name_for_active_seat0(*identity);
+#else
+    const bool attested = uid && plank::session::supervisor_attests_account_for_active_seat0(*uid);
+#endif
+    if (!attested) {
       web_auth->cancel(token);
       BOOST_LOG(warning) << "Rejecting PLANK stream for an account that is not authorized for the active desktop"sv;
       return std::nullopt;
