@@ -84,6 +84,7 @@ list(PREPEND PLATFORM_LIBRARIES
         synchronization.lib
         userenv
         wtsapi32
+        winhttp
         ws2_32
         wsock32
 )

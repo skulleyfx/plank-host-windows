@@ -103,4 +103,15 @@ namespace plank::auth {
    * @return Parsed failmode.
    */
   factor_failmode_e parse_failmode(std::string_view value);
+
+#ifdef _WIN32
+  /**
+   * @brief Construct the DUO Auth API provider from security.duo_* settings.
+   *
+   * @param failmode Behaviour when DUO is unreachable.
+   * @param error_message Populated when the provider is not fully configured.
+   * @return Provider, or nullptr when configuration is incomplete.
+   */
+  std::unique_ptr<second_factor_t> make_duo_provider(factor_failmode_e failmode, std::string &error_message);
+#endif
 }  // namespace plank::auth

@@ -69,6 +69,12 @@ namespace plank::auth {
       return std::make_unique<none_provider_t>();
     }
 
+#ifdef _WIN32
+    if (name == "duo") {
+      return make_duo_provider(failmode, error_message);
+    }
+#endif
+
     // Deliberately no default case. An unknown name must deny rather than
     // silently degrade to password-only; that would reproduce the credential
     // provider bypass this design exists to prevent.

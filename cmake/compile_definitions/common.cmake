@@ -148,6 +148,7 @@ if(WIN32)
             "${CMAKE_SOURCE_DIR}/src/auth/pam_client_win32.cpp"
             "${CMAKE_SOURCE_DIR}/src/auth/second_factor.h"
             "${CMAKE_SOURCE_DIR}/src/auth/second_factor.cpp"
+            "${CMAKE_SOURCE_DIR}/src/auth/duo_provider_win32.cpp"
             "${CMAKE_SOURCE_DIR}/src/session/session_context_win32.cpp")
 else()
     set(PLANK_PLATFORM_AUTH_SESSION_SOURCES

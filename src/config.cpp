@@ -711,6 +711,9 @@ namespace config {
     "none"s,  // no second factor unless configured; the provider logs loudly
     "deny"s,  // fail closed when a provider is unreachable
     false,  // physical console only unless explicitly enabled
+    {},  // duo_integration_key
+    {},  // duo_secret_key
+    {},  // duo_api_host
   };
 
   video_t video {
@@ -1569,6 +1572,9 @@ namespace config {
     string_f(vars, "second_factor", plank_auth.second_factor);
     string_f(vars, "second_factor_failmode", plank_auth.second_factor_failmode);
     bool_f(vars, "allow_remote_desktop_session", plank_auth.allow_remote_desktop_session);
+    string_f(vars, "duo_integration_key", plank_auth.duo_integration_key);
+    string_f(vars, "duo_secret_key", plank_auth.duo_secret_key);
+    string_f(vars, "duo_api_host", plank_auth.duo_api_host);
 
     string_f(vars, "audio_sink", audio.sink);
 

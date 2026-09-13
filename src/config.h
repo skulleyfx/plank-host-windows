@@ -29,7 +29,7 @@ namespace config {
   /**
    * @brief Configuration keys whose values must be hidden in logs.
    */
-  inline constexpr std::array<std::string_view, 0> redacted_config {};
+  inline constexpr std::array<std::string_view, 1> redacted_config {"duo_secret_key"};
 
   /**
    * @brief Log configuration entries and optionally mark them for persistence.
@@ -277,6 +277,9 @@ namespace config {
     std::string second_factor;  ///< Provider name, e.g. "none" or "duo".
     std::string second_factor_failmode;  ///< "deny" (default) or "allow" when unreachable.
     bool allow_remote_desktop_session;  ///< Attest an RDP session, not only the physical console. Default false.
+    std::string duo_integration_key;  ///< DUO Auth API integration key.
+    std::string duo_secret_key;  ///< DUO Auth API secret key; redacted from logs.
+    std::string duo_api_host;  ///< DUO API hostname, e.g. api-XXXXXXXX.duosecurity.com.
   };
 
   struct sunshine_t {
