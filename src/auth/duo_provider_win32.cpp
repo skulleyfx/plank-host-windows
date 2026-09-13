@@ -19,6 +19,10 @@
 #include <winhttp.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <chrono>
 #include <ctime>
 #include <format>
@@ -32,6 +36,7 @@
 
 #include "src/config.h"
 #include "src/logging.h"
+#include "src/platform/common.h"
 
 #ifndef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
   #define WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3 0x00002000
@@ -43,8 +48,9 @@ namespace plank::auth {
   namespace {
     constexpr std::int32_t prompt_style_text_info = 4;  ///< PAM_TEXT_INFO.
 
-    /// Longest a single client round may spend waiting; the client gives up at 5 s.
-    constexpr auto poll_round_budget = 3s;
+    /// Longest a login round waits for DUO. The client abandons a request after
+    /// 5 s and its host-status poll after 2 s, and both share one server thread.
+    constexpr auto round_budget = 1500ms;
     /// DUO expires a push after about a minute.
     constexpr auto push_deadline = 70s;
 
@@ -139,11 +145,28 @@ namespace plank::auth {
           ikey_ {std::move(ikey)},
           skey_ {std::move(skey)},
           host_ {lowercase(host)} {
+        // Default (static) proxy settings: automatic discovery can stall for
+        // seconds. One session lets WinHTTP keep the TLS connection alive.
+        session_ = WinHttpOpen(L"PLANK-Host-Duo/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (session_) {
+          DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+          if (!WinHttpSetOption(session_, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols))) {
+            protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;  // TLS 1.3 unavailable on older Windows
+            WinHttpSetOption(session_, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+          }
+        }
       }
 
       ~duo_client_t() {
+        if (session_) {
+          WinHttpCloseHandle(session_);
+        }
         SecureZeroMemory(skey_.data(), skey_.size());
       }
+
+      duo_client_t(const duo_client_t &) = delete;
+      duo_client_t &operator=(const duo_client_t &) = delete;
 
       http_result_t call(std::string_view method, std::string_view path,
                          const std::map<std::string, std::string> &params,
@@ -169,27 +192,20 @@ namespace plank::auth {
         const std::string authorization = "Basic " + base64(ikey_ + ":" + hmac_sha512_hex(skey_, canonical));
 
         http_result_t result;
-        const HINTERNET session = WinHttpOpen(L"PLANK-Host-Duo/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!session) {
-          result.error = std::format("WinHttpOpen failed ({})", GetLastError());
+        if (!session_) {
+          result.error = "WinHttpOpen failed";
           return result;
         }
-        DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-        if (!WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols))) {
-          protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;  // TLS 1.3 unavailable on older Windows
-          WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-        }
         const int ms = static_cast<int>(timeout.count());
-        WinHttpSetTimeouts(session, ms, ms, ms, ms);
 
-        const HINTERNET connection = WinHttpConnect(session, widen(host_).c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+        const HINTERNET connection = WinHttpConnect(session_, widen(host_).c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
         const std::wstring target = widen(std::string {path} + (query.empty() ? "" : "?" + query));
         const HINTERNET request = connection ?
                                     WinHttpOpenRequest(connection, widen(method).c_str(), target.c_str(), nullptr,
                                                        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) :
                                     nullptr;
         if (request) {
+          WinHttpSetTimeouts(request, ms, ms, ms, ms);
           std::wstring headers = L"Date: " + widen(date) + L"\r\nAuthorization: " + widen(authorization) + L"\r\n";
           if (!body.empty()) {
             headers += L"Content-Type: application/json\r\n";
@@ -225,7 +241,6 @@ namespace plank::auth {
         if (connection) {
           WinHttpCloseHandle(connection);
         }
-        WinHttpCloseHandle(session);
         return result;
       }
 
@@ -233,6 +248,7 @@ namespace plank::auth {
       std::string ikey_;
       std::string skey_;
       std::string host_;
+      HINTERNET session_ {nullptr};
     };
 
     /// Parsed `response` object of a successful call, or nullopt with a reason.
@@ -261,36 +277,115 @@ namespace plank::auth {
       return std::string {slash == std::string_view::npos ? account : account.substr(slash + 1)};
     }
 
+    /**
+     * @brief State shared between a DUO exchange and its worker thread.
+     *
+     * The worker outlives the provider if a DUO call is still in flight when
+     * the login is abandoned, so the state is reference counted.
+     */
+    struct duo_exchange_t {
+      std::mutex mutex;
+      std::condition_variable changed;
+      factor_step_t::state_e state {factor_step_t::state_e::challenge};
+      std::string message {"Contacting DUO..."};
+      std::string detail;
+      std::atomic_bool cancelled {false};
+    };
+
     class duo_provider_t final: public second_factor_t {
     public:
-      duo_provider_t(factor_failmode_e failmode):
-          failmode_ {failmode},
-          client_ {config::plank_auth.duo_integration_key, config::plank_auth.duo_secret_key,
-                   config::plank_auth.duo_api_host} {
+      explicit duo_provider_t(factor_failmode_e failmode):
+          failmode_ {failmode} {
+      }
+
+      ~duo_provider_t() override {
+        if (exchange_) {
+          exchange_->cancelled = true;
+        }
       }
 
       factor_step_t begin(std::string_view username, std::string_view remote_host) override {
-        username_ = duo_username(username);
-        std::map<std::string, std::string> params {{"username", username_}};
+        exchange_ = std::make_shared<duo_exchange_t>();
+        std::thread(run, exchange_, duo_username(username), std::string {remote_host}, failmode_,
+                    config::plank_auth.duo_integration_key, config::plank_auth.duo_secret_key,
+                    config::plank_auth.duo_api_host)
+          .detach();
+        return wait_round();
+      }
+
+      factor_step_t respond(std::vector<std::string>) override {
+        if (!exchange_) {
+          return {factor_step_t::state_e::denied, {}, "no DUO transaction in progress"};
+        }
+        return wait_round();
+      }
+
+    private:
+      /// Wait briefly for the worker so a login round never outlasts the client's timeout.
+      factor_step_t wait_round() {
+        std::unique_lock lock {exchange_->mutex};
+        exchange_->changed.wait_for(lock, round_budget, [this] {
+          return exchange_->state != factor_step_t::state_e::challenge;
+        });
+        if (exchange_->state == factor_step_t::state_e::challenge) {
+          return {factor_step_t::state_e::challenge,
+                  {prompt_t {prompt_style_text_info, exchange_->message}}, "waiting for DUO"};
+        }
+        return {exchange_->state, {}, exchange_->detail};
+      }
+
+      static void finish(duo_exchange_t &exchange, factor_step_t::state_e state, std::string detail) {
+        {
+          std::lock_guard lock {exchange.mutex};
+          exchange.state = state;
+          exchange.detail = std::move(detail);
+        }
+        exchange.changed.notify_all();
+      }
+
+      static void progress(duo_exchange_t &exchange, std::string message) {
+        std::lock_guard lock {exchange.mutex};
+        exchange.message = std::move(message);
+      }
+
+      static void unreachable(duo_exchange_t &exchange, factor_failmode_e failmode,
+                              const std::string &username, const std::string &reason) {
+        BOOST_LOG(error) << "DUO unavailable for " << username << ": " << reason;
+        if (failmode == factor_failmode_e::allow) {
+          BOOST_LOG(warning) << "security.second_factor_failmode=allow: accepting " << username
+                             << " on password alone because DUO is unreachable";
+          finish(exchange, factor_step_t::state_e::approved, "DUO unreachable; failmode allow");
+          return;
+        }
+        finish(exchange, factor_step_t::state_e::denied, "DUO unreachable: " + reason);
+      }
+
+      static void run(std::shared_ptr<duo_exchange_t> exchange, std::string username, std::string remote_host,
+                      factor_failmode_e failmode, std::string ikey, std::string skey, std::string host) {
+        platf::set_thread_name("duo-auth");
+        const duo_client_t client {std::move(ikey), std::move(skey), std::move(host)};
+        std::map<std::string, std::string> params {{"username", username}};
         if (!remote_host.empty()) {
-          params.emplace("ipaddr", std::string {remote_host});
+          params.emplace("ipaddr", remote_host);
         }
 
         std::string reason;
-        const auto preauth = duo_response(client_.call("POST", "/auth/v2/preauth", params, 4s), reason);
+        const auto preauth = duo_response(client.call("POST", "/auth/v2/preauth", params, 8s), reason);
         if (!preauth) {
-          return unreachable(reason);
+          unreachable(*exchange, failmode, username, reason);
+          return;
         }
-
         const auto result = preauth->value("result", "");
         const auto message = preauth->value("status_msg", "");
         if (result == "allow") {
-          BOOST_LOG(warning) << "DUO allowed " << username_ << " without a second factor: " << message;
-          return {factor_step_t::state_e::approved, {}, "DUO preauth allow: " + message};
+          BOOST_LOG(warning) << "DUO allowed " << username << " without a second factor: " << message;
+          finish(*exchange, factor_step_t::state_e::approved, "DUO preauth allow: " + message);
+          return;
         }
         if (result != "auth") {
           // deny or enroll: never fall through to password-only.
-          return {factor_step_t::state_e::denied, {}, "DUO preauth " + result + ": " + message};
+          finish(*exchange, factor_step_t::state_e::denied, "DUO preauth " + result + ": " + message);
+          return;
         }
 
         std::string device;
@@ -304,78 +399,57 @@ namespace plank::auth {
           }
         }
         if (device.empty()) {
-          return {factor_step_t::state_e::denied, {},
-                  "DUO user " + username_ + " has no push-capable device; passcode entry is not supported by the PLANK client"};
+          finish(*exchange, factor_step_t::state_e::denied,
+                 "DUO user " + username + " has no push-capable device; passcode entry is not supported by the PLANK client");
+          return;
         }
 
         params.emplace("factor", "push");
         params.emplace("device", device);
         params.emplace("async", "1");
         params.emplace("type", "PLANK login");
-        const auto auth = duo_response(client_.call("POST", "/auth/v2/auth", params, 4s), reason);
+        const auto auth = duo_response(client.call("POST", "/auth/v2/auth", params, 8s), reason);
         if (!auth || auth->value("txid", "").empty()) {
-          return unreachable(auth ? "DUO did not return a transaction id" : reason);
+          unreachable(*exchange, failmode, username, auth ? "DUO did not return a transaction id" : reason);
+          return;
         }
-        txid_ = auth->value("txid", "");
-        deadline_ = std::chrono::steady_clock::now() + push_deadline;
-        BOOST_LOG(info) << "DUO push sent for " << username_ << " to " << device_name;
-        return waiting("DUO push sent to " + device_name + ". Approve it to continue.");
-      }
+        const auto txid = auth->value("txid", "");
+        BOOST_LOG(info) << "DUO push sent for " << username << " to " << device_name;
+        progress(*exchange, "DUO push sent to " + device_name + ". Approve it to continue.");
 
-      factor_step_t respond(std::vector<std::string>) override {
-        if (txid_.empty()) {
-          return {factor_step_t::state_e::denied, {}, "no DUO transaction in progress"};
-        }
-        const auto round_end = std::chrono::steady_clock::now() + poll_round_budget;
-        std::string last_message = "Waiting for DUO approval.";
-        while (std::chrono::steady_clock::now() < round_end) {
-          if (std::chrono::steady_clock::now() >= deadline_) {
-            return {factor_step_t::state_e::denied, {}, "DUO push timed out"};
-          }
-          const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(round_end - std::chrono::steady_clock::now());
-          const auto http = client_.call("GET", "/auth/v2/auth_status", {{"txid", txid_}},
-                                         std::max(remaining, std::chrono::milliseconds {500}));
+        const auto deadline = std::chrono::steady_clock::now() + push_deadline;
+        while (!exchange->cancelled && std::chrono::steady_clock::now() < deadline) {
+          const auto http = client.call("GET", "/auth/v2/auth_status", {{"txid", txid}}, 15s);
           if (http.timed_out) {
-            break;  // long poll still open; ask again next round
+            continue;  // long poll expired without a decision
           }
-          std::string reason;
           const auto status = duo_response(http, reason);
           if (!status) {
-            return unreachable(reason);
+            unreachable(*exchange, failmode, username, reason);
+            return;
           }
-          const auto result = status->value("result", "");
-          last_message = status->value("status_msg", last_message);
-          if (result == "allow") {
-            return {factor_step_t::state_e::approved, {}, "DUO push approved: " + last_message};
+          const auto state = status->value("result", "");
+          const auto status_msg = status->value("status_msg", "");
+          if (state == "allow") {
+            finish(*exchange, factor_step_t::state_e::approved, "DUO push approved: " + status_msg);
+            return;
           }
-          if (result == "deny") {
-            return {factor_step_t::state_e::denied, {}, "DUO denied: " + status->value("status", "") + " " + last_message};
+          if (state == "deny") {
+            finish(*exchange, factor_step_t::state_e::denied,
+                   "DUO denied: " + status->value("status", "") + " " + status_msg);
+            return;
           }
-          std::this_thread::sleep_for(500ms);
+          if (!status_msg.empty()) {
+            progress(*exchange, status_msg);
+          }
+          std::this_thread::sleep_for(1s);
         }
-        return waiting(last_message);
-      }
-
-    private:
-      static factor_step_t waiting(std::string message) {
-        return {factor_step_t::state_e::challenge, {prompt_t {prompt_style_text_info, message}}, "waiting for DUO"};
-      }
-
-      factor_step_t unreachable(const std::string &reason) const {
-        BOOST_LOG(error) << "DUO unavailable for " << username_ << ": " << reason;
-        if (failmode_ == factor_failmode_e::allow) {
-          BOOST_LOG(warning) << "security.second_factor_failmode=allow: accepting " << username_
-                             << " on password alone because DUO is unreachable";
-          return {factor_step_t::state_e::approved, {}, "DUO unreachable; failmode allow"};
-        }
-        return {factor_step_t::state_e::denied, {}, "DUO unreachable: " + reason};
+        finish(*exchange, factor_step_t::state_e::denied,
+               exchange->cancelled ? "DUO exchange abandoned" : "DUO push timed out");
       }
 
       factor_failmode_e failmode_;
-      duo_client_t client_;
-      std::string username_;
-      std::string txid_;
-      std::chrono::steady_clock::time_point deadline_ {};
+      std::shared_ptr<duo_exchange_t> exchange_;
     };
   }  // namespace
 
