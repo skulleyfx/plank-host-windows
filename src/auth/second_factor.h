@@ -120,6 +120,33 @@ namespace plank::auth {
   std::string qualified_windows_account(std::string_view account);
 
   /**
+   * @brief Hold a resume ticket presented at sign-in start until the password is checked.
+   *
+   * @param username Account name as presented.
+   * @param remote_host Client address.
+   * @param ticket Ticket from the client's previous complete sign-in.
+   */
+  void stage_resume_ticket(std::string_view username, std::string_view remote_host, std::string ticket);
+
+  /**
+   * @brief Spend a staged resume ticket after the password has been accepted.
+   *
+   * @param username Account name as presented.
+   * @param remote_host Client address.
+   * @return True when a valid, unexpired ticket was presented; the ticket is consumed either way.
+   */
+  bool consume_staged_resume_ticket(std::string_view username, std::string_view remote_host);
+
+  /**
+   * @brief Issue a new resume ticket after a complete sign-in.
+   *
+   * @param username Account name as authenticated.
+   * @param remote_host Client address.
+   * @return Ticket for the client to keep in memory, or empty when disabled.
+   */
+  std::string issue_resume_ticket(std::string_view username, std::string_view remote_host);
+
+  /**
    * @brief Construct the DUO Auth API provider from security.duo_* settings.
    *
    * @param failmode Behaviour when DUO is unreachable.

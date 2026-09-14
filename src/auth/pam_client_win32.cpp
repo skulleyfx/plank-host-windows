@@ -235,6 +235,14 @@ namespace plank::auth {
         return denied(phase_e::authenticate, -1, reason);
       }
 
+      if (consume_staged_resume_ticket(state.account, state.remote_host)) {
+        BOOST_LOG(info) << "PLANK second factor satisfied by a resume ticket for " << state.account
+                        << " from " << state.remote_host;
+        authenticated_ = true;
+        expected_responses_ = 0;
+        return {step_t::state_e::authenticated, {}, phase_e::authenticated, 0};
+      }
+
       std::string error_message;
       state.factor = make_second_factor(config::plank_auth.second_factor,
                                         parse_failmode(config::plank_auth.second_factor_failmode),

@@ -282,6 +282,7 @@ namespace config {
     std::string duo_api_host;  ///< DUO API hostname, e.g. api-XXXXXXXX.duosecurity.com.
     std::string default_domain;  ///< Domain applied to bare account names, e.g. SKULLEYFX.
     bool allow_root_login;  ///< Windows: permit the built-in Administrator (RID 500). Default false.
+    int second_factor_resume_minutes;  ///< Lifetime of reconnect tickets that skip a repeat second factor; 0 disables.
   };
 
   struct sunshine_t {

@@ -50,6 +50,9 @@
 // local includes
 #include "config.h"
 #include "auth/web_auth.h"
+#ifdef _WIN32
+  #include "auth/second_factor.h"
+#endif
 #include "display_device.h"
 #include "globals.h"
 #include "httpcommon.h"
@@ -457,6 +460,12 @@ namespace nvhttp {
       return;
     }
     const auto username = body["username"].get<std::string>();
+#ifdef _WIN32
+    if (body.contains("resume_ticket") && body["resume_ticket"].is_string()) {
+      plank::auth::stage_resume_ticket(username, authentication_peer(request),
+                                       body["resume_ticket"].get<std::string>());
+    }
+#endif
     const auto step = web_auth->begin(username, authentication_peer(request));
     write_auth_json(response, SimpleWeb::StatusCode::success_ok, auth_step_json(step));
   }
@@ -495,7 +504,17 @@ namespace nvhttp {
     const auto conversation_id = body["conversation_id"].get<std::string>();
     const auto step = web_auth->respond(conversation_id, authentication_peer(request),
                                         std::move(responses));
-    write_auth_json(response, SimpleWeb::StatusCode::success_ok, auth_step_json(step));
+    auto result = auth_step_json(step);
+#ifdef _WIN32
+    if (step.state == plank::auth::step_t::state_e::authenticated) {
+      if (const auto identity = web_auth->identity(step.session_token, authentication_peer(request))) {
+        if (auto ticket = plank::auth::issue_resume_ticket(*identity, authentication_peer(request)); !ticket.empty()) {
+          result["resume_ticket"] = std::move(ticket);
+        }
+      }
+    }
+#endif
+    write_auth_json(response, SimpleWeb::StatusCode::success_ok, result);
   }
 
   /**
