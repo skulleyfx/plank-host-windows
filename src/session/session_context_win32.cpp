@@ -18,11 +18,17 @@
 #include <windows.h>
 #include <wtsapi32.h>
 
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "src/auth/second_factor.h"
 #include "src/config.h"
+#include "src/display_device.h"
 #include "src/logging.h"
 
 using namespace std::literals;
@@ -227,8 +233,65 @@ namespace plank::session {
     return std::nullopt;
   }
 
+  namespace {
+    /**
+     * @brief Temporary resolution lease on the host's physical display.
+     *
+     * Windows workstations use physical displays (or display emulators), so a
+     * requested single-display layout is served by switching the active
+     * display's mode rather than creating a virtual output. The display
+     * library persists the original configuration, so it is restored at
+     * session end or, after a crash, when the host next starts.
+     */
+    std::mutex &lease_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
+    std::optional<runtime_display_state_t> &display_lease() {
+      static std::optional<runtime_display_state_t> lease;
+      return lease;
+    }
+
+    bool parse_mode(std::string_view mode, unsigned &width, unsigned &height) {
+      const auto separator = mode.find('x');
+      if (separator == std::string_view::npos) {
+        return false;
+      }
+      width = static_cast<unsigned>(std::strtoul(std::string {mode.substr(0, separator)}.c_str(), nullptr, 10));
+      height = static_cast<unsigned>(std::strtoul(std::string {mode.substr(separator + 1)}.c_str(), nullptr, 10));
+      return width > 0 && height > 0;
+    }
+
+    /// Active mode of the primary display, which the display library configures.
+    bool primary_display_mode(unsigned &width, unsigned &height) {
+      DEVMODEW mode {};
+      mode.dmSize = sizeof(mode);
+      if (!EnumDisplaySettingsExW(nullptr, ENUM_CURRENT_SETTINGS, &mode, 0)) {
+        return false;
+      }
+      width = mode.dmPelsWidth;
+      height = mode.dmPelsHeight;
+      return true;
+    }
+
+    int active_display_count() {
+      int count = 0;
+      DISPLAY_DEVICEW device {};
+      device.cb = sizeof(device);
+      for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index) {
+        if (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) {
+          ++count;
+        }
+        device.cb = sizeof(device);
+      }
+      return count;
+    }
+  }  // namespace
+
   std::optional<runtime_display_state_t> read_runtime_display_state(std::string_view) {
-    return std::nullopt;
+    std::lock_guard lock {lease_mutex()};
+    return display_lease();
   }
 
   std::optional<bool> secondary_output_visible_from_overlay(std::string_view) {
@@ -239,18 +302,71 @@ namespace plank::session {
     return startup_layout_t::physical;
   }
 
-  display_request_status request_display_transition(const display_request_t &) {
-    unimplemented_once("request_display_transition");
-    return display_request_status::unavailable;
+  display_request_status request_display_transition(const display_request_t &request) {
+    if (request.action != display_request_t::action_t::acquire) {
+      return display_request_status::invalid;
+    }
+    std::lock_guard lock {lease_mutex()};
+    if (display_lease() && display_lease()->lease_uid != request.account_uid) {
+      return display_request_status::wrong_user;
+    }
+    // Only a single display is switched; a dual layout would need two
+    // physical displays positioned side by side.
+    unsigned width = 0;
+    unsigned height = 0;
+    if (request.layout != "single" || !request.mode_2.empty() ||
+        !parse_mode(request.mode_1, width, height) || active_display_count() != 1) {
+      BOOST_LOG(warning) << "Windows host can only switch a single active display; requested layout "
+                         << request.layout << ' ' << request.mode_1 << (request.mode_2.empty() ? "" : "+" + request.mode_2);
+      return display_request_status::unavailable;
+    }
+
+    unsigned current_width = 0;
+    unsigned current_height = 0;
+    if (!primary_display_mode(current_width, current_height) ||
+        current_width != width || current_height != height) {
+      ::display_device::SingleDisplayConfiguration configuration;
+      configuration.m_device_prep = ::display_device::SingleDisplayConfiguration::DevicePreparation::VerifyOnly;
+      configuration.m_resolution = ::display_device::Resolution {width, height};
+      BOOST_LOG(info) << "Switching the host display to " << width << 'x' << height << " for a PLANK session";
+      ::display_device::configure_display(configuration);
+
+      // The display library applies settings on its own thread; confirm the
+      // mode actually changed before promising the layout to the client.
+      bool applied = false;
+      for (int attempt = 0; attempt < 40 && !applied; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds {100});
+        applied = primary_display_mode(current_width, current_height) &&
+                  current_width == width && current_height == height;
+      }
+      if (!applied) {
+        BOOST_LOG(warning) << "The host display does not support " << width << 'x' << height
+                           << "; keeping its current mode";
+        ::display_device::revert_configuration();
+        return display_request_status::unavailable;
+      }
+    }
+
+    display_lease() = runtime_display_state_t {request.layout, request.mode_1, {}, request.account_uid};
+    return display_request_status::submitted;
   }
 
-  display_request_status activate_display_lease(uid_t) {
-    unimplemented_once("activate_display_lease");
-    return display_request_status::unavailable;
+  display_request_status activate_display_lease(uid_t account_uid) {
+    std::lock_guard lock {lease_mutex()};
+    return display_lease() && display_lease()->lease_uid == account_uid ?
+             display_request_status::submitted :
+             display_request_status::unavailable;
   }
 
-  display_request_status release_display_lease(uid_t) {
-    return display_request_status::unavailable;
+  display_request_status release_display_lease(uid_t account_uid) {
+    std::lock_guard lock {lease_mutex()};
+    if (!display_lease() || display_lease()->lease_uid != account_uid) {
+      return display_request_status::unavailable;
+    }
+    BOOST_LOG(info) << "Restoring the host display after the PLANK session";
+    ::display_device::revert_configuration();
+    display_lease().reset();
+    return display_request_status::submitted;
   }
 
   std::unique_ptr<supervisor_control_t> start_supervisor_control(

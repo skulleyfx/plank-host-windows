@@ -1549,7 +1549,15 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
+#ifdef _WIN32
+      // A PLANK display lease has already switched the display for this
+      // launch; with display configuration disabled this call would revert it.
+      if (!launch_session->plank_display_lease) {
+        display_device::configure_display(config::video, *launch_session);
+      }
+#else
       display_device::configure_display(config::video, *launch_session);
+#endif
 
       // The media worker probes capture and encoding before its HTTP interface
       // starts. Reprobing here can race a reconnecting NvFBC capture thread.
@@ -1709,7 +1717,15 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
+#ifdef _WIN32
+      // A PLANK display lease has already switched the display for this
+      // launch; with display configuration disabled this call would revert it.
+      if (!launch_session->plank_display_lease) {
+        display_device::configure_display(config::video, *launch_session);
+      }
+#else
       display_device::configure_display(config::video, *launch_session);
+#endif
 
       // Worker startup probing remains authoritative; avoid racing NvFBC
       // probing with a prior stream's capture teardown.
