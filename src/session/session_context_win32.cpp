@@ -153,23 +153,54 @@ namespace plank::session {
         << "Attesting remote-desktop session "sv << host_session
         << " because allow_remote_desktop_session is enabled"sv;
     }
-    const auto owner = session_account(host_session);
-    if (owner.empty()) {
-      BOOST_LOG(warning) << "Nobody is logged in to the host's session; refusing.";
+    auto sid = account_sid(widen(plank::auth::qualified_windows_account(account)));
+    if (sid.empty()) {
+      BOOST_LOG(warning) << "Unable to resolve the authenticated account; refusing.";
       return false;
     }
-    auto owner_sid = account_sid(owner);
-    auto requested_sid = account_sid(widen(plank::auth::qualified_windows_account(account)));
-    if (owner_sid.empty() || requested_sid.empty()) {
-      BOOST_LOG(warning) << "Unable to resolve the session owner or the authenticated account; refusing.";
+    const auto *count = GetSidSubAuthorityCount(reinterpret_cast<PSID>(sid.data()));
+    const bool builtin_administrator =
+      count != nullptr && *count > 0 &&
+      *GetSidSubAuthority(reinterpret_cast<PSID>(sid.data()), static_cast<DWORD>(*count - 1)) ==
+        DOMAIN_USER_RID_ADMIN;
+    if (builtin_administrator && !config::plank_auth.allow_root_login) {
+      BOOST_LOG(warning)
+        << "The built-in Administrator account may not connect "
+           "(security.allow_root_login is false); refusing.";
       return false;
     }
-    if (!EqualSid(reinterpret_cast<PSID>(owner_sid.data()), reinterpret_cast<PSID>(requested_sid.data()))) {
+
+    const auto relation = desktop_owner_relation(account);
+    if (relation == desktop_owner_e::different) {
       BOOST_LOG(warning)
         << "Authenticated account does not own the host's desktop session; refusing.";
       return false;
     }
+    if (relation == desktop_owner_e::none) {
+      // Login screen: as at the Linux GDM greeter, any authenticated account may
+      // connect and sign in inside the stream. Ownership is rechecked while
+      // streaming (desktop_owner_relation) once someone signs in.
+      BOOST_LOG(info) << "Attesting the Windows login screen for " << account;
+    }
     return true;
+  }
+
+  desktop_owner_e desktop_owner_relation(std::string_view account) {
+    DWORD host_session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &host_session)) {
+      return desktop_owner_e::different;
+    }
+    const auto owner = session_account(host_session);
+    if (owner.empty()) {
+      return desktop_owner_e::none;
+    }
+    auto owner_sid = account_sid(owner);
+    auto requested_sid = account_sid(widen(plank::auth::qualified_windows_account(account)));
+    if (owner_sid.empty() || requested_sid.empty() ||
+        !EqualSid(reinterpret_cast<PSID>(owner_sid.data()), reinterpret_cast<PSID>(requested_sid.data()))) {
+      return desktop_owner_e::different;
+    }
+    return desktop_owner_e::same;
   }
 
   std::string session_update_message(const update_t &) {

@@ -531,6 +531,13 @@ namespace nvhttp {
    * @param request Authorized HTTPS request.
    * @return Type-erased PAM session lifetime, or null on failure.
    */
+  std::string authenticated_identity(const req_https_t &request) {
+    if (!web_auth) {
+      return {};
+    }
+    return web_auth->identity(bearer_token(request), authentication_peer(request)).value_or(std::string {});
+  }
+
   std::shared_ptr<void> claim_authentication_session(const req_https_t &request) {
     return web_auth ? web_auth->claim(bearer_token(request), authentication_peer(request)) : nullptr;
   }
@@ -1540,6 +1547,7 @@ namespace nvhttp {
       }
     }
 
+    launch_session->authenticated_account = authenticated_identity(request);
     launch_session->authentication_session = claim_authentication_session(request);
     if (!launch_session->authentication_session) {
       tree.put("root.<xmlattr>.status_code", 401);
@@ -1688,6 +1696,7 @@ namespace nvhttp {
       // probing with a prior stream's capture teardown.
     }
 
+    launch_session->authenticated_account = authenticated_identity(request);
     launch_session->authentication_session = claim_authentication_session(request);
     if (!launch_session->authentication_session) {
       tree.put("root.<xmlattr>.status_code", 401);

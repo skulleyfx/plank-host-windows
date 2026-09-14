@@ -715,6 +715,7 @@ namespace config {
     {},  // duo_secret_key
     {},  // duo_api_host
     {},  // default_domain
+    false,  // built-in Administrator denied by default
   };
 
   video_t video {
@@ -1567,6 +1568,8 @@ namespace config {
     // media worker accepts the shared configuration without owning auth policy.
     bool broker_allow_root_login = false;
     bool_f(vars, "allow_root_login", broker_allow_root_login);
+    // Windows has no separate broker, so the host enforces it directly.
+    plank_auth.allow_root_login = broker_allow_root_login;
 
     // Windows has no PAM stack, so the second-factor provider is named here.
     // Unknown names fail closed in make_second_factor(); see AUTH-AND-DUO.md.

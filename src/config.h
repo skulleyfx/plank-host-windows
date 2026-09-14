@@ -281,6 +281,7 @@ namespace config {
     std::string duo_secret_key;  ///< DUO Auth API secret key; redacted from logs.
     std::string duo_api_host;  ///< DUO API hostname, e.g. api-XXXXXXXX.duosecurity.com.
     std::string default_domain;  ///< Domain applied to bare account names, e.g. SKULLEYFX.
+    bool allow_root_login;  ///< Windows: permit the built-in Administrator (RID 500). Default false.
   };
 
   struct sunshine_t {

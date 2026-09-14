@@ -47,6 +47,7 @@ namespace session_stream {
     uid_t plank_display_lease_uid {};  ///< PAM account that owns the temporary display lease.
 
     std::shared_ptr<void> authentication_session;  ///< PAM lifetime retained by PLANK streams.
+    std::string authenticated_account;  ///< Account that authenticated this launch.
     std::shared_ptr<void> plank_transport_endpoint;  ///< Experimental QUIC data-plane lifetime.
   };
 

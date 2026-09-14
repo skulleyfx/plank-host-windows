@@ -114,6 +114,26 @@ namespace plank::session {
    * @return True when the account owns the desktop session the host captures.
    */
   bool supervisor_attests_account_name_for_active_seat0(std::string_view account);
+
+  /**
+   * @brief Relationship between a streaming account and the captured desktop's owner.
+   */
+  enum class desktop_owner_e {
+    same,  ///< The account owns the desktop.
+    none,  ///< Nobody is logged in (login screen).
+    different,  ///< Another account owns the desktop, or ownership cannot be resolved.
+  };
+
+  /**
+   * @brief Compare an account with the current owner of the host's session.
+   *
+   * Used during a stream: logging in at the Windows login screen often reuses
+   * the same session, so ownership must be rechecked while streaming.
+   *
+   * @param account Streaming account name.
+   * @return Ownership relation.
+   */
+  desktop_owner_e desktop_owner_relation(std::string_view account);
 #endif
 
   /** Encode or decode one bounded supervisor desktop-attachment update. */

@@ -107,6 +107,7 @@ namespace stream {
     bool plank_display_lease {};  ///< Whether this stream owns the temporary physical-display layout.
     uid_t plank_display_lease_uid {};  ///< PAM account that owns the display lease.
     std::shared_ptr<void> authentication_session;  ///< PAM lifetime retained until this stream is destroyed.
+    std::string authenticated_account;  ///< Account that authenticated this stream.
     std::shared_ptr<void> plank_transport_endpoint;  ///< Native QUIC data-plane lifetime.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
@@ -595,11 +596,26 @@ namespace stream {
 
     BOOST_LOG(info) << "PLANK cursor position and shape use fixed-deadline GetCursorInfo sampling"sv;
     std::uint64_t position_sequence = 0;
+    // Signing in at the Windows login screen usually reuses the same session,
+    // so desktop ownership is rechecked while streaming. A stream opened at the
+    // login screen must not continue into another account's desktop.
+    constexpr auto ownership_check_period = 1s;
+    auto next_ownership_check = std::chrono::steady_clock::now() + ownership_check_period;
     std::uintptr_t queued_shape = image.visible ? static_cast<std::uintptr_t>(image.serial) : 0;
     constexpr auto cursor_sample_period = 16'666'667ns;
     auto next_cursor_sample = std::chrono::steady_clock::now();
 
     while (!stop_token.stop_requested()) {
+      if (std::chrono::steady_clock::now() >= next_ownership_check) {
+        next_ownership_check = std::chrono::steady_clock::now() + ownership_check_period;
+        if (plank::session::desktop_owner_relation(session->authenticated_account) ==
+            plank::session::desktop_owner_e::different) {
+          BOOST_LOG(warning) << "The captured desktop is now owned by a different account than "
+                             << session->authenticated_account << "; ending the stream"sv;
+          session::stop(*session);
+          return;
+        }
+      }
       platf::win_cursor_position_t root_position {};
       if (!platf::win_cursor_query(root_position)) {
         // GetCursorInfo fails transiently while the secure desktop is active
@@ -1366,6 +1382,7 @@ namespace stream {
       session->plank_display_lease_uid =
         launch_session.plank_display_lease_uid;
       session->authentication_session = launch_session.authentication_session;
+      session->authenticated_account = launch_session.authenticated_account;
       session->plank_transport_endpoint = launch_session.plank_transport_endpoint;
 
       if (session->plank_display_lease &&
