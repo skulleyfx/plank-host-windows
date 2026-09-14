@@ -829,10 +829,17 @@ namespace stream {
             continue;
           }
 
-          // The client expects the native setup reply as the first data
-          // message, so cursor traffic must not start before it is sent.
-          if (!session->cursorThread.joinable() &&
-              session->setup_response_sent.load(std::memory_order_acquire)) {
+          // The client expects the native setup reply as its first data
+          // message. Hold every Host-to-Client control message (HDR mode,
+          // tablet feedback, cursor) until it has been sent; queued events
+          // stay queued. Video can start before audio setup completes, so
+          // gating only the cursor still let an HDR notice arrive first.
+          if (!session->setup_response_sent.load(std::memory_order_acquire)) {
+            ++pos;
+            continue;
+          }
+
+          if (!session->cursorThread.joinable()) {
             session->cursorThread = std::jthread(localCursorThread, session);
           }
 
