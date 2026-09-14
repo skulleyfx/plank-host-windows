@@ -199,7 +199,7 @@ namespace plank::auth {
     return *this;
   }
 
-  step_t pam_client_t::begin(const std::filesystem::path &, std::uint64_t transaction_id,
+  step_t pam_client_t::begin(std::uint64_t transaction_id,
                              std::string_view username, std::string_view remote_host,
                              std::string_view) {
     transaction_id_ = transaction_id;

@@ -369,8 +369,22 @@ namespace plank::session {
     return display_request_status::submitted;
   }
 
+  std::string_view desktop_stage(const descriptor_t &, const descriptor_t &) {
+    // Windows has no logind descriptors; confirmed_desktop_stage() answers directly.
+    return "unknown";
+  }
+
+  std::string confirmed_desktop_stage() {
+    DWORD host_session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &host_session) || host_session == 0) {
+      return "unknown";
+    }
+    // Nobody signed in to the captured session means the Windows sign-in screen.
+    return session_account(host_session).empty() ? "greeter" : "user";
+  }
+
   std::unique_ptr<supervisor_control_t> start_supervisor_control(
-    std::function<void(std::uint64_t)>) {
+    std::function<void(std::uint64_t)>, std::function<void()>) {
     unimplemented_once("start_supervisor_control");
     return nullptr;
   }
