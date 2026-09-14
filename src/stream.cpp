@@ -587,9 +587,17 @@ namespace stream {
 #elif defined(_WIN32)
     platf::win_cursor_image_t image {};
     std::uint64_t generation = 1;
-    if (!platf::win_cursor_capture(image) ||
-        !queue_cursor_shape(session, image, generation)) {
-      BOOST_LOG(error) << "Unable to capture the initial Windows cursor"sv;
+    if (!platf::win_cursor_capture(image)) {
+      // The secure desktop can refuse access transiently; start hidden and let
+      // the sampling loop publish the real shape once it can be read.
+      BOOST_LOG(warning) << "Initial Windows cursor unavailable; starting with a hidden cursor"sv;
+      image.pixels.assign(4, 0);
+      image.width = image.height = 1;
+      image.hotspot_x = image.hotspot_y = 0;
+      image.visible = false;
+      image.serial = 0;
+    }
+    if (!queue_cursor_shape(session, image, generation)) {
       session::stop(*session);
       return;
     }

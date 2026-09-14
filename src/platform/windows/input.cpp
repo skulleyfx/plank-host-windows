@@ -18,6 +18,7 @@
 
 // standard includes
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -138,10 +139,34 @@ namespace platf {
     return caps;
   }
 
+  namespace {
+    /**
+     * @brief GetCursorInfo on the active input desktop.
+     *
+     * The login and lock screens run on the Winlogon secure desktop, so the
+     * calling thread follows the input desktop before sampling; a thread left
+     * on the default desktop is denied access there.
+     */
+    bool cursor_info_on_input_desktop(CURSORINFO &info) {
+      info.cbSize = sizeof(info);
+      if (GetCursorInfo(&info)) {
+        return true;
+      }
+      syncThreadDesktop();
+      return GetCursorInfo(&info) != FALSE;
+    }
+  }  // namespace
+
   bool win_cursor_query(win_cursor_position_t &position) {
     CURSORINFO info {};
-    info.cbSize = sizeof(info);
-    if (!GetCursorInfo(&info)) {
+    // Leaving the secure desktop does not make GetCursorInfo fail, so also
+    // resynchronise periodically rather than only on error.
+    static thread_local auto next_sync = std::chrono::steady_clock::time_point {};
+    if (std::chrono::steady_clock::now() >= next_sync) {
+      next_sync = std::chrono::steady_clock::now() + 500ms;
+      syncThreadDesktop();
+    }
+    if (!cursor_info_on_input_desktop(info)) {
       return false;
     }
     const int origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -200,8 +225,7 @@ namespace platf {
 
   bool win_cursor_capture(win_cursor_image_t &image) {
     CURSORINFO info {};
-    info.cbSize = sizeof(info);
-    if (!GetCursorInfo(&info)) {
+    if (!cursor_info_on_input_desktop(info)) {
       return false;
     }
     const auto shape = reinterpret_cast<std::uintptr_t>(info.hCursor);
