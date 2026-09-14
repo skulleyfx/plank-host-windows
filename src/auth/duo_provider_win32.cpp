@@ -25,6 +25,8 @@
 #include <mutex>
 #include <chrono>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <format>
 #include <map>
 #include <optional>
@@ -278,6 +280,78 @@ namespace plank::auth {
     }
 
     /**
+     * @brief DUO remembered-device tokens, persisted across host restarts.
+     *
+     * The host restarts whenever the console session changes (sign-in,
+     * sign-out), and the client then re-authenticates automatically, so tokens
+     * must outlive the process. DUO does not bind a token to a machine, so
+     * PLANK stores it per account and source address: a remembered sign-in from
+     * one client cannot be replayed from another. The password is still
+     * verified on every sign-in, and DUO policy sets the token lifetime. The
+     * file lives in %ProgramData%\PLANK, readable only by SYSTEM and
+     * Administrators.
+     */
+    class trusted_device_store_t {
+    public:
+      static std::string key(std::string_view username, std::string_view remote_host) {
+        return lowercase(username) + "|" + std::string {remote_host};
+      }
+
+      static std::string get(const std::string &key) {
+        std::lock_guard lock {mutex()};
+        const auto tokens = load();
+        const auto found = tokens.find(key);
+        return found != tokens.end() && found->is_string() ? found->get<std::string>() : std::string {};
+      }
+
+      static void put(const std::string &key, const std::string &token) {
+        std::lock_guard lock {mutex()};
+        auto tokens = load();
+        if (token.empty()) {
+          tokens.erase(key);
+        } else {
+          tokens[key] = token;
+        }
+        save(tokens);
+      }
+
+    private:
+      static std::mutex &mutex() {
+        static std::mutex m;
+        return m;
+      }
+
+      static std::filesystem::path path() {
+        return platf::appdata() / "duo-trusted-devices.json";
+      }
+
+      static nlohmann::json load() {
+        std::ifstream in {path()};
+        auto json = in ? nlohmann::json::parse(in, nullptr, false) : nlohmann::json::object();
+        return json.is_object() ? json : nlohmann::json::object();
+      }
+
+      static void save(const nlohmann::json &tokens) {
+        const auto target = path();
+        auto temporary = target;
+        temporary += ".tmp";
+        {
+          std::ofstream out {temporary, std::ios::trunc};
+          out << tokens.dump();
+          if (!out) {
+            BOOST_LOG(warning) << "Unable to write DUO remembered-device tokens";
+            return;
+          }
+        }
+        std::error_code ec;
+        std::filesystem::rename(temporary, target, ec);
+        if (ec) {
+          BOOST_LOG(warning) << "Unable to replace DUO remembered-device tokens: " << ec.message();
+        }
+      }
+    };
+
+    /**
      * @brief State shared between a DUO exchange and its worker thread.
      *
      * The worker outlives the provider if a DUO call is still in flight when
@@ -373,8 +447,15 @@ namespace plank::auth {
           params.emplace("ipaddr", remote_host);
         }
 
+        const auto device_key = trusted_device_store_t::key(username, remote_host);
+        const auto trusted_token = trusted_device_store_t::get(device_key);
+        auto preauth_params = params;
+        if (!trusted_token.empty()) {
+          preauth_params.emplace("trusted_device_token", trusted_token);
+        }
+
         std::string reason;
-        const auto preauth = duo_response(client.call("POST", "/auth/v2/preauth", params, 8s), reason);
+        const auto preauth = duo_response(client.call("POST", "/auth/v2/preauth", preauth_params, 8s), reason);
         if (!preauth) {
           unreachable(*exchange, failmode, username, reason);
           return;
@@ -382,9 +463,17 @@ namespace plank::auth {
         const auto result = preauth->value("result", "");
         const auto message = preauth->value("status_msg", "");
         if (result == "allow") {
-          BOOST_LOG(warning) << "DUO allowed " << username << " without a second factor: " << message;
-          finish(*exchange, factor_step_t::state_e::approved, "DUO preauth allow: " + message);
+          if (!trusted_token.empty()) {
+            BOOST_LOG(info) << "DUO remembered device for " << username << " from " << remote_host << ": " << message;
+            finish(*exchange, factor_step_t::state_e::approved, "DUO remembered device: " + message);
+          } else {
+            BOOST_LOG(warning) << "DUO allowed " << username << " without a second factor: " << message;
+            finish(*exchange, factor_step_t::state_e::approved, "DUO preauth allow: " + message);
+          }
           return;
+        }
+        if (!trusted_token.empty()) {
+          trusted_device_store_t::put(device_key, {});  // expired or revoked
         }
         if (result != "auth") {
           // deny or enroll: never fall through to password-only.
@@ -442,6 +531,10 @@ namespace plank::auth {
           const auto state = status->value("result", "");
           const auto status_msg = status->value("status_msg", "");
           if (state == "allow") {
+            // Present only when DUO policy enables Remembered Devices.
+            if (const auto token = status->value("trusted_device_token", ""); !token.empty()) {
+              trusted_device_store_t::put(device_key, token);
+            }
             finish(*exchange, factor_step_t::state_e::approved, "DUO push approved: " + status_msg);
             return;
           }
