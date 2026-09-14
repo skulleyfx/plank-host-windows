@@ -134,6 +134,19 @@ namespace plank::session {
    * @return Ownership relation.
    */
   desktop_owner_e desktop_owner_relation(std::string_view account);
+
+  /**
+   * @brief Lock the signed-in desktop once no stream has resumed within the configured delay.
+   *
+   * A later stream start cancels the pending lock, so a network interruption
+   * or an automatic reconnect does not lock the user out.
+   *
+   * @param still_idle Returns true while no stream is running.
+   */
+  void schedule_lock_after_disconnect(std::function<bool()> still_idle);
+
+  /** Cancel a pending lock because a stream started. */
+  void cancel_lock_after_disconnect();
 #endif
 
   /** Encode or decode one bounded supervisor desktop-attachment update. */

@@ -717,6 +717,8 @@ namespace config {
     {},  // default_domain
     false,  // built-in Administrator denied by default
     10,  // second_factor_resume_minutes
+    true,  // lock_on_disconnect
+    30,  // lock_on_disconnect_delay
   };
 
   video_t video {
@@ -1582,6 +1584,8 @@ namespace config {
     string_f(vars, "duo_api_host", plank_auth.duo_api_host);
     string_f(vars, "default_domain", plank_auth.default_domain);
     int_between_f(vars, "second_factor_resume_minutes", plank_auth.second_factor_resume_minutes, {0, 1440});
+    bool_f(vars, "lock_on_disconnect", plank_auth.lock_on_disconnect);
+    int_between_f(vars, "lock_on_disconnect_delay", plank_auth.lock_on_disconnect_delay, {0, 3600});
 
     string_f(vars, "audio_sink", audio.sink);
 

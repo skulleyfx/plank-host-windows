@@ -18,7 +18,9 @@
 #include <windows.h>
 #include <wtsapi32.h>
 
+#include <atomic>
 #include <chrono>
+#include <functional>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
@@ -207,6 +209,56 @@ namespace plank::session {
       return desktop_owner_e::different;
     }
     return desktop_owner_e::same;
+  }
+
+  namespace {
+    std::atomic_uint64_t &lock_generation() {
+      static std::atomic_uint64_t generation {0};
+      return generation;
+    }
+
+    bool session_locked(DWORD session_id) {
+      WTSINFOEXW *info = nullptr;
+      DWORD bytes = 0;
+      if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session_id, WTSSessionInfoEx,
+                                       reinterpret_cast<LPWSTR *>(&info), &bytes) ||
+          info == nullptr) {
+        return false;
+      }
+      // WTS_SESSIONSTATE_LOCK is 0; Windows 7 and Server 2008 R2 invert it, which we do not support.
+      const bool locked = info->Level == 1 && info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
+      WTSFreeMemory(info);
+      return locked;
+    }
+  }  // namespace
+
+  void schedule_lock_after_disconnect(std::function<bool()> still_idle) {
+    if (!config::plank_auth.lock_on_disconnect) {
+      return;
+    }
+    const auto generation = ++lock_generation();
+    const auto delay = std::chrono::seconds {config::plank_auth.lock_on_disconnect_delay};
+    std::thread([generation, delay, still_idle = std::move(still_idle)] {
+      std::this_thread::sleep_for(delay);
+      if (lock_generation() != generation || !still_idle()) {
+        return;  // a stream resumed, or another lock is pending
+      }
+      DWORD host_session = 0;
+      if (!ProcessIdToSessionId(GetCurrentProcessId(), &host_session) || host_session == 0 ||
+          session_account(host_session).empty() || session_locked(host_session)) {
+        return;  // sign-in screen, already locked, or no interactive session
+      }
+      if (LockWorkStation()) {
+        BOOST_LOG(info) << "Locked the workstation after the PLANK stream ended";
+      } else {
+        BOOST_LOG(warning) << "Unable to lock the workstation after the PLANK stream ended ("
+                           << GetLastError() << ')';
+      }
+    }).detach();
+  }
+
+  void cancel_lock_after_disconnect() {
+    ++lock_generation();
   }
 
   std::string session_update_message(const update_t &) {

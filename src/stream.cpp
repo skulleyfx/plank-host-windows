@@ -1330,6 +1330,11 @@ namespace stream {
         }
 
         platf::streaming_will_stop();
+#ifdef _WIN32
+        plank::session::schedule_lock_after_disconnect([] {
+          return running_sessions.load() == 0;
+        });
+#endif
         if (session.plank_display_lease) {
           const auto released = plank::session::release_display_lease(
             session.plank_display_lease_uid
@@ -1372,6 +1377,10 @@ namespace stream {
 #endif
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
+#ifdef _WIN32
+      // A stream resumed before the disconnect lock fired.
+      plank::session::cancel_lock_after_disconnect();
+#endif
 
       // If this is the first session, invoke the platform callbacks
       if (++running_sessions == 1) {
