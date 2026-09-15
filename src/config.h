@@ -285,6 +285,7 @@ namespace config {
     int second_factor_resume_minutes;  ///< Lifetime of reconnect tickets that skip a repeat second factor; 0 disables.
     bool lock_on_disconnect;  ///< Windows: lock the signed-in desktop after the last stream ends. Default true.
     int lock_on_disconnect_delay;  ///< Seconds to wait for a reconnect before locking.
+    std::string admin_group;  ///< Windows: group whose members see host details such as the signed-in user. Empty means BUILTIN\\Administrators.
   };
 
   struct sunshine_t {

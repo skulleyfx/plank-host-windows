@@ -120,6 +120,18 @@ namespace plank::auth {
   std::string qualified_windows_account(std::string_view account);
 
   /**
+   * @brief Whether an account was in security.admin_group when it last signed in.
+   *
+   * Membership is read from the logon token at each password sign-in and kept
+   * for the life of the host process. An account that has not signed in with
+   * a password since the host started is not treated as an admin.
+   *
+   * @param account Account name as presented.
+   * @return True for a remembered member of the admin group.
+   */
+  bool account_is_plank_admin(std::string_view account);
+
+  /**
    * @brief Hold a resume ticket presented at sign-in start until the password is checked.
    *
    * @param username Account name as presented.

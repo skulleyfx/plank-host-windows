@@ -1196,6 +1196,10 @@ namespace stream {
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
 
+    unsigned running_count() {
+      return running_sessions.load();
+    }
+
     /**
      * @brief Platform handle returned from stream setup.
      */

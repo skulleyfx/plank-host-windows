@@ -136,6 +136,13 @@ namespace plank::session {
   desktop_owner_e desktop_owner_relation(std::string_view account);
 
   /**
+   * @brief Account signed in to the host's desktop session, or empty at the sign-in screen.
+   *
+   * @return "DOMAIN\\user" in UTF-8.
+   */
+  std::string signed_in_account();
+
+  /**
    * @brief Lock the signed-in desktop once no stream has resumed within the configured delay.
    *
    * A later stream start cancels the pending lock, so a network interruption

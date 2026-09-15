@@ -104,5 +104,12 @@ namespace stream {
      * @param session Active streaming session.
      */
     void mark_setup_response_sent(session_t &session);
+
+    /**
+     * @brief Number of streams currently running.
+     *
+     * @return Running stream count.
+     */
+    unsigned running_count();
   }  // namespace session
 }  // namespace stream

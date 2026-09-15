@@ -16,8 +16,12 @@
 
 #include "pam_client.h"
 
+#include <algorithm>
+#include <cctype>
 #include <map>
 #include <mutex>
+#include <set>
+#include <vector>
 
 #include <windows.h>
 
@@ -66,6 +70,59 @@ namespace plank::auth {
       domain = L".";  // local account; qualified_windows_account() adds default_domain first
     }
 
+    std::string admin_key(std::string_view account) {
+      std::string key = qualified_windows_account(account);
+      std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+      });
+      return key;
+    }
+
+    std::mutex &admin_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
+    std::set<std::string> &admin_accounts() {
+      static std::set<std::string> accounts;
+      return accounts;
+    }
+
+    /**
+     * @brief Check a logon token for membership of security.admin_group.
+     */
+    bool token_in_admin_group(HANDLE token) {
+      std::vector<BYTE> sid_buffer;
+      PSID sid = nullptr;
+      if (config::plank_auth.admin_group.empty()) {
+        sid_buffer.resize(SECURITY_MAX_SID_SIZE);
+        DWORD size = static_cast<DWORD>(sid_buffer.size());
+        if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, sid_buffer.data(), &size)) {
+          return false;
+        }
+        sid = sid_buffer.data();
+      } else {
+        const auto &name = config::plank_auth.admin_group;
+        const int wide_size = MultiByteToWideChar(CP_UTF8, 0, name.data(), static_cast<int>(name.size()), nullptr, 0);
+        std::wstring wide(static_cast<std::size_t>(wide_size), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, name.data(), static_cast<int>(name.size()), wide.data(), wide_size);
+        DWORD sid_size = 0;
+        DWORD domain_size = 0;
+        SID_NAME_USE use {};
+        LookupAccountNameW(nullptr, wide.c_str(), nullptr, &sid_size, nullptr, &domain_size, &use);
+        sid_buffer.resize(sid_size);
+        std::wstring domain(domain_size, L'\0');
+        if (sid_size == 0 ||
+            !LookupAccountNameW(nullptr, wide.c_str(), sid_buffer.data(), &sid_size, domain.data(), &domain_size, &use)) {
+          BOOST_LOG(warning) << "PLANK admin_group could not be resolved: " << name;
+          return false;
+        }
+        sid = sid_buffer.data();
+      }
+      BOOL member = FALSE;
+      return CheckTokenMembership(token, sid, &member) && member;
+    }
+
     /**
      * @brief Validate an account password without creating a logon session.
      *
@@ -98,7 +155,14 @@ namespace plank::auth {
         SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
       }
       if (token != nullptr) {
+        const bool admin = token_in_admin_group(token);
         CloseHandle(token);
+        std::lock_guard lock {admin_mutex()};
+        if (admin) {
+          admin_accounts().insert(admin_key(account));
+        } else {
+          admin_accounts().erase(admin_key(account));
+        }
       }
       if (!ok) {
         reason = "LogonUser failed (" + std::to_string(last_error) + ")";
@@ -174,6 +238,14 @@ namespace plank::auth {
       return std::string {account};
     }
     return config::plank_auth.default_domain + "\\" + std::string {account};
+  }
+
+  bool account_is_plank_admin(std::string_view account) {
+    if (account.empty()) {
+      return false;
+    }
+    std::lock_guard lock {admin_mutex()};
+    return admin_accounts().contains(admin_key(account));
   }
 
   pam_client_t::~pam_client_t() {

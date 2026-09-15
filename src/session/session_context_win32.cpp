@@ -193,6 +193,23 @@ namespace plank::session {
     return true;
   }
 
+  std::string signed_in_account() {
+    DWORD host_session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &host_session) || host_session == 0) {
+      return {};
+    }
+    const std::wstring account = session_account(host_session);
+    if (account.empty()) {
+      return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, account.data(), static_cast<int>(account.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    std::string result(static_cast<std::size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, account.data(), static_cast<int>(account.size()),
+                        result.data(), size, nullptr, nullptr);
+    return result;
+  }
+
   desktop_owner_e desktop_owner_relation(std::string_view account) {
     DWORD host_session = 0;
     if (!ProcessIdToSessionId(GetCurrentProcessId(), &host_session)) {

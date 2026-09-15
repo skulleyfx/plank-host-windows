@@ -63,6 +63,7 @@
 #include "process.h"
 #include "session_stream.h"
 #include "session/session_context.h"
+#include "stream.h"
 #include "plank_topology.h"
 #include "utility.h"
 #include "uuid.h"
@@ -1371,6 +1372,16 @@ namespace nvhttp {
     // This compatibility-shaped field reports PAM bearer authorization.
     tree.put("root.PairStatus", authorization_status);
     tree.put("root.currentgame", current_appid);
+    // Whether anyone is streaming, so clients can warn before taking over.
+    tree.put("root.PlankStreamActive", stream::session::running_count() > 0 ? 1 : 0);
+#ifdef _WIN32
+    // The Windows account at the desktop is shown only to admin-group members.
+    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (authorization_status == 1 && plank::auth::account_is_plank_admin(authenticated_identity(request))) {
+        tree.put("root.PlankSignedInUser", plank::session::signed_in_account());
+      }
+    }
+#endif
     tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
 
     std::ostringstream data;
