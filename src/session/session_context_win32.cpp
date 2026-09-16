@@ -28,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+#include "display_arrange.h"
 #include "src/auth/second_factor.h"
 #include "src/config.h"
 #include "src/display_device.h"
@@ -344,6 +345,42 @@ namespace plank::session {
       return true;
     }
 
+    /// Physical displays we can arrange, ignoring virtual ones added by other
+    /// remote-desktop software.
+    std::vector<plank::display_arrange::display_mode_t> streamable_displays() {
+      std::vector<plank::display_arrange::display_mode_t> displays;
+      for (auto &display : plank::display_arrange::current_layout()) {
+        DISPLAY_DEVICEW device {};
+        device.cb = sizeof(device);
+        const std::wstring name = widen(display.name);
+        std::string adapter;
+        if (EnumDisplayDevicesW(nullptr, 0, &device, 0)) {
+          for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index) {
+            device.cb = sizeof(device);
+            if (name == device.DeviceName) {
+              const int size = WideCharToMultiByte(CP_UTF8, 0, device.DeviceString, -1,
+                                                   nullptr, 0, nullptr, nullptr);
+              if (size > 1) {
+                adapter.resize(static_cast<std::size_t>(size - 1));
+                WideCharToMultiByte(CP_UTF8, 0, device.DeviceString, -1, adapter.data(),
+                                    size, nullptr, nullptr);
+              }
+              break;
+            }
+          }
+        }
+        // DCV, Teradici and similar add virtual displays that are not part of
+        // the workstation's screens.
+        if (adapter.find("Indirect") != std::string::npos ||
+            adapter.find("Teradici") != std::string::npos ||
+            adapter.find("Remote") != std::string::npos) {
+          continue;
+        }
+        displays.push_back(std::move(display));
+      }
+      return displays;
+    }
+
     int active_display_count() {
       int count = 0;
       DISPLAY_DEVICEW device {};
@@ -379,10 +416,51 @@ namespace plank::session {
     if (display_lease() && display_lease()->lease_uid != request.account_uid) {
       return display_request_status::wrong_user;
     }
-    // Only a single display is switched; a dual layout would need two
-    // physical displays positioned side by side.
     unsigned width = 0;
     unsigned height = 0;
+
+    // Two screens: arrange both displays side by side at the requested modes.
+    if (request.layout == "dual-horizontal") {
+      unsigned second_width = 0;
+      unsigned second_height = 0;
+      if (!parse_mode(request.mode_1, width, height) ||
+          !parse_mode(request.mode_2, second_width, second_height)) {
+        BOOST_LOG(warning) << "Two-screen layout needs two valid modes; got "
+                           << request.mode_1 << " and " << request.mode_2;
+        return display_request_status::unavailable;
+      }
+
+      auto displays = streamable_displays();
+      if (displays.size() != 2) {
+        BOOST_LOG(warning) << "Two-screen layout needs exactly two workstation displays; found "
+                           << displays.size();
+        return display_request_status::unavailable;
+      }
+
+      // Remember the arrangement before changing it, so it survives a crash.
+      if (!display_lease()) {
+        plank::display_arrange::save_saved_layout(plank::display_arrange::current_layout());
+      }
+
+      auto left = displays[0];
+      left.width = width;
+      left.height = height;
+      auto right = displays[1];
+      right.width = second_width;
+      right.height = second_height;
+
+      if (!plank::display_arrange::apply_side_by_side(left, right)) {
+        BOOST_LOG(warning) << "The workstation displays do not support "
+                           << request.mode_1 << " + " << request.mode_2;
+        plank::display_arrange::restore_saved_layout_if_any();
+        return display_request_status::unavailable;
+      }
+
+      display_lease() = runtime_display_state_t {request.layout, request.mode_1, request.mode_2, request.account_uid};
+      return display_request_status::submitted;
+    }
+
+    // One screen: switch the active display's mode.
     if (request.layout != "single" || !request.mode_2.empty() ||
         !parse_mode(request.mode_1, width, height) || active_display_count() != 1) {
       BOOST_LOG(warning) << "Windows host can only switch a single active display; requested layout "
@@ -433,7 +511,11 @@ namespace plank::session {
       return display_request_status::unavailable;
     }
     BOOST_LOG(info) << "Restoring the host display after the PLANK session";
-    ::display_device::revert_configuration();
+    if (display_lease()->layout == "dual-horizontal") {
+      plank::display_arrange::restore_saved_layout_if_any();
+    } else {
+      ::display_device::revert_configuration();
+    }
     display_lease().reset();
     return display_request_status::submitted;
   }

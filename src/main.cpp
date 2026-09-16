@@ -28,6 +28,9 @@
   #include "session/session_context.h"
 #endif
 #include "video.h"
+#ifdef _WIN32
+  #include "session/display_arrange.h"
+#endif
 
 #ifdef PLANK_TRANSPORT
   #include <plank_transport.h>
@@ -386,6 +389,12 @@ int main(int argc, char *argv[]) {
   if (!platf_deinit_guard) {
     BOOST_LOG(error) << "Platform failed to initialize"sv;
   }
+
+#ifdef _WIN32
+  // A host that died during a two-screen session leaves the workstation's
+  // displays rearranged. Put them back before anyone sits down at it.
+  plank::display_arrange::restore_saved_layout_if_any();
+#endif
 
   auto proc_deinit_guard = proc::init();
   if (!proc_deinit_guard) {

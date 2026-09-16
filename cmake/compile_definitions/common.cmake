@@ -151,7 +151,8 @@ if(WIN32)
             "${CMAKE_SOURCE_DIR}/src/auth/duo_provider_win32.cpp"
             "${CMAKE_SOURCE_DIR}/src/auth/resume_ticket_win32.cpp"
             "${CMAKE_SOURCE_DIR}/src/session/session_context_win32.cpp"
-            "${CMAKE_SOURCE_DIR}/src/session/clipboard_win32.cpp")
+            "${CMAKE_SOURCE_DIR}/src/session/clipboard_win32.cpp"
+            "${CMAKE_SOURCE_DIR}/src/session/display_arrange_win32.cpp")
 else()
     set(PLANK_PLATFORM_AUTH_SESSION_SOURCES
             "${CMAKE_SOURCE_DIR}/src/auth/pam_client.cpp"
@@ -167,6 +168,7 @@ set(SUNSHINE_TARGET_FILES
         ${PLANK_PLATFORM_AUTH_SESSION_SOURCES}
         "${CMAKE_SOURCE_DIR}/src/session/session_context.h"
         "${CMAKE_SOURCE_DIR}/src/session/clipboard.h"
+        "${CMAKE_SOURCE_DIR}/src/session/display_arrange.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Limelight.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/plank.h"
