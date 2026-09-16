@@ -125,6 +125,8 @@ namespace nvhttp {
     plank::topology::feature_selected_output;
   constexpr auto plank_feature_scaled_span =
     plank::topology::feature_scaled_span;
+  constexpr auto plank_topology_two_screen_capture =
+    plank::topology::feature_two_screen_capture;
   constexpr auto plank_feature_topology_generation =
     plank::topology::feature_topology_generation;
   constexpr auto plank_feature_composite_source_regions =
@@ -912,7 +914,14 @@ namespace nvhttp {
         return false;
       }
       session.output_name.clear();
+#ifdef _WIN32
+      // Windows joins two outputs into one canvas, which older clients cannot
+      // lay out. They keep the previous behaviour: the first output only.
+      session.span_desktop =
+        (session.plank_feature_flags & plank_topology_two_screen_capture) != 0;
+#else
       session.span_desktop = true;
+#endif
       BOOST_LOG(info) << "PLANK selected "sv << session.display_mode
                       << " virtual-desktop span"sv;
       return true;

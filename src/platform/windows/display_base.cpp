@@ -56,6 +56,10 @@ namespace platf::dxgi {
    * DDAPI-specific initialization goes here.
    */
   int duplication_t::init(display_base_t *display, const ::video::config_t &config) {
+    return init(display, config, display->output);
+  }
+
+  int duplication_t::init(display_base_t *display, const ::video::config_t &config, output_t &target_output) {
     HRESULT status;
 
     // Capture format will be determined from the first call to AcquireNextFrame()
@@ -65,7 +69,7 @@ namespace platf::dxgi {
     {
       // IDXGIOutput5 is optional, but can provide improved performance and wide color support
       dxgi::output5_t output5 {};
-      status = display->output->QueryInterface(IID_IDXGIOutput5, (void **) &output5);
+      status = target_output->QueryInterface(IID_IDXGIOutput5, (void **) &output5);
       if (SUCCEEDED(status)) {
         // Ask the display implementation which formats it supports
         auto supported_formats = display->get_supported_capture_formats();
@@ -97,7 +101,7 @@ namespace platf::dxgi {
         BOOST_LOG(warning) << "IDXGIOutput5 is not supported by your OS. Capture performance may be reduced."sv;
 
         dxgi::output1_t output1 {};
-        status = display->output->QueryInterface(IID_IDXGIOutput1, (void **) &output1);
+        status = target_output->QueryInterface(IID_IDXGIOutput1, (void **) &output1);
         if (FAILED(status)) {
           BOOST_LOG(error) << "Failed to query IDXGIOutput1 from the output"sv;
           return -1;
@@ -1014,6 +1018,17 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    // A spanned session covers the whole desktop rather than one output.
+    // Windows can only duplicate one output at a time, so this joins them.
+    if (config.span_desktop && hwdevice_type == mem_type_e::dxgi) {
+      auto disp = std::make_shared<dxgi::display_span_vram_t>();
+
+      if (!disp->init(config, display_name)) {
+        return disp;
+      }
+      BOOST_LOG(info) << "Spanned capture is unavailable; falling back to a single output"sv;
+    }
+
     if (hwdevice_type == mem_type_e::dxgi) {
       auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
 

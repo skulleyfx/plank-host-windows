@@ -1761,6 +1761,214 @@ namespace platf::dxgi {
     return dup.release_frame();
   }
 
+  int display_span_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    // Set up the device against the first duplicatable output, then widen the
+    // geometry to cover every output on that adapter.
+    if (display_base_t::init(config, std::string {})) {
+      return -1;
+    }
+    (void) display_name;
+
+    if (display_rotation != DXGI_MODE_ROTATION_UNSPECIFIED &&
+        display_rotation != DXGI_MODE_ROTATION_IDENTITY) {
+      BOOST_LOG(warning) << "Spanned capture does not support rotated displays"sv;
+      return -1;
+    }
+
+    const int virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    struct candidate_t {
+      std::string name;
+      int left, top, right, bottom;
+      output_t output;
+    };
+    std::vector<candidate_t> candidates;
+
+    output_t::pointer output_p {};
+    for (int index = 0; adapter->EnumOutputs(index, &output_p) != DXGI_ERROR_NOT_FOUND; ++index) {
+      output_t candidate_output {output_p};
+
+      DXGI_OUTPUT_DESC desc;
+      candidate_output->GetDesc(&desc);
+      if (!desc.AttachedToDesktop) {
+        continue;
+      }
+      if (desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED && desc.Rotation != DXGI_MODE_ROTATION_IDENTITY) {
+        BOOST_LOG(warning) << "Skipping rotated output for spanned capture"sv;
+        continue;
+      }
+      candidates.push_back({utf_utils::to_utf8(desc.DeviceName),
+                            desc.DesktopCoordinates.left, desc.DesktopCoordinates.top,
+                            desc.DesktopCoordinates.right, desc.DesktopCoordinates.bottom,
+                            std::move(candidate_output)});
+    }
+
+    if (candidates.size() < 2) {
+      BOOST_LOG(info) << "Spanned capture needs two attached outputs; found "sv << candidates.size();
+      return -1;
+    }
+
+    // Left to right, top to bottom, so the canvas matches what the user sees.
+    std::sort(std::begin(candidates), std::end(candidates), [](const auto &left, const auto &right) {
+      return std::tie(left.left, left.top) < std::tie(right.left, right.top);
+    });
+
+    int min_left = candidates.front().left;
+    int min_top = candidates.front().top;
+    int max_right = candidates.front().right;
+    int max_bottom = candidates.front().bottom;
+    for (const auto &candidate : candidates) {
+      min_left = std::min(min_left, candidate.left);
+      min_top = std::min(min_top, candidate.top);
+      max_right = std::max(max_right, candidate.right);
+      max_bottom = std::max(max_bottom, candidate.bottom);
+    }
+
+    width = max_right - min_left;
+    height = max_bottom - min_top;
+    width_before_rotation = width;
+    height_before_rotation = height;
+    offset_x = min_left - virtual_left;
+    offset_y = min_top - virtual_top;
+
+    for (auto &candidate : candidates) {
+      auto &entry = outputs.emplace_back();
+      entry.name = candidate.name;
+      entry.x = candidate.left - min_left;
+      entry.y = candidate.top - min_top;
+      entry.width = candidate.right - candidate.left;
+      entry.height = candidate.bottom - candidate.top;
+      entry.output = std::move(candidate.output);
+    }
+
+    for (auto &entry : outputs) {
+      if (entry.dup.init(this, config, entry.output)) {
+        BOOST_LOG(error) << "Couldn't duplicate output "sv << entry.name << " for spanned capture"sv;
+        return -1;
+      }
+      BOOST_LOG(info) << "Spanned capture output "sv << entry.name << " at "sv << entry.x << ','
+                      << entry.y << " sized "sv << entry.width << 'x' << entry.height;
+    }
+
+    BOOST_LOG(info) << "Spanned capture canvas is "sv << width << 'x' << height
+                    << " across "sv << outputs.size() << " outputs"sv;
+    return 0;
+  }
+
+  capture_e display_span_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    (void) cursor_visible;  // PLANK sends the cursor separately
+
+    HRESULT status;
+    bool updated = false;
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+
+    for (std::size_t index = 0; index < outputs.size(); ++index) {
+      auto &entry = outputs[index];
+
+      // Wait on the first output only. The others are polled, so an idle
+      // second screen never holds up a frame from the first.
+      const auto wait = index == 0 ? timeout : std::chrono::milliseconds {0};
+
+      DXGI_OUTDUPL_FRAME_INFO frame_info;
+      resource_t::pointer res_p {};
+      auto capture_status = entry.dup.next_frame(frame_info, wait, &res_p);
+      resource_t res {res_p};
+
+      if (capture_status == capture_e::timeout) {
+        continue;
+      }
+      if (capture_status != capture_e::ok) {
+        return capture_status;
+      }
+      if (frame_info.LastPresentTime.QuadPart == 0) {
+        continue;  // cursor-only update
+      }
+
+      texture2d_t src {};
+      status = res->QueryInterface(IID_ID3D11Texture2D, (void **) &src);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Couldn't query the captured texture [0x"sv << util::hex(status).to_string_view() << ']';
+        return capture_e::error;
+      }
+
+      D3D11_TEXTURE2D_DESC desc;
+      src->GetDesc(&desc);
+      if ((int) desc.Width != entry.width || (int) desc.Height != entry.height) {
+        BOOST_LOG(info) << "Spanned output "sv << entry.name << " changed size; reinitializing"sv;
+        return capture_e::reinit;
+      }
+
+      if (capture_format == DXGI_FORMAT_UNKNOWN) {
+        capture_format = desc.Format;
+        BOOST_LOG(info) << "Capture format ["sv << dxgi_format_to_string(capture_format) << ']';
+      } else if (capture_format != desc.Format) {
+        BOOST_LOG(info) << "Capture format changed ["sv << dxgi_format_to_string(capture_format)
+                        << " -> "sv << dxgi_format_to_string(desc.Format) << ']';
+        return capture_e::reinit;
+      }
+
+      if (!canvas) {
+        D3D11_TEXTURE2D_DESC canvas_desc {};
+        canvas_desc.Width = width;
+        canvas_desc.Height = height;
+        canvas_desc.MipLevels = 1;
+        canvas_desc.ArraySize = 1;
+        canvas_desc.SampleDesc.Count = 1;
+        canvas_desc.Usage = D3D11_USAGE_DEFAULT;
+        canvas_desc.Format = capture_format;
+        status = device->CreateTexture2D(&canvas_desc, nullptr, &canvas);
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "Couldn't create the spanned canvas texture [0x"sv << util::hex(status).to_string_view() << ']';
+          return capture_e::error;
+        }
+      }
+
+      device_ctx->CopySubresourceRegion(canvas.get(), 0, entry.x, entry.y, 0, src.get(), 0, nullptr);
+      updated = true;
+      canvas_has_content = true;
+
+      if (auto displayed = frame_info.LastPresentTime.QuadPart) {
+        frame_timestamp = std::chrono::steady_clock::now() - qpc_time_difference(qpc_counter(), displayed);
+      }
+
+      entry.dup.release_frame();
+    }
+
+    if (!updated || !canvas_has_content) {
+      return capture_e::timeout;
+    }
+
+    std::shared_ptr<platf::img_t> img;
+    if (!pull_free_image_cb(img)) {
+      return capture_e::interrupted;
+    }
+
+    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+    if (complete_img(d3d_img.get(), false)) {
+      return capture_e::error;
+    }
+
+    texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
+    if (!lock_helper.lock()) {
+      BOOST_LOG(error) << "Failed to lock capture texture"sv;
+      return capture_e::error;
+    }
+    d3d_img->blank = false;
+
+    device_ctx->CopyResource(d3d_img->capture_texture.get(), canvas.get());
+    d3d_img->frame_timestamp = frame_timestamp;
+    img_out = std::move(img);
+    return capture_e::ok;
+  }
+
+  capture_e display_span_vram_t::release_snapshot() {
+    for (auto &entry : outputs) {
+      entry.dup.release_frame();
+    }
+    return capture_e::ok;
+  }
+
   int display_ddup_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
     if (display_base_t::init(config, display_name) || dup.init(this, config)) {
       return -1;

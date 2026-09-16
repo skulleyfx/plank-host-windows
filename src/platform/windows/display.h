@@ -597,6 +597,15 @@ namespace platf::dxgi {
      */
     int init(display_base_t *display, const ::video::config_t &config);
     /**
+     * @brief Duplicate one specific output, so one display can span several.
+     *
+     * @param display Display owning the D3D device.
+     * @param config Configuration values to apply.
+     * @param target_output Output to duplicate.
+     * @return 0 on success; nonzero or negative platform status on failure.
+     */
+    int init(display_base_t *display, const ::video::config_t &config, output_t &target_output);
+    /**
      * @brief Acquire the next frame from the Windows capture backend.
      *
      * @param frame_info Frame info.
@@ -654,6 +663,62 @@ namespace platf::dxgi {
 
     duplication_t dup;  ///< Desktop Duplication session used to acquire frames.
     cursor_t cursor;  ///< Cursor.
+  };
+
+  /**
+   * Display backend that joins several outputs into one spanned canvas.
+   *
+   * The Desktop Duplication API captures one output at a time, so a
+   * two-monitor session duplicates each output and copies the results
+   * side by side into a single canvas texture. PLANK never composites the
+   * mouse cursor into the frame, which keeps this path simple.
+   */
+  class display_span_vram_t: public display_vram_t {
+  public:
+    /**
+     * @brief Duplicate every attached output and prepare the canvas.
+     *
+     * @param config Configuration values to apply.
+     * @param display_name Ignored: a spanned display covers every output.
+     * @return 0 on success; nonzero on failure.
+     */
+    int init(const ::video::config_t &config, const std::string &display_name);
+
+    /**
+     * @brief Capture every output and return them as one image.
+     *
+     * @param pull_free_image_cb Callback that provides an available image buffer.
+     * @param img_out Captured image buffer returned to the streaming pipeline.
+     * @param timeout Maximum time to wait for the operation.
+     * @param cursor_visible Unused: PLANK transports the cursor separately.
+     * @return Capture status reported to the streaming pipeline.
+     */
+    capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
+
+    /**
+     * @brief Release resources associated with the last captured snapshot.
+     *
+     * @return Capture status after releasing the current snapshot.
+     */
+    capture_e release_snapshot() override;
+
+    /**
+     * @brief One duplicated output and its place in the canvas.
+     */
+    struct span_output_t {
+      std::string name;  ///< GDI device name, e.g. \\.\DISPLAY1.
+      int x {};  ///< Left edge inside the canvas.
+      int y {};  ///< Top edge inside the canvas.
+      int width {};  ///< Output width in pixels.
+      int height {};  ///< Output height in pixels.
+      output_t output;  ///< DXGI output.
+      duplication_t dup;  ///< Duplication session for this output.
+    };
+
+    // A deque, because a duplication session cannot be moved once created.
+    std::deque<span_output_t> outputs;  ///< Outputs joined into the canvas, left to right.
+    texture2d_t canvas;  ///< Canvas holding the most recent frame of every output.
+    bool canvas_has_content {};  ///< Whether the canvas holds at least one captured frame.
   };
 
   /**
