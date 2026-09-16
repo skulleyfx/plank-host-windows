@@ -252,6 +252,7 @@ namespace config {
     bool always_send_scancodes;  ///< Always send keyboard scancodes when available.
 
     bool high_resolution_scrolling;  ///< Enable high-resolution mouse-wheel events.
+    bool clipboard_text;  ///< Share plain-text clipboard contents with the client. Default true.
   };
 
   namespace flag {

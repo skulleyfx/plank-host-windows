@@ -854,6 +854,7 @@ namespace config {
     true,  // mouse enabled
     true,  // always send scancodes
     true,  // high resolution scrolling
+    true,  // clipboard text sharing
   };
 
   /**
@@ -1588,6 +1589,8 @@ namespace config {
     bool_f(vars, "lock_on_disconnect", plank_auth.lock_on_disconnect);
     int_between_f(vars, "lock_on_disconnect_delay", plank_auth.lock_on_disconnect_delay, {0, 3600});
     string_f(vars, "admin_group", plank_auth.admin_group);
+
+    bool_f(vars, "clipboard_text", input.clipboard_text);
 
     string_f(vars, "audio_sink", audio.sink);
 

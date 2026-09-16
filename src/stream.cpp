@@ -26,9 +26,11 @@ extern "C" {
 #include "process.h"
 #include "raw_hid_tablet.h"
 #include "session_stream.h"
+#include "session/clipboard.h"
 #include "session/session_context.h"
 #include "stream.h"
 #include "plank_bitrate.h"
+#include "plank_topology.h"
 #include "sync.h"
 #include "thread_safe.h"
 #include "utility.h"
@@ -108,6 +110,9 @@ namespace stream {
     uid_t plank_display_lease_uid {};  ///< PAM account that owns the display lease.
     std::shared_ptr<void> authentication_session;  ///< PAM lifetime retained until this stream is destroyed.
     std::string authenticated_account;  ///< Account that authenticated this stream.
+    std::uint32_t plank_client_features {};  ///< PLANK feature bits the client advertised.
+    std::uint32_t clipboard_generation {};  ///< Host clipboard change counter last seen by this stream.
+    std::chrono::steady_clock::time_point clipboard_next_poll {};  ///< When to look at the host clipboard again.
     std::shared_ptr<void> plank_transport_endpoint;  ///< Native QUIC data-plane lifetime.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
@@ -188,6 +193,47 @@ namespace stream {
     return plank_transport_native_data_send(
       endpoint, packet.data(), packet_size
     ) == PLANK_TRANSPORT_OK ? 0 : -1;
+  }
+
+  /// Plain-text clipboard, both directions. Not in the shared transport
+  /// header: Windows hosts and clients negotiate it with a feature bit.
+  constexpr std::uint16_t plank_event_clipboard_text = 5;
+
+  /// Client packets are control-sized except clipboard text, which arrives
+  /// on the event channel.
+  constexpr std::size_t plank_client_packet_capacity =
+    PLANK_TRANSPORT_EVENT_HEADER_SIZE + plank::clipboard::max_text_bytes;
+
+  /**
+   * @brief Send host clipboard text to a client that supports clipboard sharing.
+   */
+  void send_clipboard_text(session_t *session, const std::string &text) {
+    if ((session->plank_client_features & plank::topology::feature_clipboard_text) == 0) {
+      return;
+    }
+    if (send_plank_transport_event(
+          session, plank_event_clipboard_text,
+          reinterpret_cast<const std::uint8_t *>(text.data()), text.size()) != 0) {
+      BOOST_LOG(warning) << "Couldn't send clipboard text to the client"sv;
+    }
+  }
+
+  /**
+   * @brief Share host clipboard changes, at most a few times a second.
+   */
+  void poll_clipboard(session_t *session) {
+    if (!config::input.clipboard_text ||
+        (session->plank_client_features & plank::topology::feature_clipboard_text) == 0) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < session->clipboard_next_poll) {
+      return;
+    }
+    session->clipboard_next_poll = now + 250ms;
+    if (auto text = plank::clipboard::poll_host_text(session->clipboard_generation)) {
+      send_clipboard_text(session, *text);
+    }
   }
 
   int send_host_termination(session_t *session, const std::uint32_t reason) {
@@ -708,8 +754,38 @@ namespace stream {
   }
 
 #ifdef PLANK_TRANSPORT
+  /**
+   * @brief Handle a client event packet, currently clipboard text only.
+   *
+   * @return True when the packet was understood.
+   */
+  bool handle_client_event(session_t *session, const std::uint8_t *packet, std::size_t packet_size) {
+    PlankTransportEventPacket event {};
+    if (plank_transport_event_decode(packet, packet_size, &event) != 0) {
+      return false;
+    }
+    if (event.type != plank_event_clipboard_text) {
+      return false;
+    }
+    if ((session->plank_client_features & plank::topology::feature_clipboard_text) == 0 ||
+        !config::input.clipboard_text) {
+      return true;  // ignore quietly; the client should not have sent it
+    }
+    if (event.payload_size == 0 || event.payload_size > plank::clipboard::max_text_bytes) {
+      BOOST_LOG(info) << "Ignoring client clipboard text of "sv << event.payload_size << " bytes"sv;
+      return true;
+    }
+    const std::string text(reinterpret_cast<const char *>(event.payload), event.payload_size);
+    if (plank::clipboard::set_host_text(text)) {
+      // Our own write bumps the clipboard counter; don't echo it back.
+      session->clipboard_generation =
+        static_cast<std::uint32_t>(plank::clipboard::host_generation());
+    }
+    return true;
+  }
+
   void drain_plank_transport_control(session_t *session,
-                               std::array<std::uint8_t, PLANK_TRANSPORT_CONTROL_MAX_PACKET_SIZE> &packet) {
+                               std::array<std::uint8_t, plank_client_packet_capacity> &packet) {
     if (!session->plank_transport_endpoint) {
       return;
     }
@@ -732,6 +808,16 @@ namespace stream {
         }
         session::stop(*session);
         return;
+      }
+
+      if (packet_size >= 4 &&
+          plank_transport_event_read_u32(packet.data()) == PLANK_TRANSPORT_EVENT_MAGIC) {
+        if (!handle_client_event(session, packet.data(), packet_size)) {
+          BOOST_LOG(error) << "Rejected unexpected client PlankTransport event"sv;
+          session::stop(*session);
+          return;
+        }
+        continue;
       }
 
       PlankTransportControlPacket control {};
@@ -808,7 +894,8 @@ namespace stream {
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
 #ifdef PLANK_TRANSPORT
-    std::array<std::uint8_t, PLANK_TRANSPORT_CONTROL_MAX_PACKET_SIZE> control_packet;
+    auto control_packet =
+      std::make_unique<std::array<std::uint8_t, plank_client_packet_capacity>>();
 #endif
 
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
@@ -821,7 +908,7 @@ namespace stream {
 
           auto session = *pos;
 #ifdef PLANK_TRANSPORT
-          drain_plank_transport_control(session, control_packet);
+          drain_plank_transport_control(session, *control_packet);
 #endif
           if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
             pos = ctx->sessions->erase(pos);
@@ -842,6 +929,8 @@ namespace stream {
           if (!session->cursorThread.joinable()) {
             session->cursorThread = std::jthread(localCursorThread, session);
           }
+
+          poll_clipboard(session);
 
           auto &hdr_queue = session->control.hdr_queue;
           while (hdr_queue->peek()) {
@@ -1411,6 +1500,7 @@ namespace stream {
         launch_session.plank_display_lease_uid;
       session->authentication_session = launch_session.authentication_session;
       session->authenticated_account = launch_session.authenticated_account;
+      session->plank_client_features = launch_session.plank_feature_flags;
       session->plank_transport_endpoint = launch_session.plank_transport_endpoint;
 
       if (session->plank_display_lease &&
