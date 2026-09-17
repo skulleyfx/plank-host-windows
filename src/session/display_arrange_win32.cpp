@@ -157,6 +157,15 @@ namespace plank::display_arrange {
     return apply_queued_changes();
   }
 
+  bool apply_mode(const display_mode_t &display) {
+    if (!queue_display(display, display.primary)) {
+      // Drop anything already queued.
+      ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+      return false;
+    }
+    return apply_queued_changes();
+  }
+
   bool restore_layout(const std::vector<display_mode_t> &layout) {
     if (layout.empty()) {
       return false;

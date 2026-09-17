@@ -54,6 +54,18 @@ namespace plank::display_arrange {
   bool apply_side_by_side(const display_mode_t &left, const display_mode_t &right);
 
   /**
+   * @brief Set one display's mode, leaving every other display alone.
+   *
+   * A one-screen session on a workstation with more than one display changes
+   * only the display it streams, so the artist's other screen keeps working.
+   *
+   * @param display Display name with the wanted resolution; its position is
+   *        used as given.
+   * @return True when Windows applied the mode.
+   */
+  bool apply_mode(const display_mode_t &display);
+
+  /**
    * @brief Restore an arrangement captured by current_layout().
    *
    * @param layout Arrangement to restore.

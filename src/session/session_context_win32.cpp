@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <wtsapi32.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -333,18 +334,6 @@ namespace plank::session {
       return width > 0 && height > 0;
     }
 
-    /// Active mode of the primary display, which the display library configures.
-    bool primary_display_mode(unsigned &width, unsigned &height) {
-      DEVMODEW mode {};
-      mode.dmSize = sizeof(mode);
-      if (!EnumDisplaySettingsExW(nullptr, ENUM_CURRENT_SETTINGS, &mode, 0)) {
-        return false;
-      }
-      width = mode.dmPelsWidth;
-      height = mode.dmPelsHeight;
-      return true;
-    }
-
     /// Physical displays we can arrange, ignoring virtual ones added by other
     /// remote-desktop software.
     std::vector<plank::display_arrange::display_mode_t> streamable_displays() {
@@ -370,10 +359,28 @@ namespace plank::session {
           }
         }
         // DCV, Teradici and similar add virtual displays that are not part of
-        // the workstation's screens.
-        if (adapter.find("Indirect") != std::string::npos ||
-            adapter.find("Teradici") != std::string::npos ||
-            adapter.find("Remote") != std::string::npos) {
+        // the workstation's screens. They are named by their driver rather
+        // than by any one convention, so match every spelling we have seen:
+        // DCV calls itself a virtual display adapter, others announce
+        // themselves as indirect display drivers.
+        static constexpr std::string_view virtual_adapters[] {
+          "Indirect"sv, "Teradici"sv, "Remote"sv, "DCV"sv, "Virtual"sv, "IDD"sv
+        };
+        const bool is_virtual = std::any_of(
+          std::begin(virtual_adapters), std::end(virtual_adapters),
+          [&adapter](std::string_view marker) {
+            return adapter.find(marker) != std::string::npos;
+          });
+        // Logged because a refused layout is otherwise indistinguishable from
+        // a missing display emulator, and workstations are not reachable by
+        // any shell when a session cannot start.
+        BOOST_LOG(info) << "Display "sv << display.name << " on \""sv << adapter << "\" "sv
+                        << display.width << 'x' << display.height
+                        << " at "sv << display.x << ',' << display.y
+                        << (display.primary ? " primary"sv : ""sv)
+                        << (is_virtual ? " — ignored, another remote desktop added it"sv
+                                       : " — streamable"sv);
+        if (is_virtual) {
           continue;
         }
         displays.push_back(std::move(display));
@@ -381,18 +388,18 @@ namespace plank::session {
       return displays;
     }
 
-    int active_display_count() {
-      int count = 0;
-      DISPLAY_DEVICEW device {};
-      device.cb = sizeof(device);
-      for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index) {
-        if (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) {
-          ++count;
-        }
-        device.cb = sizeof(device);
+    /// The streamable display a one-screen session uses: the Windows primary
+    /// when it is streamable, otherwise the leftmost one.
+    std::optional<plank::display_arrange::display_mode_t> primary_streamable_display() {
+      auto displays = streamable_displays();
+      if (displays.empty()) {
+        return std::nullopt;
       }
-      return count;
+      const auto primary = std::find_if(std::begin(displays), std::end(displays),
+                                        [](const auto &display) { return display.primary; });
+      return primary != std::end(displays) ? *primary : displays.front();
     }
+
   }  // namespace
 
   std::optional<runtime_display_state_t> read_runtime_display_state(std::string_view) {
@@ -460,36 +467,38 @@ namespace plank::session {
       return display_request_status::submitted;
     }
 
-    // One screen: switch the active display's mode.
+    // One screen: switch the mode of the display being streamed, and leave
+    // any other workstation display alone. A two-display workstation still
+    // serves one-screen sessions this way, which is what an artist gets on
+    // every first connection.
     if (request.layout != "single" || !request.mode_2.empty() ||
-        !parse_mode(request.mode_1, width, height) || active_display_count() != 1) {
-      BOOST_LOG(warning) << "Windows host can only switch a single active display; requested layout "
+        !parse_mode(request.mode_1, width, height)) {
+      BOOST_LOG(warning) << "Windows host cannot serve the requested layout "
                          << request.layout << ' ' << request.mode_1 << (request.mode_2.empty() ? "" : "+" + request.mode_2);
       return display_request_status::unavailable;
     }
 
-    unsigned current_width = 0;
-    unsigned current_height = 0;
-    if (!primary_display_mode(current_width, current_height) ||
-        current_width != width || current_height != height) {
-      ::display_device::SingleDisplayConfiguration configuration;
-      configuration.m_device_prep = ::display_device::SingleDisplayConfiguration::DevicePreparation::VerifyOnly;
-      configuration.m_resolution = ::display_device::Resolution {width, height};
-      BOOST_LOG(info) << "Switching the host display to " << width << 'x' << height << " for a PLANK session";
-      ::display_device::configure_display(configuration);
+    auto target = primary_streamable_display();
+    if (!target) {
+      BOOST_LOG(warning) << "One-screen layout needs a workstation display; the only displays "
+                            "attached belong to other remote-desktop software"sv;
+      return display_request_status::unavailable;
+    }
 
-      // The display library applies settings on its own thread; confirm the
-      // mode actually changed before promising the layout to the client.
-      bool applied = false;
-      for (int attempt = 0; attempt < 40 && !applied; ++attempt) {
-        std::this_thread::sleep_for(std::chrono::milliseconds {100});
-        applied = primary_display_mode(current_width, current_height) &&
-                  current_width == width && current_height == height;
+    if (target->width != width || target->height != height) {
+      // Remember the arrangement before changing it, so it survives a crash.
+      if (!display_lease()) {
+        plank::display_arrange::save_saved_layout(plank::display_arrange::current_layout());
       }
-      if (!applied) {
-        BOOST_LOG(warning) << "The host display does not support " << width << 'x' << height
-                           << "; keeping its current mode";
-        ::display_device::revert_configuration();
+      BOOST_LOG(info) << "Switching "sv << target->name << " to "sv << width << 'x' << height
+                      << " for a PLANK session"sv;
+      auto requested = *target;
+      requested.width = width;
+      requested.height = height;
+      if (!plank::display_arrange::apply_mode(requested)) {
+        BOOST_LOG(warning) << target->name << " does not support "sv << width << 'x' << height
+                           << "; keeping its current mode"sv;
+        plank::display_arrange::restore_saved_layout_if_any();
         return display_request_status::unavailable;
       }
     }
@@ -511,7 +520,11 @@ namespace plank::session {
       return display_request_status::unavailable;
     }
     BOOST_LOG(info) << "Restoring the host display after the PLANK session";
-    if (display_lease()->layout == "dual-horizontal") {
+    // Both layouts now change modes through display_arrange, which saved the
+    // arrangement before touching anything, so both are restored from it.
+    // revert_configuration() remains the fallback for a lease taken by an
+    // older host that used the display library.
+    if (!plank::display_arrange::saved_layout().empty()) {
       plank::display_arrange::restore_saved_layout_if_any();
     } else {
       ::display_device::revert_configuration();
