@@ -334,59 +334,9 @@ namespace plank::session {
       return width > 0 && height > 0;
     }
 
-    /// Physical displays we can arrange, ignoring virtual ones added by other
-    /// remote-desktop software.
-    std::vector<plank::display_arrange::display_mode_t> streamable_displays() {
-      std::vector<plank::display_arrange::display_mode_t> displays;
-      for (auto &display : plank::display_arrange::current_layout()) {
-        DISPLAY_DEVICEW device {};
-        device.cb = sizeof(device);
-        const std::wstring name = widen(display.name);
-        std::string adapter;
-        if (EnumDisplayDevicesW(nullptr, 0, &device, 0)) {
-          for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index) {
-            device.cb = sizeof(device);
-            if (name == device.DeviceName) {
-              const int size = WideCharToMultiByte(CP_UTF8, 0, device.DeviceString, -1,
-                                                   nullptr, 0, nullptr, nullptr);
-              if (size > 1) {
-                adapter.resize(static_cast<std::size_t>(size - 1));
-                WideCharToMultiByte(CP_UTF8, 0, device.DeviceString, -1, adapter.data(),
-                                    size, nullptr, nullptr);
-              }
-              break;
-            }
-          }
-        }
-        // DCV, Teradici and similar add virtual displays that are not part of
-        // the workstation's screens. They are named by their driver rather
-        // than by any one convention, so match every spelling we have seen:
-        // DCV calls itself a virtual display adapter, others announce
-        // themselves as indirect display drivers.
-        static constexpr std::string_view virtual_adapters[] {
-          "Indirect"sv, "Teradici"sv, "Remote"sv, "DCV"sv, "Virtual"sv, "IDD"sv
-        };
-        const bool is_virtual = std::any_of(
-          std::begin(virtual_adapters), std::end(virtual_adapters),
-          [&adapter](std::string_view marker) {
-            return adapter.find(marker) != std::string::npos;
-          });
-        // Logged because a refused layout is otherwise indistinguishable from
-        // a missing display emulator, and workstations are not reachable by
-        // any shell when a session cannot start.
-        BOOST_LOG(info) << "Display "sv << display.name << " on \""sv << adapter << "\" "sv
-                        << display.width << 'x' << display.height
-                        << " at "sv << display.x << ',' << display.y
-                        << (display.primary ? " primary"sv : ""sv)
-                        << (is_virtual ? " — ignored, another remote desktop added it"sv
-                                       : " — streamable"sv);
-        if (is_virtual) {
-          continue;
-        }
-        displays.push_back(std::move(display));
-      }
-      return displays;
-    }
+    // Moved into display_arrange so the host can log the same inventory at
+    // startup, when nothing has requested a layout yet.
+    using plank::display_arrange::streamable_displays;
 
     /// The streamable display a one-screen session uses: the Windows primary
     /// when it is streamable, otherwise the leftmost one.

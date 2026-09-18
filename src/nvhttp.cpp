@@ -63,6 +63,9 @@
 #include "process.h"
 #include "session_stream.h"
 #include "session/session_context.h"
+#ifdef _WIN32
+  #include "session/display_arrange.h"
+#endif
 #include "stream.h"
 #include "plank_topology.h"
 #include "utility.h"
@@ -666,6 +669,45 @@ namespace nvhttp {
     std::sort(outputs.begin(), outputs.end(), [](const auto &left, const auto &right) {
       return std::tie(left.x, left.y, left.id) < std::tie(right.x, right.y, right.id);
     });
+    const auto leased_layout = live_display_layout(outputs);
+
+#ifdef _WIN32
+    // A leased layout describes the screens being streamed, so those are the
+    // only outputs to publish. A workstation keeps its other displays and
+    // gains virtual ones from other remote-desktop software, and reporting
+    // any of them here contradicts the layout: a one-screen lease names one
+    // mode, and a client rightly refuses a topology claiming one mode for two
+    // outputs. Before one-screen sessions were allowed on a workstation with
+    // two displays, this could not arise.
+    {
+      // live_display_layout() answers from the lease itself when one is held,
+      // so filtering the outputs afterwards cannot change what it says.
+      const auto &leased = leased_layout;
+      if (leased.temporary_physical_lease && !outputs.empty()) {
+        const auto streamable = plank::display_arrange::streamable_displays();
+        const auto is_streamable = [&streamable](const std::string &name) {
+          return std::any_of(streamable.begin(), streamable.end(),
+                             [&name](const auto &display) { return display.name == name; });
+        };
+        std::vector<platf::display_info_t> leased_outputs;
+        for (const auto &output : outputs) {
+          if (!is_streamable(output.name)) {
+            continue;
+          }
+          // One screen is the display whose mode was changed, which is the
+          // one the capture uses: the Windows primary.
+          if (leased.kind == "single" && !output.primary) {
+            continue;
+          }
+          leased_outputs.push_back(output);
+        }
+        if (!leased_outputs.empty()) {
+          outputs = std::move(leased_outputs);
+        }
+      }
+    }
+#endif
+
     int min_x = 0;
     int min_y = 0;
     int max_x = 0;
@@ -686,7 +728,7 @@ namespace nvhttp {
       }
     }
 
-    const auto live_layout = live_display_layout(outputs);
+    const auto &live_layout = leased_layout;
     nlohmann::json virtual_modes = live_layout.virtual_modes;
     nlohmann::json allowed_layouts = nlohmann::json::array();
     if (live_layout.startup_kind == "physical") {

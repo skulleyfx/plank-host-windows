@@ -54,6 +54,19 @@ namespace plank::display_arrange {
   bool apply_side_by_side(const display_mode_t &left, const display_mode_t &right);
 
   /**
+   * @brief Displays PLANK can stream, left to right.
+   *
+   * Virtual displays added by other remote-desktop software are left out:
+   * they are not the workstation's screens, and counting them once made a
+   * one-screen resolution change impossible on any machine running DCV.
+   * Every display is logged with its adapter and whether it counted, because
+   * a workstation with a stream problem is reachable by no shell.
+   *
+   * @return Streamable displays.
+   */
+  std::vector<display_mode_t> streamable_displays();
+
+  /**
    * @brief Set one display's mode, leaving every other display alone.
    *
    * A one-screen session on a workstation with more than one display changes

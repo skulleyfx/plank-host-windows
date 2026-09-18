@@ -394,6 +394,11 @@ int main(int argc, char *argv[]) {
   // A host that died during a two-screen session leaves the workstation's
   // displays rearranged. Put them back before anyone sits down at it.
   plank::display_arrange::restore_saved_layout_if_any();
+  // Record what this workstation has, so a black picture or a refused layout
+  // can be told apart from a missing display emulator without anyone walking
+  // to the machine. Only a layout change logged this before, which is exactly
+  // the case where nothing goes wrong.
+  plank::display_arrange::streamable_displays();
 #endif
 
   auto proc_deinit_guard = proc::init();
