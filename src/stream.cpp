@@ -115,6 +115,19 @@ namespace stream {
     std::chrono::steady_clock::time_point clipboard_next_poll {};  ///< When to look at the host clipboard again.
     std::shared_ptr<void> plank_transport_endpoint;  ///< Native QUIC data-plane lifetime.
 
+    /// Congestion-driven bitrate control. The configured bitrate is the
+    /// ceiling; the target is lowered under loss and recovers when the link
+    /// clears, so a home connection thinner than the ceiling stops flooding.
+    struct {
+      std::chrono::steady_clock::time_point next_poll {};
+      std::uint64_t last_packets_lost {};
+      std::uint64_t last_bytes_sent {};
+      std::uint64_t last_send_drops {};
+      int current_kbps {};  ///< Currently applied target.
+      int clean_intervals {};  ///< Consecutive clear polls, for recovery.
+      bool initialized {};
+    } adaptive_bitrate;
+
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
 
@@ -755,6 +768,95 @@ namespace stream {
 
 #ifdef PLANK_TRANSPORT
   /**
+   * @brief Lower the encoder target under packet loss and recover when clear.
+   *
+   * DCV's advantage on a home connection is that it fits itself to the link.
+   * The configured bitrate is the ceiling; when the link cannot carry it the
+   * transport drops packets and the send queue backs up, so the target is
+   * reduced multiplicatively, and it climbs back gradually once several polls
+   * are clean. Off unless plank_adaptive_bitrate is set, so the fixed-rate
+   * behaviour is unchanged for everyone who has not turned it on.
+   */
+  void poll_adaptive_bitrate(session_t *session) {
+    if (!config::video.plank_adaptive_bitrate ||
+        session->state.load(std::memory_order_acquire) != session::state_e::RUNNING ||
+        !session->plank_transport_endpoint) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < session->adaptive_bitrate.next_poll) {
+      return;
+    }
+    session->adaptive_bitrate.next_poll = now + 2s;
+
+    auto *endpoint = static_cast<PlankTransportNativeEndpoint *>(session->plank_transport_endpoint.get());
+    PlankTransportNativeStats stats {};
+    stats.struct_size = sizeof(stats);
+    if (plank_transport_native_endpoint_stats(endpoint, &stats) != PLANK_TRANSPORT_OK) {
+      return;
+    }
+
+    auto &state = session->adaptive_bitrate;
+    if (!state.initialized) {
+      state.current_kbps = session->config.monitor.bitrate;
+      state.last_packets_lost = stats.quic_packets_lost;
+      state.last_bytes_sent = stats.video_bytes_sent;
+      state.last_send_drops = stats.video_send_drops;
+      state.clean_intervals = 0;
+      state.initialized = true;
+      return;
+    }
+
+    const std::uint64_t delta_lost = stats.quic_packets_lost - state.last_packets_lost;
+    const std::uint64_t delta_bytes = stats.video_bytes_sent - state.last_bytes_sent;
+    const std::uint64_t delta_drops = stats.video_send_drops - state.last_send_drops;
+    state.last_packets_lost = stats.quic_packets_lost;
+    state.last_bytes_sent = stats.video_bytes_sent;
+    state.last_send_drops = stats.video_send_drops;
+
+    // Estimate packets from bytes at a typical datagram size, then a loss
+    // fraction over the interval.
+    const std::uint64_t est_packets = delta_bytes / 1200 + delta_lost;
+    const double loss_fraction = est_packets > 0 ?
+      static_cast<double>(delta_lost) / static_cast<double>(est_packets) : 0.0;
+
+    const int ceiling = session->config.monitor.bitrate;
+    // A practical floor: below a few Mbps the picture is not worth streaming,
+    // and the ceiling caps it in case a bookmark is set lower still.
+    const int floor_target = std::min(ceiling, 3000);
+    int next_target = state.current_kbps;
+
+    // The send queue backing up means the encoder is outrunning the link; loss
+    // above a couple of percent means the network is dropping. Either is
+    // congestion.
+    if (delta_drops > 0 || loss_fraction > 0.02) {
+      next_target = std::max<int>(floor_target, state.current_kbps * 3 / 4);
+      state.clean_intervals = 0;
+    } else if (loss_fraction < 0.005 && delta_drops == 0) {
+      // Climb back only after a sustained clear stretch, and gently, so the
+      // rate does not oscillate around the link's capacity.
+      if (++state.clean_intervals >= 3) {
+        next_target = std::min<int>(ceiling, state.current_kbps + 5000);
+        state.clean_intervals = 0;
+      }
+    } else {
+      state.clean_intervals = 0;
+    }
+
+    if (next_target != state.current_kbps) {
+      BOOST_LOG(info) << "Adaptive bitrate: "sv << state.current_kbps << " -> "sv
+                      << next_target << " Kbps (loss="sv
+                      << static_cast<int>(loss_fraction * 1000) / 10.0 << "%, send_drops="sv
+                      << delta_drops << ", ceiling="sv << ceiling << ')';
+      state.current_kbps = next_target;
+      session->mail->event<int>(mail::video_bitrate)->raise(next_target);
+      send_video_bitrate_applied(session, next_target);
+    }
+  }
+#endif
+
+#ifdef PLANK_TRANSPORT
+  /**
    * @brief Handle a client event packet, currently clipboard text only.
    *
    * @return True when the packet was understood.
@@ -931,6 +1033,9 @@ namespace stream {
           }
 
           poll_clipboard(session);
+#ifdef PLANK_TRANSPORT
+          poll_adaptive_bitrate(session);
+#endif
 
           auto &hdr_queue = session->control.hdr_queue;
           while (hdr_queue->peek()) {
