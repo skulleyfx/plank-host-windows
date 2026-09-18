@@ -729,6 +729,12 @@ namespace nvhttp {
     });
     const auto leased_layout = live_display_layout(outputs);
 
+    // The generation fingerprints the workstation's own outputs and is what a
+    // launch compares its token against, so it is taken before the lease
+    // narrows the list. Computing it from the leased subset made every launch
+    // disagree with the topology the client had just read.
+    const auto generation = video::output_topology_generation(outputs);
+
     // A leased layout describes the screens being streamed, and both the
     // published topology and the binding check below must agree about which
     // those are.
@@ -803,7 +809,7 @@ namespace nvhttp {
     body["desktop"] = {
       {"x", min_x}, {"y", min_y}, {"width", max_x - min_x}, {"height", max_y - min_y},
     };
-    body["generation"] = video::output_topology_generation(outputs);
+    body["generation"] = generation;
     return body;
   }
 
