@@ -34,6 +34,8 @@ namespace plank::topology {
   constexpr std::uint32_t feature_clipboard_text = 0x400000;
   // Windows hosts join two outputs into one canvas only for clients that ask.
   constexpr std::uint32_t feature_two_screen_capture = 0x800000;
+  // The client may ask the host to fit the encoder to its link per session.
+  constexpr std::uint32_t feature_adaptive_bitrate = 0x1000000;
   constexpr std::uint32_t feature_flags =
     feature_output_topology |
     feature_selected_output |
@@ -55,7 +57,8 @@ namespace plank::topology {
     feature_authenticated_desktop_stage |
     feature_worker_instance |
     feature_clipboard_text |
-    feature_two_screen_capture;
+    feature_two_screen_capture |
+    feature_adaptive_bitrate;
 
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {
     return mtu >= 1200 && mtu <= 65527;

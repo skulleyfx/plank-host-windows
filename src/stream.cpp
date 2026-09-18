@@ -778,7 +778,12 @@ namespace stream {
    * behaviour is unchanged for everyone who has not turned it on.
    */
   void poll_adaptive_bitrate(session_t *session) {
-    if (!config::video.plank_adaptive_bitrate ||
+    // Either the host is configured to always adapt, or this client asked for
+    // it on this connection. The client request is the common case: the host
+    // is shared, but the link belongs to whoever is connecting.
+    const bool client_requested =
+      (session->plank_client_features & plank::topology::feature_adaptive_bitrate) != 0;
+    if ((!config::video.plank_adaptive_bitrate && !client_requested) ||
         session->state.load(std::memory_order_acquire) != session::state_e::RUNNING ||
         !session->plank_transport_endpoint) {
       return;
