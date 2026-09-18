@@ -3997,9 +3997,15 @@ namespace video {
       // If we've used a previous encoder and it's not this one, we expect this encoder to
       // fail to validate. It will use a slightly different order of checks to more quickly
       // eliminate failing encoders.
+      // Probe HEVC as well as H.264. Two screens side by side exceed the
+      // 4096-pixel width H.264 can carry, so a host that never validates
+      // HEVC can never serve a two-screen session; with the probe off, every
+      // HEVC capability was cleared and the client was told the profile was
+      // unsupported. A GPU without HEVC simply fails this probe and keeps
+      // H.264, exactly as before.
       if (!validate_encoder(*encoder,
                             previous_encoder && previous_encoder != encoder,
-                            false, false)) {
+                            true, false)) {
         pos = encoder_list.erase(pos);
         continue;
       }
