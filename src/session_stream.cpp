@@ -354,7 +354,7 @@ namespace session_stream {
     }
 
     if (launch_session->encoder_backend == "nvenc-direct") {
-      const bool nvfbc_mode =
+      const bool nvfbc_identity_444 =
         config.monitor.capture_source == video::capture_source_e::nvfbc_8bit &&
         exact_identity_444 &&
         ((config.monitor.dynamicRange == 0 &&
@@ -362,6 +362,14 @@ namespace session_stream {
          (config.monitor.dynamicRange == 1 && config.monitor.videoFormat == 1 &&
           (launch_session->plank_feature_flags &
            plank::topology::feature_nvfbc_hevc10_nvenc) != 0));
+      // HEVC 8-bit 4:2:0 for bandwidth-limited links: the encoder converts the
+      // captured desktop to 4:2:0 in the ordinary way, so this is not an
+      // identity-GBR path and does not need exact_identity_444.
+      const bool nvfbc_hevc_420 =
+        config.monitor.capture_source == video::capture_source_e::nvfbc_8bit &&
+        config.monitor.videoFormat == 1 && config.monitor.dynamicRange == 0 &&
+        config.monitor.chromaSamplingType == 0 && !identity_gbr_requested;
+      const bool nvfbc_mode = nvfbc_identity_444 || nvfbc_hevc_420;
       const bool native10_mode =
         config.monitor.capture_source == video::capture_source_e::x11_native10 &&
         config.monitor.videoFormat == 1 && config.monitor.dynamicRange == 1 &&
