@@ -183,6 +183,9 @@ namespace session_stream {
     if (encoding_mode == "h264-10-444-software"sv) {
       return VIDEO_FORMAT_H264_HIGH10_444;
     }
+    if (encoding_mode == "hevc-8-420-nvenc"sv) {
+      return VIDEO_FORMAT_H265;
+    }
     if (encoding_mode == "hevc-8-444-nvenc"sv) {
       return VIDEO_FORMAT_H265_REXT8_444;
     }
@@ -335,6 +338,9 @@ namespace session_stream {
       (launch_session->encoding_mode == "h264-8-444-nvenc" &&
        config.monitor.videoFormat == 0 && config.monitor.dynamicRange == 0 &&
        exact_identity_444) ||
+      (launch_session->encoding_mode == "hevc-8-420-nvenc" &&
+       config.monitor.videoFormat == 1 && config.monitor.dynamicRange == 0 &&
+       config.monitor.chromaSamplingType == 0 && !identity_gbr_requested) ||
       (launch_session->encoding_mode == "hevc-8-444-nvenc" &&
        config.monitor.videoFormat == 1 && config.monitor.dynamicRange == 0 &&
        exact_identity_444) ||

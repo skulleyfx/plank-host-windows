@@ -1379,6 +1379,7 @@ namespace nvhttp {
       "h264-10-422-software"sv,
       "h264-10-444-software"sv,
       "h264-8-444-nvenc"sv,
+      "hevc-8-420-nvenc"sv,
       "hevc-8-444-nvenc"sv,
       "hevc-10-444-nvenc"sv,
     };
