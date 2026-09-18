@@ -664,6 +664,64 @@ namespace nvhttp {
     return result;
   }
 
+
+  /**
+   * @brief The displays a leased layout streams.
+   *
+   * A workstation keeps its other displays, and gains virtual ones from other
+   * remote-desktop software. Reporting any of them contradicts the lease: a
+   * one-screen lease names one mode, and both the client and the host's own
+   * binding check refuse a layout claiming one mode for two outputs. Until
+   * one-screen sessions were allowed on a workstation with two displays, this
+   * could not arise.
+   *
+   * @param outputs Every output the capture reports, ordered left to right.
+   * @param layout Live layout, which answers from the lease when one is held.
+   * @return The leased displays, or every output when no lease is held.
+   */
+  std::vector<platf::display_info_t> leased_outputs(
+    std::vector<platf::display_info_t> outputs,
+    const live_layout_t &layout
+  ) {
+#ifdef _WIN32
+    if (!layout.temporary_physical_lease || outputs.empty()) {
+      return outputs;
+    }
+    const auto streamable = plank::display_arrange::streamable_displays();
+    const auto is_streamable = [&streamable](const std::string &name) {
+      return std::any_of(streamable.begin(), streamable.end(),
+                         [&name](const auto &display) { return display.name == name; });
+    };
+    std::vector<platf::display_info_t> leased;
+    for (const auto &output : outputs) {
+      if (!is_streamable(output.name)) {
+        continue;
+      }
+      // One screen is the display whose mode was changed, which is the one
+      // the capture uses: the Windows primary.
+      if (layout.kind == "single" && !output.primary) {
+        continue;
+      }
+      leased.push_back(output);
+    }
+    if (leased.empty()) {
+      // Nothing matched, which means the names the capture reports and the
+      // names Windows arranges by have diverged. Say so rather than publish a
+      // topology that contradicts the lease.
+      BOOST_LOG(warning)
+        << "Leased layout "sv << layout.kind
+        << " matched none of the capture's outputs; reporting them all"sv;
+      return outputs;
+    }
+    BOOST_LOG(info) << "Leased layout "sv << layout.kind << " streams "sv
+                    << leased.size() << " of "sv << outputs.size() << " output(s)"sv;
+    return leased;
+#else
+    (void) layout;
+    return outputs;
+#endif
+  }
+
   nlohmann::json output_topology_json() {
     auto outputs = video::output_topology();
     std::sort(outputs.begin(), outputs.end(), [](const auto &left, const auto &right) {
@@ -671,42 +729,10 @@ namespace nvhttp {
     });
     const auto leased_layout = live_display_layout(outputs);
 
-#ifdef _WIN32
-    // A leased layout describes the screens being streamed, so those are the
-    // only outputs to publish. A workstation keeps its other displays and
-    // gains virtual ones from other remote-desktop software, and reporting
-    // any of them here contradicts the layout: a one-screen lease names one
-    // mode, and a client rightly refuses a topology claiming one mode for two
-    // outputs. Before one-screen sessions were allowed on a workstation with
-    // two displays, this could not arise.
-    {
-      // live_display_layout() answers from the lease itself when one is held,
-      // so filtering the outputs afterwards cannot change what it says.
-      const auto &leased = leased_layout;
-      if (leased.temporary_physical_lease && !outputs.empty()) {
-        const auto streamable = plank::display_arrange::streamable_displays();
-        const auto is_streamable = [&streamable](const std::string &name) {
-          return std::any_of(streamable.begin(), streamable.end(),
-                             [&name](const auto &display) { return display.name == name; });
-        };
-        std::vector<platf::display_info_t> leased_outputs;
-        for (const auto &output : outputs) {
-          if (!is_streamable(output.name)) {
-            continue;
-          }
-          // One screen is the display whose mode was changed, which is the
-          // one the capture uses: the Windows primary.
-          if (leased.kind == "single" && !output.primary) {
-            continue;
-          }
-          leased_outputs.push_back(output);
-        }
-        if (!leased_outputs.empty()) {
-          outputs = std::move(leased_outputs);
-        }
-      }
-    }
-#endif
+    // A leased layout describes the screens being streamed, and both the
+    // published topology and the binding check below must agree about which
+    // those are.
+    outputs = leased_outputs(std::move(outputs), leased_layout);
 
     int min_x = 0;
     int min_y = 0;
@@ -798,9 +824,14 @@ namespace nvhttp {
       return false;
     }
 
+    const auto live_layout = live_display_layout(outputs);
+    // Every check below judges the leased screens, not every display the
+    // workstation happens to have attached.
+    const auto bound_outputs = leased_outputs(outputs, live_layout);
+
     std::vector<std::reference_wrapper<const platf::display_info_t>> ordered_outputs;
-    ordered_outputs.reserve(outputs.size());
-    for (const auto &output : outputs) {
+    ordered_outputs.reserve(bound_outputs.size());
+    for (const auto &output : bound_outputs) {
       ordered_outputs.emplace_back(output);
     }
     std::sort(ordered_outputs.begin(), ordered_outputs.end(), [](const auto &left, const auto &right) {
@@ -808,8 +839,6 @@ namespace nvhttp {
       const auto &r = right.get();
       return std::tie(l.x, l.y, l.id) < std::tie(r.x, r.y, r.id);
     });
-
-    const auto live_layout = live_display_layout(outputs);
     if (!plank::topology::layout_allowed_by_startup_layout(
           session.host_layout, live_layout.startup_kind
         )) {
@@ -833,7 +862,7 @@ namespace nvhttp {
       actual_layout,
       actual_mode_1,
       actual_mode_2,
-      outputs.size()
+      bound_outputs.size()
     );
     if (validation == plank::topology::layout_error::invalid_request) {
       tree.put("root.<xmlattr>.status_code", 400);
