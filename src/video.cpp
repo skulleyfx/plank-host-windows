@@ -1767,6 +1767,10 @@ namespace video {
     if (mode == "hevc-8-444-nvenc"sv) {
       return nvenc_direct_supports_hevc_444_8bit();
     }
+    if (mode == "hevc-8-420-nvenc"sv) {
+      // 4:2:0 HEVC is the baseline every HEVC-capable NVENC GPU encodes.
+      return nvenc_direct_supports_hevc_444_8bit();
+    }
     if (mode == "hevc-10-444-nvenc"sv) {
       return nvenc_direct_supports_hevc_444_10bit();
     }
@@ -1775,6 +1779,10 @@ namespace video {
       return nvenc_direct_supports_h264_444_8bit();
     }
     if (mode == "hevc-8-444-nvenc"sv) {
+      return nvenc_direct_supports_hevc_444_8bit();
+    }
+    if (mode == "hevc-8-420-nvenc"sv) {
+      // 4:2:0 HEVC is the baseline every HEVC-capable NVENC GPU encodes.
       return nvenc_direct_supports_hevc_444_8bit();
     }
 #else

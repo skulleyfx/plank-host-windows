@@ -130,6 +130,7 @@ namespace plank::topology {
       if (capture_source == "nvfbc") {
         return encoding_mode == "h264-8-444-nvenc" ||
                encoding_mode == "hevc-8-444-nvenc" ||
+               encoding_mode == "hevc-8-420-nvenc" ||
                encoding_mode == "hevc-10-444-nvenc";
       }
       return capture_source == "x11-native10" &&
