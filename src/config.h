@@ -288,6 +288,7 @@ namespace config {
     bool lock_on_disconnect;  ///< Windows: lock the signed-in desktop after the last stream ends. Default true.
     int lock_on_disconnect_delay;  ///< Seconds to wait for a reconnect before locking.
     std::string admin_group;  ///< Windows: group whose members see host details such as the signed-in user. Empty means BUILTIN\\Administrators.
+    bool admin_desktop_override;  ///< Windows: let an admin-group member stream the active desktop even when another account owns it. Default false.
   };
 
   struct sunshine_t {

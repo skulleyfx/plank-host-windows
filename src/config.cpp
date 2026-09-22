@@ -720,6 +720,7 @@ namespace config {
     true,  // lock_on_disconnect
     30,  // lock_on_disconnect_delay
     {},  // admin_group: BUILTIN\Administrators
+    false,  // admin_desktop_override: an admin cannot seize another user's desktop unless enabled
   };
 
   video_t video {
@@ -1591,6 +1592,7 @@ namespace config {
     bool_f(vars, "lock_on_disconnect", plank_auth.lock_on_disconnect);
     int_between_f(vars, "lock_on_disconnect_delay", plank_auth.lock_on_disconnect_delay, {0, 3600});
     string_f(vars, "admin_group", plank_auth.admin_group);
+    bool_f(vars, "admin_desktop_override", plank_auth.admin_desktop_override);
 
     bool_f(vars, "clipboard_text", input.clipboard_text);
 

@@ -592,6 +592,19 @@ namespace nvhttp {
     const bool attested = uid && plank::session::supervisor_attests_account_for_active_seat0(*uid);
 #endif
     if (!attested) {
+#ifdef _WIN32
+      // Supervisor override: a member of the admin group (admin_group, default
+      // BUILTIN\Administrators) who has authenticated may attach to the active
+      // desktop even when a different account owns the seat, the way a console
+      // support tool can. Off unless admin_desktop_override is enabled. The
+      // returned uid is the admin's own, so the display lease is keyed to them.
+      if (uid && config::plank_auth.admin_desktop_override &&
+          plank::auth::account_is_plank_admin(*identity)) {
+        BOOST_LOG(warning) << "PLANK admin desktop override: attaching "sv << *identity
+                           << " to the active seat, which another account owns"sv;
+        return uid;
+      }
+#endif
       web_auth->cancel(token);
       BOOST_LOG(warning) << "Rejecting PLANK stream for an account that is not authorized for the active desktop"sv;
       return std::nullopt;
