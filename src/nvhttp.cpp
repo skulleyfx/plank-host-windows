@@ -1372,7 +1372,8 @@ namespace nvhttp {
     if (video::last_encoder_probe_supported_h264_10bit_422) {
       codec_mode_flags |= SCM_H264_HIGH10_422;
     }
-    if (video::nvenc_direct_supports_hevc_444_8bit() ||
+    if (video::nvenc_direct_supports_hevc_420_8bit() ||
+        video::nvenc_direct_supports_hevc_444_8bit() ||
         video::nvenc_direct_supports_hevc_444_10bit()) {
       codec_mode_flags |= SCM_HEVC;
       if (video::nvenc_direct_supports_hevc_444_8bit()) {
@@ -1446,7 +1447,8 @@ namespace nvhttp {
     tree.put("root.PlankEncoderBackends", "software-cuda,nvenc-direct");
     tree.put("root.PlankEncodingModes", get_plank_encoding_modes());
     tree.put("root.MaxLumaPixelsHEVC",
-             video::nvenc_direct_supports_hevc_444_8bit() ||
+             video::nvenc_direct_supports_hevc_420_8bit() ||
+                 video::nvenc_direct_supports_hevc_444_8bit() ||
                  video::nvenc_direct_supports_hevc_444_10bit() ?
                "1869449984" : "0");
 

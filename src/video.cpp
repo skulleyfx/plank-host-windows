@@ -1704,6 +1704,23 @@ namespace video {
 #endif
   }
 
+  bool codec_supports_8bit_420(const encoder_t::codec_t &codec) {
+    return codec[encoder_t::PASSED];
+  }
+
+  bool nvenc_direct_supports_hevc_420_8bit() {
+#if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
+    return nvenc_direct_qualified && codec_supports_8bit_420(nvenc_direct.hevc);
+#elif defined(_WIN32)
+    // Baseline HEVC 4:2:0 is qualified independently of the optional 4:4:4
+    // input path. This keeps bandwidth-limited hosts usable when their GPU
+    // cannot encode HEVC Rext 4:4:4.
+    return chosen_encoder == &nvenc && codec_supports_8bit_420(nvenc.hevc);
+#else
+    return false;
+#endif
+  }
+
   bool nvenc_direct_supports_hevc_444_8bit() {
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     return nvenc_direct_qualified && nvenc_direct.hevc[encoder_t::PASSED] &&
@@ -1728,13 +1745,15 @@ namespace video {
   bool encoder_backend_available(std::string_view backend) {
 #if defined(_WIN32)
     if (backend == "nvenc-direct"sv) {
-      return nvenc_direct_supports_h264_444_8bit() ||
+      return nvenc_direct_supports_hevc_420_8bit() ||
+             nvenc_direct_supports_h264_444_8bit() ||
              nvenc_direct_supports_hevc_444_8bit();
     }
 #endif
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     if (backend == "nvenc-direct"sv) {
-      return nvenc_direct_supports_h264_444_8bit() ||
+      return nvenc_direct_supports_hevc_420_8bit() ||
+             nvenc_direct_supports_h264_444_8bit() ||
              nvenc_direct_supports_hevc_444_8bit() ||
              nvenc_direct_supports_hevc_444_10bit();
     }
@@ -1768,8 +1787,7 @@ namespace video {
       return nvenc_direct_supports_hevc_444_8bit();
     }
     if (mode == "hevc-8-420-nvenc"sv) {
-      // 4:2:0 HEVC is the baseline every HEVC-capable NVENC GPU encodes.
-      return nvenc_direct_supports_hevc_444_8bit();
+      return nvenc_direct_supports_hevc_420_8bit();
     }
     if (mode == "hevc-10-444-nvenc"sv) {
       return nvenc_direct_supports_hevc_444_10bit();
@@ -1782,8 +1800,7 @@ namespace video {
       return nvenc_direct_supports_hevc_444_8bit();
     }
     if (mode == "hevc-8-420-nvenc"sv) {
-      // 4:2:0 HEVC is the baseline every HEVC-capable NVENC GPU encodes.
-      return nvenc_direct_supports_hevc_444_8bit();
+      return nvenc_direct_supports_hevc_420_8bit();
     }
 #else
     (void) mode;

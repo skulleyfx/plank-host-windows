@@ -748,6 +748,17 @@ namespace video {
   bool encoding_mode_available(std::string_view mode);
 
   /**
+   * @brief Report whether a codec passed its baseline 8-bit 4:2:0 probe.
+   *
+   * 4:2:0 support depends on the base codec probe and does not require the
+   * separate 4:4:4 capability bit.
+   *
+   * @param codec Probed codec capability record.
+   * @return `true` when the baseline codec probe passed.
+   */
+  bool codec_supports_8bit_420(const encoder_t::codec_t &codec);
+
+  /**
    * @brief Report whether a negotiated PLANK capture source is available.
    *
    * @param source PLANK protocol capture-source name.
@@ -760,6 +771,7 @@ namespace video {
 
   /** Return exact direct-NVENC capability bits used by server-info advertisement. */
   bool nvenc_direct_supports_h264_444_8bit();
+  bool nvenc_direct_supports_hevc_420_8bit();
   bool nvenc_direct_supports_hevc_444_8bit();
   bool nvenc_direct_supports_hevc_444_10bit();
 

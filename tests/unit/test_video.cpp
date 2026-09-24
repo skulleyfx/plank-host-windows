@@ -190,6 +190,19 @@ TEST(VideoColorspaceTest, IdentityGbrCudaKernelProducesExact10BitPlanes) {
 }
 #endif
 
+TEST(VideoCapabilityTest, Hevc420DependsOnlyOnBaselineCodecProbe) {
+  video::encoder_t::codec_t codec {};
+
+  EXPECT_FALSE(video::codec_supports_8bit_420(codec));
+
+  codec[video::encoder_t::PASSED] = true;
+  EXPECT_TRUE(video::codec_supports_8bit_420(codec));
+
+  codec[video::encoder_t::YUV444] = false;
+  codec[video::encoder_t::DYNAMIC_RANGE_YUV444] = false;
+  EXPECT_TRUE(video::codec_supports_8bit_420(codec));
+}
+
 struct EncoderTest: PlatformTestSuite, testing::WithParamInterface<video::encoder_t *> {
   void SetUp() override {
     BaseTest::SetUp();
