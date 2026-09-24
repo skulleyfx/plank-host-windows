@@ -26,6 +26,7 @@ extern "C" {
 #include "process.h"
 #include "raw_hid_tablet.h"
 #include "session_stream.h"
+#include "auth/second_factor.h"
 #include "session/clipboard.h"
 #include "session/session_context.h"
 #include "stream.h"
@@ -677,10 +678,19 @@ namespace stream {
         next_ownership_check = std::chrono::steady_clock::now() + ownership_check_period;
         if (plank::session::desktop_owner_relation(session->authenticated_account) ==
             plank::session::desktop_owner_e::different) {
-          BOOST_LOG(warning) << "The captured desktop is now owned by a different account than "
-                             << session->authenticated_account << "; ending the stream"sv;
-          session::stop(*session);
-          return;
+          // A PLANK admin using the desktop override deliberately streams a
+          // seat another account owns, so the ownership mismatch that ends an
+          // ordinary login-screen stream must not end theirs. Everyone else is
+          // still cut off the moment a different account takes the desktop.
+          const bool admin_override =
+            config::plank_auth.admin_desktop_override &&
+            plank::auth::account_is_plank_admin(session->authenticated_account);
+          if (!admin_override) {
+            BOOST_LOG(warning) << "The captured desktop is now owned by a different account than "
+                               << session->authenticated_account << "; ending the stream"sv;
+            session::stop(*session);
+            return;
+          }
         }
       }
       platf::win_cursor_position_t root_position {};
