@@ -80,6 +80,14 @@ constexpr auto __mingw_uuidof<winrt::IDirect3DDxgiInterfaceAccess>() -> GUID con
 #endif
 
 namespace platf::dxgi {
+  bool wgc_supported() {
+    try {
+      return winrt::GraphicsCaptureSession::IsSupported();
+    } catch (const winrt::hresult_error &) {
+      return false;
+    }
+  }
+
   wgc_capture_t::wgc_capture_t() {
     InitializeConditionVariable(&frame_present_cv);
   }
@@ -105,7 +113,7 @@ namespace platf::dxgi {
     dxgi::dxgi_t dxgi;
     winrt::com_ptr<::IInspectable> d3d_comhandle;
     try {
-      if (!winrt::GraphicsCaptureSession::IsSupported()) {
+      if (!wgc_supported()) {
         BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows!"sv;
         return -1;
       }

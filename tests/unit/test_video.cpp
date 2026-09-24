@@ -203,6 +203,19 @@ TEST(VideoCapabilityTest, Hevc420DependsOnlyOnBaselineCodecProbe) {
   EXPECT_TRUE(video::codec_supports_8bit_420(codec));
 }
 
+TEST(VideoCapabilityTest, CaptureSourceNamesPreserveWindowsBackendSelection) {
+  EXPECT_EQ(video::capture_source_from_name("nvfbc"), video::capture_source_e::nvfbc_8bit);
+  EXPECT_EQ(video::capture_source_from_name("x11-native10"), video::capture_source_e::x11_native10);
+  EXPECT_EQ(video::capture_source_from_name("ddup"), video::capture_source_e::ddup);
+  EXPECT_EQ(video::capture_source_from_name("wgc"), video::capture_source_e::wgc);
+  EXPECT_FALSE(video::capture_source_from_name("unknown").has_value());
+
+  EXPECT_TRUE(video::is_8bit_desktop_capture(video::capture_source_e::nvfbc_8bit));
+  EXPECT_TRUE(video::is_8bit_desktop_capture(video::capture_source_e::ddup));
+  EXPECT_TRUE(video::is_8bit_desktop_capture(video::capture_source_e::wgc));
+  EXPECT_FALSE(video::is_8bit_desktop_capture(video::capture_source_e::x11_native10));
+}
+
 struct EncoderTest: PlatformTestSuite, testing::WithParamInterface<video::encoder_t *> {
   void SetUp() override {
     BaseTest::SetUp();

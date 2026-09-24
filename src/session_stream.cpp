@@ -211,21 +211,15 @@ namespace session_stream {
     config.monitor.output_name = launch_session->span_desktop ?
       std::string {} : launch_session->output_name;
     config.monitor.encoder_backend = launch_session->encoder_backend;
-    if (launch_session->capture_source == "nvfbc") {
-      config.monitor.capture_source = video::capture_source_e::nvfbc_8bit;
-#ifdef _WIN32
-    } else if (launch_session->capture_source == "ddup" ||
-               launch_session->capture_source == "wgc") {
-      // Both are 8-bit desktop capture; the session path treats them alike.
-      config.monitor.capture_source = video::capture_source_e::nvfbc_8bit;
-#endif
-    } else if (launch_session->capture_source == "x11-native10") {
-      config.monitor.capture_source = video::capture_source_e::x11_native10;
-    } else {
+    const auto capture_source = video::capture_source_from_name(
+      launch_session->capture_source
+    );
+    if (!capture_source) {
       result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
       result.message = "Unsupported capture source";
       return result;
     }
+    config.monitor.capture_source = *capture_source;
 
     int encoder_target_kbps {};
     std::uint32_t requested_video_format {};
@@ -355,7 +349,7 @@ namespace session_stream {
 
     if (launch_session->encoder_backend == "nvenc-direct") {
       const bool nvfbc_identity_444 =
-        config.monitor.capture_source == video::capture_source_e::nvfbc_8bit &&
+        video::is_8bit_desktop_capture(config.monitor.capture_source) &&
         exact_identity_444 &&
         ((config.monitor.dynamicRange == 0 &&
           (config.monitor.videoFormat == 0 || config.monitor.videoFormat == 1)) ||
@@ -366,7 +360,7 @@ namespace session_stream {
       // captured desktop to 4:2:0 in the ordinary way, so this is not an
       // identity-GBR path and does not need exact_identity_444.
       const bool nvfbc_hevc_420 =
-        config.monitor.capture_source == video::capture_source_e::nvfbc_8bit &&
+        video::is_8bit_desktop_capture(config.monitor.capture_source) &&
         config.monitor.videoFormat == 1 && config.monitor.dynamicRange == 0 &&
         config.monitor.chromaSamplingType == 0 && !identity_gbr_requested;
       const bool nvfbc_mode = nvfbc_identity_444 || nvfbc_hevc_420;

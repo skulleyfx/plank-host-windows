@@ -1018,9 +1018,16 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    const bool force_ddup = config.capture_source == video::capture_source_e::ddup;
+    const bool force_wgc = config.capture_source == video::capture_source_e::wgc;
+
     // A spanned session covers the whole desktop rather than one output.
     // Windows can only duplicate one output at a time, so this joins them.
     if (config.span_desktop && hwdevice_type == mem_type_e::dxgi) {
+      if (force_wgc) {
+        BOOST_LOG(error) << "Windows.Graphics.Capture cannot capture a spanned desktop; choose Automatic or DXGI Desktop Duplication"sv;
+        return nullptr;
+      }
       auto disp = std::make_shared<dxgi::display_span_vram_t>();
 
       if (!disp->init(config, display_name)) {
@@ -1029,18 +1036,23 @@ namespace platf {
       BOOST_LOG(info) << "Spanned capture is unavailable; falling back to a single output"sv;
     }
 
-    if (hwdevice_type == mem_type_e::dxgi) {
+    if (!force_wgc && hwdevice_type == mem_type_e::dxgi) {
       auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
 
       if (!disp->init(config, display_name)) {
         return disp;
       }
-    } else if (hwdevice_type == mem_type_e::system) {
+    } else if (!force_wgc && hwdevice_type == mem_type_e::system) {
       auto disp = std::make_shared<dxgi::display_ddup_ram_t>();
 
       if (!disp->init(config, display_name)) {
         return disp;
       }
+    }
+
+    if (force_ddup) {
+      BOOST_LOG(error) << "DXGI Desktop Duplication was requested but could not initialize"sv;
+      return nullptr;
     }
 
     if (hwdevice_type == mem_type_e::dxgi) {
@@ -1060,6 +1072,32 @@ namespace platf {
     // ddx and wgc failed
     return nullptr;
   }
+
+  namespace {
+    bool has_attached_output() {
+      dxgi::factory1_t factory;
+      if (FAILED(CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory))) {
+        return false;
+      }
+      dxgi::adapter_t::pointer adapter_p;
+      for (int adapter_index = 0;
+           factory->EnumAdapters1(adapter_index, &adapter_p) != DXGI_ERROR_NOT_FOUND;
+           ++adapter_index) {
+        dxgi::adapter_t adapter {adapter_p};
+        dxgi::output_t::pointer output_p {};
+        for (int output_index = 0;
+             adapter->EnumOutputs(output_index, &output_p) != DXGI_ERROR_NOT_FOUND;
+             ++output_index) {
+          dxgi::output_t output {output_p};
+          DXGI_OUTPUT_DESC desc {};
+          if (SUCCEEDED(output->GetDesc(&desc)) && desc.AttachedToDesktop) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+  }  // namespace
 
   std::vector<std::string> display_names(mem_type_e) {
     std::vector<std::string> display_names;
@@ -1131,17 +1169,23 @@ namespace platf {
   /**
    * @brief Report which PLANK capture sources this host can serve.
    *
-   * DXGI Desktop Duplication and Windows.Graphics.Capture both require an
-   * interactive session with attached outputs, so availability is decided by
-   * whether any display enumerates - the same test display() performs.
+   * DXGI Desktop Duplication must pass a duplication probe. WGC must be
+   * supported by the OS and have an attached output. The legacy `nvfbc`
+   * protocol alias remains available when either automatic-path backend works.
    */
   bool plank_capture_source_available(std::string_view source_name) {
-    // "nvfbc" is accepted as the protocol name for 8-bit desktop capture,
-    // which Windows serves through DXGI; see plank_capture_sources().
-    if (source_name != "nvfbc" && source_name != "ddup" && source_name != "wgc") {
-      return false;
+    const bool ddup_available = !display_names(mem_type_e::dxgi).empty();
+    const bool wgc_available = dxgi::wgc_supported() && has_attached_output();
+    if (source_name == "nvfbc") {
+      return ddup_available || wgc_available;
     }
-    return !display_names(mem_type_e::dxgi).empty();
+    if (source_name == "ddup") {
+      return ddup_available;
+    }
+    if (source_name == "wgc") {
+      return wgc_available;
+    }
+    return false;
   }
 
   std::vector<display_info_t> display_infos(mem_type_e hwdevice_type) {

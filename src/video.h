@@ -35,6 +35,17 @@ namespace video {
     wgc,  ///< Windows.Graphics.Capture.
   };
 
+  /**
+   * @brief Map a PLANK protocol capture-source name to its internal value.
+   *
+   * @param source Protocol capture-source name.
+   * @return Mapped capture source, or no value for an unknown name.
+   */
+  std::optional<capture_source_e> capture_source_from_name(std::string_view source);
+
+  /** Return whether a capture source supplies the ordinary 8-bit desktop path. */
+  bool is_8bit_desktop_capture(capture_source_e source);
+
   struct software_rate_control_t {
     std::int64_t average_rate;  ///< Sustained encoder target in bits per second.
     std::int64_t peak_rate;  ///< Short-term encoder ceiling in bits per second.

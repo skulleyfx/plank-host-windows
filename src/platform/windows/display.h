@@ -20,6 +20,9 @@
 #include "src/video.h"
 
 namespace platf::dxgi {
+  /** Return whether Windows.Graphics.Capture is available on this OS. */
+  bool wgc_supported();
+
   extern const char *format_str[];
 
   // Add D3D11_CREATE_DEVICE_DEBUG here to enable the D3D11 debug runtime.

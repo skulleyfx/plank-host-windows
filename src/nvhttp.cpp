@@ -98,14 +98,23 @@ namespace nvhttp {
    * Windows. Availability of a named source is a separate runtime question
    * answered by video::capture_source_available().
    */
-  constexpr std::string_view plank_capture_sources() {
+  std::string plank_capture_sources() {
 #ifdef _WIN32
-    // "nvfbc" is advertised as an alias for 8-bit desktop capture so existing
-    // clients, which only know the Linux source names, can connect.
-    return "nvfbc,ddup,wgc";
+    static constexpr std::array sources {"nvfbc"sv, "ddup"sv, "wgc"sv};
 #else
-    return "nvfbc,x11-native10";
+    static constexpr std::array sources {"nvfbc"sv, "x11-native10"sv};
 #endif
+    std::string result;
+    for (const auto source : sources) {
+      if (!video::capture_source_available(source)) {
+        continue;
+      }
+      if (!result.empty()) {
+        result += ',';
+      }
+      result += source;
+    }
+    return result;
   }
 
   /**

@@ -58,6 +58,28 @@ extern "C" {
 using namespace std::literals;
 
 namespace video {
+  std::optional<capture_source_e> capture_source_from_name(std::string_view source) {
+    if (source == "nvfbc"sv) {
+      return capture_source_e::nvfbc_8bit;
+    }
+    if (source == "x11-native10"sv) {
+      return capture_source_e::x11_native10;
+    }
+    if (source == "ddup"sv) {
+      return capture_source_e::ddup;
+    }
+    if (source == "wgc"sv) {
+      return capture_source_e::wgc;
+    }
+    return std::nullopt;
+  }
+
+  bool is_8bit_desktop_capture(capture_source_e source) {
+    return source == capture_source_e::nvfbc_8bit ||
+           source == capture_source_e::ddup ||
+           source == capture_source_e::wgc;
+  }
+
 
   software_rate_control_t software_rate_control(
     std::int64_t average_rate,
