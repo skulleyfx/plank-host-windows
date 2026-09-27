@@ -181,12 +181,14 @@ namespace NVENC_NAMESPACE {
      * @param config NVENC encoder configuration.
      * @param client_config Stream configuration requested by the client.
      * @param encode_guid Selected codec GUID.
+     * @param buffer_format Encode buffer format; 4:4:4 gets extra VBV headroom.
      */
     void configure_rate_control(
       NV_ENC_CONFIG &enc_config,
       const ::nvenc::nvenc_config &config,
       const video::config_t &client_config,
-      const GUID &encode_guid
+      const GUID &encode_guid,
+      NV_ENC_BUFFER_FORMAT buffer_format
     );
 
     /**

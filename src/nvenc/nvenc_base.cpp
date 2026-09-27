@@ -47,6 +47,11 @@ namespace {
            buffer_format == NV_ENC_BUFFER_FORMAT_YUV444_10BIT;
   }
 
+  // Minimum VBV headroom (percent added to the one-frame CBR VBV) applied to 4:4:4
+  // so the encoder absorbs its larger per-frame bit spikes instead of spiking QP
+  // (the periodic 4:4:4 compression glitch). Matches the tested nvenc_vbv_increase.
+  constexpr int YUV444_VBV_FLOOR_PERCENT = 200;
+
   /**
    * @brief Determine whether a codec GUID appears in the driver-provided list.
    *
@@ -255,7 +260,8 @@ namespace NVENC_NAMESPACE {
     NV_ENC_CONFIG &enc_config,
     const ::nvenc::nvenc_config &config,
     const video::config_t &client_config,
-    const GUID &encode_guid
+    const GUID &encode_guid,
+    NV_ENC_BUFFER_FORMAT buffer_format
   ) {
     enc_config.gopLength = NVENC_INFINITE_GOPLENGTH;
     enc_config.frameIntervalP = 1;
@@ -275,10 +281,21 @@ namespace NVENC_NAMESPACE {
 
     enc_config.rcParams.enableAQ = config.adaptive_quantization;
     enc_config.rcParams.averageBitRate = client_config.bitrate * 1000;
+
+    // 4:4:4 carries ~2x the chroma of 4:2:0, so the same CBR target with a strict
+    // single-frame VBV starves complex/refresh frames and shows a periodic
+    // compression glitch. Give 4:4:4 a VBV floor so the encoder can absorb those
+    // bit spikes. An explicit, higher nvenc_vbv_increase still wins. 4:2:0 keeps
+    // its configured value (default 0 = tightest latency).
+    int vbv_increase = config.vbv_percentage_increase;
+    if (buffer_is_yuv444(buffer_format) && vbv_increase < YUV444_VBV_FLOOR_PERCENT) {
+      vbv_increase = YUV444_VBV_FLOOR_PERCENT;
+      BOOST_LOG(info) << "NvEnc: 4:4:4 VBV floor applied (" << vbv_increase << "%)";
+    }
     if (get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE)) {
       enc_config.rcParams.vbvBufferSize = client_config.bitrate * 1000 / client_config.framerate;
-      if (config.vbv_percentage_increase > 0) {
-        enc_config.rcParams.vbvBufferSize += enc_config.rcParams.vbvBufferSize * config.vbv_percentage_increase / 100;
+      if (vbv_increase > 0) {
+        enc_config.rcParams.vbvBufferSize += enc_config.rcParams.vbvBufferSize * vbv_increase / 100;
       }
     }
   }
@@ -675,7 +692,7 @@ namespace NVENC_NAMESPACE {
 
     NV_ENC_CONFIG enc_config = preset_config.presetCfg;
     enc_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
-    configure_rate_control(enc_config, config, client_config, init_params.encodeGUID);
+    configure_rate_control(enc_config, config, client_config, init_params.encodeGUID, buffer_format);
     configure_codec(enc_config, config, client_config, colorspace, buffer_format, init_params.encodeGUID);
     init_params.encodeConfig = &enc_config;
     if (!initialize_encoder_resources(init_params)) {
