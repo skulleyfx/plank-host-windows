@@ -231,28 +231,44 @@ namespace stream {
   constexpr std::size_t plank_client_packet_capacity =
     PLANK_TRANSPORT_EVENT_HEADER_SIZE + plank::clipboard::max_text_bytes;
 
+  bool queue_clipboard_offer(session_t *session, const std::string &text);
+
   /**
-   * @brief Send host clipboard text to a client that supports clipboard sharing.
+   * @brief Offer host clipboard text to a client that supports clipboard sync.
+   *
+   * Uses the framed clipboard-sync format (protocol/clipboard-sync.md), the
+   * same one Mac and Linux hosts send, so any PLANK client can receive it.
    */
   void send_clipboard_text(session_t *session, const std::string &text) {
-    if ((session->plank_client_features & plank::topology::feature_clipboard_text) == 0) {
+    if ((session->plank_client_features & plank::topology::feature_clipboard_sync) == 0) {
       return;
     }
-    if (send_plank_transport_event(
-          session, plank_event_clipboard_text,
-          reinterpret_cast<const std::uint8_t *>(text.data()), text.size()) != 0) {
-      BOOST_LOG(warning) << "Couldn't send clipboard text to the client"sv;
+    if (!queue_clipboard_offer(session, text)) {
+      BOOST_LOG(warning) << "Couldn't offer clipboard text to the client"sv;
     }
   }
 
   /**
-   * @brief Share host clipboard changes, at most a few times a second.
+   * @brief Share clipboard changes both ways, at most a few times a second.
+   *
+   * Text the client offered (assembled by handle_client_clipboard_offer) is
+   * placed on the host clipboard here; host changes go out as framed offers.
    */
   void poll_clipboard(session_t *session) {
     if (!config::input.clipboard_text ||
-        (session->plank_client_features & plank::topology::feature_clipboard_text) == 0) {
+        (session->plank_client_features & plank::topology::feature_clipboard_sync) == 0) {
       return;
     }
+#ifdef _WIN32
+    if (auto incoming = session->client_clipboard_inbox.take()) {
+      const std::string text(incoming->begin(), incoming->end());
+      if (plank::clipboard::set_host_text(text)) {
+        // Our own write bumps the clipboard counter; don't echo it back.
+        session->clipboard_generation =
+          static_cast<std::uint32_t>(plank::clipboard::host_generation());
+      }
+    }
+#endif
     const auto now = std::chrono::steady_clock::now();
     if (now < session->clipboard_next_poll) {
       return;
@@ -390,6 +406,9 @@ namespace stream {
   bool clipboard_backend_available(const session_t *session) {
 #if defined(__linux__) && defined(SUNSHINE_BUILD_X11)
     return session != nullptr && session->clipboard != nullptr;
+#elif defined(_WIN32)
+    // The Windows clipboard is read and written by poll_clipboard().
+    return session != nullptr && config::input.clipboard_text;
 #else
     (void) session;
     return false;
