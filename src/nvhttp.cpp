@@ -13,6 +13,8 @@
 
 #include "src/plank_win32_compat.h"
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -21,6 +23,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -90,31 +93,168 @@ namespace nvhttp {
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
 
+  namespace {
+    /**
+     * @brief Live probe of which PLANK capture sources work right now.
+     *
+     * The set is platform-specific: NvFBC and the 10-bit X11 path exist only on
+     * Linux, DXGI Desktop Duplication and Windows.Graphics.Capture only on
+     * Windows; each is kept only if video::capture_source_available() passes.
+     * On Windows that creates a D3D11 device and attempts DuplicateOutput on
+     * every output, which can block indefinitely (desktop switches, RDP). Never
+     * call it on the HTTPS thread; use the cached accessors below.
+     */
+    std::string probe_plank_capture_sources() {
+#ifdef _WIN32
+      static constexpr std::array sources {"nvfbc"sv, "ddup"sv, "wgc"sv};
+#else
+      static constexpr std::array sources {"nvfbc"sv, "x11-native10"sv};
+#endif
+      std::string result;
+      for (const auto source : sources) {
+        if (!video::capture_source_available(source)) {
+          continue;
+        }
+        if (!result.empty()) {
+          result += ',';
+        }
+        result += source;
+      }
+      return result;
+    }
+
+    /**
+     * @brief Background-refreshed cache of probe_plank_capture_sources().
+     *
+     * Every client polls serverinfo every few seconds. Probing inline ran
+     * several duplication tests per poll on the single HTTPS thread, and one
+     * probe that never returned stopped the server from accepting connections
+     * until restart (clients piled up in CLOSE_WAIT and showed the host
+     * offline). The probe now runs on a detached worker at most every
+     * capture_sources_max_age; a probe that never returns parks only that
+     * worker, and callers keep the last known answer.
+     */
+    struct capture_sources_cache_t {
+      std::mutex mutex;
+      std::condition_variable updated;
+      std::string value;
+      std::uint64_t generation = 0;  ///< Completed probes; 0 means no answer yet.
+      bool refreshing = false;
+      bool stall_logged = false;
+      std::chrono::steady_clock::time_point refreshed_at;
+      std::chrono::steady_clock::time_point refresh_started_at;
+    };
+
+    constexpr auto capture_sources_max_age = 30s;
+    constexpr auto capture_sources_first_wait = 3s;
+    constexpr auto capture_sources_launch_wait = 5s;
+    constexpr auto capture_sources_stall_warning = 20s;
+
+    capture_sources_cache_t &capture_sources_cache() {
+      static capture_sources_cache_t cache;
+      return cache;
+    }
+
+    /**
+     * @brief Start a background probe unless one is already running.
+     * @param cache Cache whose mutex the caller holds.
+     */
+    void start_capture_sources_refresh(capture_sources_cache_t &cache) {
+      if (cache.refreshing) {
+        return;
+      }
+      cache.refreshing = true;
+      cache.refresh_started_at = std::chrono::steady_clock::now();
+      std::thread([&cache] {
+        std::optional<std::string> sources;
+        try {
+          sources = probe_plank_capture_sources();
+        } catch (const std::exception &e) {
+          BOOST_LOG(error) << "PLANK capture source probe failed: "sv << e.what();
+        }
+        std::lock_guard lock {cache.mutex};
+        if (sources) {
+          cache.value = std::move(*sources);
+          cache.refreshed_at = std::chrono::steady_clock::now();
+          ++cache.generation;
+        }
+        cache.refreshing = false;
+        cache.stall_logged = false;
+        cache.updated.notify_all();
+      }).detach();
+    }
+
+    /**
+     * @brief Warn once when a probe has been running far longer than normal.
+     * @param cache Cache whose mutex the caller holds.
+     */
+    void log_capture_sources_stall(capture_sources_cache_t &cache) {
+      const auto running = std::chrono::steady_clock::now() - cache.refresh_started_at;
+      if (cache.refreshing && !cache.stall_logged && running > capture_sources_stall_warning) {
+        cache.stall_logged = true;
+        BOOST_LOG(warning) << "PLANK capture source probe has not returned after "sv
+                           << std::chrono::duration_cast<std::chrono::seconds>(running).count()
+                           << "s; serving the last known capture sources"sv;
+      }
+    }
+
+    bool source_listed(std::string_view sources, std::string_view source) {
+      while (!sources.empty()) {
+        const auto comma = sources.find(',');
+        if (sources.substr(0, comma) == source) {
+          return true;
+        }
+        if (comma == std::string_view::npos) {
+          break;
+        }
+        sources.remove_prefix(comma + 1);
+      }
+      return false;
+    }
+  }  // namespace
+
   /**
-   * @brief PLANK capture sources this platform can offer.
+   * @brief Comma-separated PLANK capture sources available on this host.
    *
-   * The set is platform-specific: NvFBC and the 10-bit X11 path exist only on
-   * Linux, DXGI Desktop Duplication and Windows.Graphics.Capture only on
-   * Windows. Availability of a named source is a separate runtime question
-   * answered by video::capture_source_available().
+   * Served from the background cache; refreshes it when stale. Only the very
+   * first call waits, briefly, for an initial answer.
    */
   std::string plank_capture_sources() {
-#ifdef _WIN32
-    static constexpr std::array sources {"nvfbc"sv, "ddup"sv, "wgc"sv};
-#else
-    static constexpr std::array sources {"nvfbc"sv, "x11-native10"sv};
-#endif
-    std::string result;
-    for (const auto source : sources) {
-      if (!video::capture_source_available(source)) {
-        continue;
-      }
-      if (!result.empty()) {
-        result += ',';
-      }
-      result += source;
+    auto &cache = capture_sources_cache();
+    std::unique_lock lock {cache.mutex};
+    if (cache.generation == 0 ||
+        std::chrono::steady_clock::now() - cache.refreshed_at > capture_sources_max_age) {
+      start_capture_sources_refresh(cache);
     }
-    return result;
+    if (cache.generation == 0) {
+      cache.updated.wait_for(lock, capture_sources_first_wait, [&cache] {
+        return cache.generation != 0 || !cache.refreshing;
+      });
+    }
+    log_capture_sources_stall(cache);
+    return cache.value;
+  }
+
+  /**
+   * @brief Whether a session may start with the given capture source.
+   *
+   * Trusts a cached "available". A cached "unavailable" may be stale (a
+   * display can appear after the last probe), so it is re-probed, waiting a
+   * bounded time for a fresh answer instead of blocking the HTTPS thread.
+   */
+  bool plank_capture_source_ready(std::string_view source) {
+    auto &cache = capture_sources_cache();
+    std::unique_lock lock {cache.mutex};
+    if (cache.generation != 0 && source_listed(cache.value, source)) {
+      return true;
+    }
+    const auto seen = cache.generation;
+    start_capture_sources_refresh(cache);
+    cache.updated.wait_for(lock, capture_sources_launch_wait, [&cache, seen] {
+      return cache.generation != seen || !cache.refreshing;
+    });
+    log_capture_sources_stall(cache);
+    return source_listed(cache.value, source);
   }
 
   /**
@@ -1071,7 +1211,7 @@ namespace nvhttp {
                "Unsupported PLANK capture source");
       return false;
     }
-    if (!video::capture_source_available(session.capture_source)) {
+    if (!plank_capture_source_ready(session.capture_source)) {
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message",
                "Requested PLANK capture source is unavailable");
