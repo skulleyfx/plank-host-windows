@@ -239,9 +239,16 @@ if(X11_FOUND)
     add_compile_definitions(SUNSHINE_BUILD_X11)
     include_directories(SYSTEM ${X11_INCLUDE_DIR})
     list(APPEND PLATFORM_LIBRARIES ${X11_LIBRARIES})
+    # A dedicated XCB connection isolates clipboard protocol errors from Xlib
+    # capture threads and their process-wide error handler.
+    pkg_check_modules(PLANK_XCB REQUIRED xcb)
+    include_directories(SYSTEM ${PLANK_XCB_INCLUDE_DIRS})
+    list(APPEND PLATFORM_LIBRARIES ${PLANK_XCB_LIBRARIES})
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.h"
-            "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.cpp")
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/x11_clipboard.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/x11_clipboard.cpp")
 endif()
 
 # GIO

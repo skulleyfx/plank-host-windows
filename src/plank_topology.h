@@ -31,7 +31,16 @@ namespace plank::topology {
   constexpr std::uint32_t feature_authenticated_desktop_stage = 0x20000;
   constexpr std::uint32_t feature_worker_instance = 0x40000;
   // 0x80000 - 0x200000 are reserved by client builds for capture and macOS bits.
-  constexpr std::uint32_t feature_clipboard_text = 0x400000;
+  constexpr std::uint32_t feature_clipboard_sync = 0x400000;
+  // Windows hosts shared plain text under this bit in their own unframed
+  // format before adopting the framed clipboard-sync protocol; the old name
+  // stays until that switch lands.
+  constexpr std::uint32_t feature_clipboard_text = feature_clipboard_sync;
+#if (defined(__linux__) && defined(SUNSHINE_BUILD_X11)) || defined(_WIN32)
+  constexpr std::uint32_t feature_platform_clipboard_sync = feature_clipboard_sync;
+#else
+  constexpr std::uint32_t feature_platform_clipboard_sync = 0;
+#endif
   // Windows hosts join two outputs into one canvas only for clients that ask.
   constexpr std::uint32_t feature_two_screen_capture = 0x800000;
   // The client may ask the host to fit the encoder to its link per session.
@@ -56,7 +65,7 @@ namespace plank::topology {
     feature_desktop_handoff_notice |
     feature_authenticated_desktop_stage |
     feature_worker_instance |
-    feature_clipboard_text |
+    feature_platform_clipboard_sync |
     feature_two_screen_capture |
     feature_adaptive_bitrate;
 

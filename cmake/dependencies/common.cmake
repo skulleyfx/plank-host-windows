@@ -11,10 +11,8 @@ include(dependencies/Boost_Sunshine)
 # web server
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")
 
-# lizardbyte common helpers
-set(LIZARDBYTE_COMMON_BUILD_TEST_SUPPORT ${BUILD_TESTS}
-        CACHE BOOL "Build lizardbyte-common GoogleTest support helpers" FORCE)
-add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/lizardbyte-common")
+# Common helpers and the Host-owned test framework.
+include("${CMAKE_CURRENT_LIST_DIR}/lizardbyte_common.cmake")
 
 # libdisplaydevice
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libdisplaydevice")

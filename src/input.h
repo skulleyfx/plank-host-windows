@@ -113,6 +113,15 @@ namespace input {
     void handle_keyboard(const std::shared_ptr<input_t> &input, std::uint16_t key_code, bool release);
 
     /**
+     * @brief Submit one mouse-button transition directly for lifecycle tests.
+     *
+     * @param input Retained test input session.
+     * @param button Moonlight button identifier.
+     * @param release True for button release, false for button press.
+     */
+    void handle_mouse_button(const std::shared_ptr<input_t> &input, std::uint8_t button, bool release);
+
+    /**
      * @brief Return the last key submitted to the fake platform keyboard.
      */
     std::uint16_t last_keyboard_code();

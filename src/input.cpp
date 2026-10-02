@@ -55,17 +55,6 @@ using namespace std::literals;
 
 namespace input {
 
-/**
- * @def DISABLE_LEFT_BUTTON_DELAY
- * @brief Macro for DISABLE LEFT BUTTON DELAY.
- */
-#define DISABLE_LEFT_BUTTON_DELAY ((thread_pool_util::ThreadPool::task_id_t) 0x01)
-/**
- * @def ENABLE_LEFT_BUTTON_DELAY
- * @brief Macro for ENABLE LEFT BUTTON DELAY.
- */
-#define ENABLE_LEFT_BUTTON_DELAY nullptr
-
   constexpr auto VKEY_SHIFT = 0x10;  ///< Windows virtual-key code for shift.
   constexpr auto VKEY_LSHIFT = 0xA0;  ///< Windows virtual-key code for lshift.
   constexpr auto VKEY_RSHIFT = 0xA1;  ///< Windows virtual-key code for rshift.
@@ -214,7 +203,6 @@ namespace input {
         raw_hid_tablet {std::make_unique<raw_hid::tablet_t>(std::move(raw_hid_feedback_queue))},
         raw_hid_owns_tablet {false},
         connection_id {0},
-        mouse_left_button_timeout {},
         touch_port {{0, 0, 0, 0}, 0, 0, 1.0f, 1.0f, 0, 0},
         accumulated_vscroll_delta {},
         accumulated_hscroll_delta {} {
@@ -235,8 +223,6 @@ namespace input {
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Pending raw input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
-
-    thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
 
     input::touch_port_t touch_port;  ///< Touch coordinate bounds for the current stream.
 
@@ -547,7 +533,6 @@ namespace input {
       return;
     }
 
-    input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
     platf::move_mouse(platf_input, util::endian::big(packet->deltaX), util::endian::big(packet->deltaY));
   }
 
@@ -650,10 +635,6 @@ namespace input {
       return;
     }
 
-    if (input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
-      input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
-    }
-
     float x = util::endian::big(packet->x);
     float y = util::endian::big(packet->y);
 
@@ -716,49 +697,8 @@ namespace input {
 
       mouse_press[button] = !release;
     }
-    /**
-     * When Moonlight sends mouse input through absolute coordinates,
-     * it's possible that BUTTON_RIGHT is pressed down immediately after releasing BUTTON_LEFT.
-     * As a result, Sunshine will left-click on hyperlinks in the browser before right-clicking
-     *
-     * This can be solved by delaying BUTTON_LEFT, however, any delay on input is undesirable during gaming
-     * As a compromise, Sunshine will only put delays on BUTTON_LEFT when
-     * absolute mouse coordinates have been sent.
-     *
-     * Try to make sure BUTTON_RIGHT gets called before BUTTON_LEFT is released.
-     *
-     * input->mouse_left_button_timeout can only be nullptr
-     * when the last mouse coordinates were absolute
-     */
-    if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
-      auto f = [=]() {
-        auto left_released = mouse_press[BUTTON_LEFT];
-        if (left_released) {
-          // Already released left button
-          return;
-        }
-        platf::button_mouse(platf_input, BUTTON_LEFT, release);
-
-        mouse_press[BUTTON_LEFT] = false;
-        input->mouse_left_button_timeout = nullptr;
-      };
-
-      input->mouse_left_button_timeout = task_pool.pushDelayed(std::move(f), 10ms).task_id;
-
-      return;
-    }
-    if (
-      button == BUTTON_RIGHT && !release &&
-      input->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY
-    ) {
-      platf::button_mouse(platf_input, BUTTON_RIGHT, false);
-      platf::button_mouse(platf_input, BUTTON_RIGHT, true);
-
-      mouse_press[BUTTON_RIGHT] = false;
-
-      return;
-    }
-
+    // PLANK sends explicit button transitions. Preserve their order without
+    // delaying left releases or synthesizing right clicks between transitions.
     platf::button_mouse(platf_input, button, release);
   }
 
@@ -1533,7 +1473,7 @@ namespace input {
 #endif
 
   /**
-   * @brief Release every pressed mouse button tracked by Sunshine.
+   * @brief Release every mouse button still held when the stream disconnects.
    */
   void reset_mouse_buttons() {
     for (int button = 0; button < mouse_press.size(); ++button) {
@@ -1568,7 +1508,6 @@ namespace input {
     }
 
     task_pool.cancel(key_press_repeat_id);
-    task_pool.cancel(input->mouse_left_button_timeout);
     reset_mouse_buttons();
     reset_keyboard_keys();
     // Keep the host UHID/XInput endpoints stable while this retained session
@@ -1726,6 +1665,19 @@ namespace input {
       NV_KEYBOARD_PACKET packet {};
       packet.header.magic = util::endian::little<std::uint32_t>(release ? KEY_UP_EVENT_MAGIC : KEY_DOWN_EVENT_MAGIC);
       packet.keyCode = static_cast<short>(key_code);
+      auto mutable_input = input;
+      passthrough(mutable_input, &packet);
+    }
+
+    void handle_mouse_button(const std::shared_ptr<input_t> &input, const std::uint8_t button, const bool release) {
+      if (!input) {
+        return;
+      }
+      NV_MOUSE_BUTTON_PACKET packet {};
+      packet.header.magic = util::endian::little<std::uint32_t>(
+        release ? MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5 : MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5
+      );
+      packet.button = button;
       auto mutable_input = input;
       passthrough(mutable_input, &packet);
     }

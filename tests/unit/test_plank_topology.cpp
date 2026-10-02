@@ -10,7 +10,13 @@ namespace topology = plank::topology;
 
 TEST(PlankTopology, PublishesVersionThirteenFeatureContract) {
   EXPECT_EQ(topology::protocol_version, 13U);
-  EXPECT_EQ(topology::feature_flags, 0xFFFFU);
+#if defined(__linux__) && defined(SUNSHINE_BUILD_X11)
+  EXPECT_EQ(topology::feature_flags, 0x47FFFFU);
+  EXPECT_NE(topology::feature_flags & topology::feature_clipboard_sync, 0U);
+#else
+  EXPECT_EQ(topology::feature_flags, 0x7FFFFU);
+  EXPECT_EQ(topology::feature_flags & topology::feature_clipboard_sync, 0U);
+#endif
   EXPECT_NE(topology::feature_flags & topology::feature_nvfbc_hevc10_nvenc, 0U);
   EXPECT_NE(topology::feature_flags & topology::feature_fixed_transport_mtu, 0U);
   EXPECT_NE(topology::feature_flags & topology::feature_session_takeover, 0U);

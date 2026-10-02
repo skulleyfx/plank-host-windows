@@ -14,14 +14,8 @@ include_directories("${CMAKE_SOURCE_DIR}")
 
 enable_testing()
 
-# Add GoogleTest directory to the project
-set(GTEST_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third-party/lizardbyte-common/third-party/googletest")
-set(INSTALL_GTEST OFF)
-set(INSTALL_GMOCK OFF)
-if(NOT TARGET gtest)
-    add_subdirectory("${GTEST_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/googletest")
-endif()
-include_directories("${GTEST_SOURCE_DIR}/googletest/include" "${GTEST_SOURCE_DIR}")
+# GoogleTest is configured before lizardbyte-common by dependencies/common.cmake.
+# Its targets supply headers and libraries from the same Host-owned pin.
 
 # coverage
 # https://gcovr.com/en/stable/guide/compiling.html#compiler-options
@@ -72,12 +66,6 @@ if(UNIX AND NOT APPLE)
         message(WARNING "Could not find GCC library directory for version ${GCC_VERSION}")
     endif()
 endif()
-
-# if windows
-if (WIN32)
-    # For Windows: Prevent overriding the parent project's compiler/linker settings
-    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)  # cmake-lint: disable=C0103
-endif ()
 
 # modify SUNSHINE_DEFINITIONS
 if (WIN32)

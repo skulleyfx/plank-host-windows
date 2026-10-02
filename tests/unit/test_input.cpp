@@ -4,9 +4,11 @@
  */
 
 // standard includes
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" {
@@ -67,21 +69,67 @@ namespace {
      * @brief Install an observable fake virtual-input runtime.
      */
     void SetUp() override {
+      ASSERT_FALSE(task_pool.running());
       auto platform_input = platf::input();
       ASSERT_TRUE(platform_input);
       auto &context = platf::virtualhid::get_input_context(platform_input);
       context = platf::virtualhid::input_context_t {lvh::BackendKind::fake};
       ASSERT_NE(context.runtime, nullptr);
+      ASSERT_NE(context.mouse, nullptr);
+      mouse = context.mouse.get();
       input::testing::set_platform_input(std::move(platform_input));
     }
 
     /**
-     * @brief Destroy retained test sessions.
+     * @brief Release input and discard callbacks before destroying the fake backend.
      */
     void TearDown() override {
+      for (auto &[session, connection_id] : sessions) {
+        input::reset(session, connection_id);
+      }
+      // alloc() also queues a mouse nudge. Never let any callback from this
+      // fixture run against the next test's replacement platform backend.
+      static_cast<task_pool_util::TaskPool &>(task_pool) = task_pool_util::TaskPool {};
+      sessions.clear();
       input::terminate_retained_input();
       input::testing::set_platform_input({});
     }
+
+    /**
+     * @brief Allocate a retained session and track its lease for teardown.
+     * @param session_id Stable identity used for reconnects.
+     * @param connection_id Receives the new connection lease.
+     * @return Input state bound to the lease.
+     */
+    std::shared_ptr<input::input_t> allocate(const std::string &session_id, std::uint64_t &connection_id) {
+      auto session = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id, connection_id);
+      sessions.emplace_back(session, connection_id);
+      return session;
+    }
+
+    /**
+     * @brief Execute real queued timers synchronously without starting worker threads.
+     *
+     * Tests drain the initial alloc() nudge before observing button counts.
+     * The one-second bound rejects unexpected repeating or long-lived tasks.
+     */
+    void drain_tasks() {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      for (;;) {
+        if (auto task = task_pool.pop()) {
+          ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+          (*task)->run();
+        } else if (auto next = task_pool.next()) {
+          ASSERT_LT(*next, deadline);
+          std::this_thread::sleep_until(*next);
+        } else {
+          return;
+        }
+      }
+    }
+
+    lvh::Mouse *mouse = nullptr;  ///< Observable fake mouse, owned by the platform backend.
+    std::vector<std::pair<std::shared_ptr<input::input_t>, std::uint64_t>> sessions;  ///< Leases released at teardown.
   };
 }  // namespace
 
@@ -96,12 +144,12 @@ TEST(InputConfigDefaults, AdvertisesNativePenWithoutRemappingRightAlt) {
 TEST_F(InputRetainedSessionTest, DisconnectSuspendsRatherThanDiscardingResumableRawTablet) {
   const std::string session_id = "resumed-tablet-client";
   std::uint64_t first_connection_id = 0;
-  auto first = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id, first_connection_id);
+  auto first = allocate(session_id, first_connection_id);
   ASSERT_TRUE(input::testing::handle_raw_hid(first, make_raw_hid_device_frame(7)));
   ASSERT_EQ(input::testing::raw_hid_generation(first), 7);
 
   std::uint64_t resumed_connection_id = 0;
-  auto resumed = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id, resumed_connection_id);
+  auto resumed = allocate(session_id, resumed_connection_id);
   ASSERT_EQ(first, resumed);
   ASSERT_GT(resumed_connection_id, first_connection_id);
   ASSERT_TRUE(input::testing::handle_raw_hid(resumed, make_raw_hid_device_frame(8)));
@@ -114,10 +162,172 @@ TEST_F(InputRetainedSessionTest, DisconnectSuspendsRatherThanDiscardingResumable
   EXPECT_EQ(input::testing::raw_hid_generation(resumed), 8);
 }
 
+TEST_F(InputRetainedSessionTest, LeftButtonReleaseIsImmediateAndNotRepeatedOnDisconnect) {
+  const std::string session_id = "immediate-left-button-release";
+  std::uint64_t connection_id = 0;
+  auto session = allocate(session_id, connection_id);
+  const auto before_press = mouse->submit_count();
+  const auto next_task = task_pool.next();
+
+  constexpr std::uint8_t left_button = 1;
+  input::testing::handle_mouse_button(session, left_button, false);
+  ASSERT_EQ(mouse->submit_count(), before_press + 1);
+  EXPECT_EQ(mouse->last_submitted_event().kind, lvh::MouseEventKind::button);
+  EXPECT_EQ(mouse->last_submitted_event().button, lvh::MouseButton::left);
+  EXPECT_TRUE(mouse->last_submitted_event().pressed);
+
+  // With the pool stopped, a deferred implementation cannot satisfy this.
+  input::testing::handle_mouse_button(session, left_button, true);
+  ASSERT_EQ(mouse->submit_count(), before_press + 2);
+  EXPECT_EQ(mouse->last_submitted_event().kind, lvh::MouseEventKind::button);
+  EXPECT_EQ(mouse->last_submitted_event().button, lvh::MouseButton::left);
+  EXPECT_FALSE(mouse->last_submitted_event().pressed);
+  EXPECT_EQ(task_pool.next(), next_task);
+  input::reset(session, connection_id);
+  EXPECT_EQ(mouse->submit_count(), before_press + 2);
+}
+
+TEST_F(InputRetainedSessionTest, RepeatedDisconnectDoesNotDuplicateButtonRelease) {
+  std::uint64_t connection_id = 0;
+  auto session = allocate("repeat-cleanup", connection_id);
+  input::testing::handle_mouse_button(session, 1, false);
+  const auto before_reset = mouse->submit_count();
+
+  input::reset(session, connection_id);
+  ASSERT_EQ(mouse->submit_count(), before_reset + 1);
+  input::reset(session, connection_id);
+  EXPECT_EQ(mouse->submit_count(), before_reset + 1);
+  EXPECT_FALSE(mouse->last_submitted_event().pressed);
+}
+
+TEST_F(InputRetainedSessionTest, EmptyDisconnectDoesNotSynthesizeButtonEvents) {
+  std::uint64_t connection_id = 0;
+  auto session = allocate("empty-cleanup", connection_id);
+  const auto before_reset = mouse->submit_count();
+  input::reset(session, connection_id);
+  input::reset(session, connection_id);
+  EXPECT_EQ(mouse->submit_count(), before_reset);
+}
+
+TEST_F(InputRetainedSessionTest, DisconnectReleasesEachHeldMouseButtonOnce) {
+  std::uint64_t connection_id = 0;
+  auto session = allocate("held-buttons", connection_id);
+  // Exercise left, middle and right separately so each release is observable.
+  for (std::uint8_t button = 1; button <= 3; ++button) {
+    SCOPED_TRACE(button);
+    const auto before_press = mouse->submit_count();
+    input::testing::handle_mouse_button(session, button, false);
+    ASSERT_EQ(mouse->submit_count(), before_press + 1);
+    const auto pressed_button = mouse->last_submitted_event().button;
+    ASSERT_TRUE(mouse->last_submitted_event().pressed);
+    input::reset(session, connection_id);
+    ASSERT_EQ(mouse->submit_count(), before_press + 2);
+    EXPECT_EQ(mouse->last_submitted_event().button, pressed_button);
+    EXPECT_FALSE(mouse->last_submitted_event().pressed);
+    input::reset(session, connection_id);
+    EXPECT_EQ(mouse->submit_count(), before_press + 2);
+  }
+}
+
+TEST_F(InputRetainedSessionTest, RapidLeftClicksRemainOrderedWithoutQueuedReleases) {
+  std::uint64_t connection_id = 0;
+  auto session = allocate("rapid-left-clicks", connection_id);
+  ASSERT_NO_FATAL_FAILURE(drain_tasks());
+  const auto before_press = mouse->submit_count();
+  input::testing::handle_mouse_button(session, 1, false);
+  ASSERT_EQ(mouse->submit_count(), before_press + 1);
+  EXPECT_TRUE(mouse->last_submitted_event().pressed);
+  input::testing::handle_mouse_button(session, 1, true);
+  ASSERT_EQ(mouse->submit_count(), before_press + 2);
+  EXPECT_FALSE(mouse->last_submitted_event().pressed);
+  input::testing::handle_mouse_button(session, 1, false);
+  ASSERT_EQ(mouse->submit_count(), before_press + 3);
+  EXPECT_TRUE(mouse->last_submitted_event().pressed);
+  EXPECT_FALSE(task_pool.next().has_value());
+  input::testing::handle_mouse_button(session, 1, true);
+  ASSERT_EQ(mouse->submit_count(), before_press + 4);
+  EXPECT_FALSE(mouse->last_submitted_event().pressed);
+  EXPECT_FALSE(task_pool.next().has_value());
+  input::reset(session, connection_id);
+  EXPECT_EQ(mouse->submit_count(), before_press + 4);
+}
+
+TEST_F(InputRetainedSessionTest, RightButtonRemainsHeldAfterLeftButtonRelease) {
+  std::uint64_t connection_id = 0;
+  auto session = allocate("left-then-right-drag", connection_id);
+  const auto before_press = mouse->submit_count();
+  const auto next_task = task_pool.next();
+  input::testing::handle_mouse_button(session, 1, false);
+  input::testing::handle_mouse_button(session, 1, true);
+  ASSERT_EQ(mouse->submit_count(), before_press + 2);
+  EXPECT_EQ(mouse->last_submitted_event().button, lvh::MouseButton::left);
+  EXPECT_FALSE(mouse->last_submitted_event().pressed);
+
+  // A real right press must remain down, not become a synthetic down/up pair.
+  input::testing::handle_mouse_button(session, 3, false);
+  ASSERT_EQ(mouse->submit_count(), before_press + 3);
+  EXPECT_EQ(mouse->last_submitted_event().button, lvh::MouseButton::right);
+  EXPECT_TRUE(mouse->last_submitted_event().pressed);
+  input::testing::handle_mouse_button(session, 3, true);
+  ASSERT_EQ(mouse->submit_count(), before_press + 4);
+  EXPECT_FALSE(mouse->last_submitted_event().pressed);
+  EXPECT_EQ(task_pool.next(), next_task);
+  input::reset(session, connection_id);
+  EXPECT_EQ(mouse->submit_count(), before_press + 4);
+}
+
+TEST_F(InputRetainedSessionTest, StaleDisconnectDoesNotReleaseResumedConnectionsButton) {
+  std::uint64_t first_connection_id = 0;
+  auto first = allocate("stale-cleanup", first_connection_id);
+  input::reset(first, first_connection_id);
+  std::uint64_t resumed_connection_id = 0;
+  auto resumed = allocate("stale-cleanup", resumed_connection_id);
+  ASSERT_EQ(first, resumed);
+  ASSERT_GT(resumed_connection_id, first_connection_id);
+
+  input::testing::handle_mouse_button(resumed, 1, false);
+  const auto after_press = mouse->submit_count();
+  input::reset(first, first_connection_id);
+  EXPECT_EQ(mouse->submit_count(), after_press);
+  EXPECT_TRUE(mouse->last_submitted_event().pressed);
+  input::testing::handle_mouse_button(resumed, 1, true);
+  EXPECT_EQ(mouse->submit_count(), after_press + 1);
+  EXPECT_FALSE(mouse->last_submitted_event().pressed);
+}
+
+TEST_F(InputRetainedSessionTest, ReconnectKeepsNewDragHeldUntilItsOwnRelease) {
+  std::uint64_t first_connection_id = 0;
+  auto first = allocate("reconnect-release", first_connection_id);
+  ASSERT_NO_FATAL_FAILURE(drain_tasks());
+  const auto before_press = mouse->submit_count();
+  input::testing::handle_mouse_button(first, 1, false);
+  input::testing::handle_mouse_button(first, 1, true);
+  ASSERT_EQ(mouse->submit_count(), before_press + 2);
+  input::reset(first, first_connection_id);
+  ASSERT_EQ(mouse->submit_count(), before_press + 2);
+
+  std::uint64_t resumed_connection_id = 0;
+  auto resumed = allocate("reconnect-release", resumed_connection_id);
+  ASSERT_EQ(first, resumed);
+  ASSERT_GT(resumed_connection_id, first_connection_id);
+  input::testing::handle_mouse_button(resumed, 1, false);
+  ASSERT_EQ(mouse->submit_count(), before_press + 3);
+  EXPECT_TRUE(mouse->last_submitted_event().pressed);
+  ASSERT_NO_FATAL_FAILURE(drain_tasks());
+  // Only alloc()'s two movement events may run, never an old button release.
+  EXPECT_EQ(mouse->submit_count(), before_press + 5);
+  input::testing::handle_mouse_button(resumed, 1, true);
+  EXPECT_EQ(mouse->submit_count(), before_press + 6);
+  EXPECT_EQ(mouse->last_submitted_event().kind, lvh::MouseEventKind::button);
+  EXPECT_FALSE(mouse->last_submitted_event().pressed);
+  input::reset(resumed, resumed_connection_id);
+  EXPECT_EQ(mouse->submit_count(), before_press + 6);
+}
+
 TEST_F(InputRetainedSessionTest, ConsumesNumLockWithoutChangingNumericKeypadIdentity) {
   const std::string session_id = "always-on-num-lock";
   std::uint64_t connection_id = 0;
-  auto session = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id, connection_id);
+  auto session = allocate(session_id, connection_id);
 
   input::testing::handle_keyboard(session, 0x61, false);
   EXPECT_EQ(input::testing::last_keyboard_code(), 0x61);
@@ -134,7 +344,7 @@ TEST_F(InputRetainedSessionTest, ExactRawTabletSuppressesNormalizedFallbackUntil
 
   const std::string session_id = "exclusive-raw-tablet";
   std::uint64_t connection_id = 0;
-  auto session = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id, connection_id);
+  auto session = allocate(session_id, connection_id);
   ASSERT_TRUE(input::testing::normalized_pen_enabled(session));
 
   constexpr std::uint16_t generation = 11;
@@ -185,7 +395,7 @@ TEST_F(InputRetainedSessionTest, NormalizedPenReleasesRetainedRawTabletEndpoints
 
   const std::string session_id = "raw-to-normalized-tablet";
   std::uint64_t connection_id = 0;
-  auto session = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id, connection_id);
+  auto session = allocate(session_id, connection_id);
 
   constexpr std::uint16_t generation = 12;
   ASSERT_TRUE(input::testing::handle_raw_hid(session, make_raw_hid_device_frame(generation, 0x0357)));

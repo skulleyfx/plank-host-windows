@@ -1,0 +1,23 @@
+# Product updates only. Packaging/qualification is owned by instinctual/plank.
+version: 2
+updates:
+  - package-ecosystem: gitsubmodule
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    allow:
+      - dependency-name: third-party/build-deps
+      - dependency-name: third-party/glad
+      - dependency-name: third-party/googletest
+      - dependency-name: third-party/libdisplaydevice
+      - dependency-name: third-party/libvirtualhid
+      - dependency-name: third-party/lizardbyte-common
+      - dependency-name: third-party/moonlight-common-c
+      - dependency-name: third-party/Simple-Web-Server
+      - dependency-name: third-party/plasma-wayland-protocols
+      - dependency-name: third-party/wayland-protocols
+      - dependency-name: third-party/wlr-protocols
+    commit-message:
+      prefix: deps
