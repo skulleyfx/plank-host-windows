@@ -884,6 +884,39 @@ namespace nvhttp {
 #endif
   }
 
+  /**
+   * @brief Publish only the primary output while one-screen mode is on.
+   *
+   * Clients without the Windows two-screen capability (Alan's Mac and Linux
+   * clients) lay out every published output, but a Windows host captures only
+   * its first output for them, so with two monitors they size the stream for
+   * both and get one shrunk into it. Creating C:\ProgramData\PLANK\one-screen
+   * makes the host publish just the primary output, so those clients size the
+   * stream for the monitor they actually receive. Every client sees one output
+   * while the file exists; removing it restores the full list. No restart.
+   *
+   * @param outputs Outputs about to be published.
+   * @return The primary output alone in one-screen mode, otherwise @p outputs.
+   */
+  std::vector<platf::display_info_t> one_screen_outputs(std::vector<platf::display_info_t> outputs) {
+#ifdef _WIN32
+    std::error_code ec;
+    if (outputs.size() < 2 || !fs::exists(R"(C:\ProgramData\PLANK\one-screen)", ec)) {
+      return outputs;
+    }
+    auto primary = std::find_if(outputs.begin(), outputs.end(), [](const auto &output) {
+      return output.primary;
+    });
+    if (primary == outputs.end()) {
+      primary = outputs.begin();
+    }
+    BOOST_LOG(info) << "One-screen mode: publishing only "sv << primary->name;
+    return {*primary};
+#else
+    return outputs;
+#endif
+  }
+
   nlohmann::json output_topology_json() {
     auto outputs = video::output_topology();
     std::sort(outputs.begin(), outputs.end(), [](const auto &left, const auto &right) {
@@ -900,7 +933,7 @@ namespace nvhttp {
     // A leased layout describes the screens being streamed, and both the
     // published topology and the binding check below must agree about which
     // those are.
-    outputs = leased_outputs(std::move(outputs), leased_layout);
+    outputs = one_screen_outputs(leased_outputs(std::move(outputs), leased_layout));
 
     int min_x = 0;
     int min_y = 0;
