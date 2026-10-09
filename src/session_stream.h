@@ -48,6 +48,7 @@ namespace session_stream {
 
     std::shared_ptr<void> authentication_session;  ///< PAM lifetime retained by PLANK streams.
     std::string authenticated_account;  ///< Account that authenticated this launch.
+    std::string authenticated_peer;  ///< Normalized client address that authenticated this launch.
     std::shared_ptr<void> plank_transport_endpoint;  ///< Experimental QUIC data-plane lifetime.
   };
 

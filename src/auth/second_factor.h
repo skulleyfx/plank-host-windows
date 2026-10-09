@@ -155,8 +155,21 @@ namespace plank::auth {
    * @param username Account name as authenticated.
    * @param remote_host Client address.
    * @return Ticket for the client to keep in memory, or empty when disabled.
+   *         When it follows a resume-ticket sign-in the original sign-in time is carried over,
+   *         so the security.second_factor_resume_max_hours cap keeps counting from the real second factor.
    */
   std::string issue_resume_ticket(std::string_view username, std::string_view remote_host);
+
+  /**
+   * @brief Record streaming activity so the resume window slides.
+   *
+   * Call while a session that signed in as this account from this client is
+   * streaming, and once more when it ends. Does nothing when no ticket is stored.
+   *
+   * @param username Account name as authenticated.
+   * @param remote_host Client address.
+   */
+  void touch_resume_ticket(std::string_view username, std::string_view remote_host);
 
   /**
    * @brief Construct the DUO Auth API provider from security.duo_* settings.

@@ -284,7 +284,8 @@ namespace config {
     std::string duo_api_host;  ///< DUO API hostname, e.g. api-XXXXXXXX.duosecurity.com.
     std::string default_domain;  ///< Domain applied to bare account names, e.g. SKULLEYFX.
     bool allow_root_login;  ///< Windows: permit the built-in Administrator (RID 500). Default false.
-    int second_factor_resume_minutes;  ///< Lifetime of reconnect tickets that skip a repeat second factor; 0 disables.
+    int second_factor_resume_minutes;  ///< Minutes a reconnect ticket stays valid after the last streaming activity; 0 disables.
+    int second_factor_resume_max_hours;  ///< Hours after the original sign-in at which tickets stop working and the second factor is always asked.
     bool lock_on_disconnect;  ///< Windows: lock the signed-in desktop after the last stream ends. Default true.
     int lock_on_disconnect_delay;  ///< Seconds to wait for a reconnect before locking.
     std::string admin_group;  ///< Windows: group whose members see host details such as the signed-in user. Empty means BUILTIN\\Administrators.

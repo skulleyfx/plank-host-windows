@@ -1876,6 +1876,7 @@ namespace nvhttp {
     }
 
     launch_session->authenticated_account = authenticated_identity(request);
+    launch_session->authenticated_peer = authentication_peer(request);
     launch_session->authentication_session = claim_authentication_session(request);
     if (!launch_session->authentication_session) {
       tree.put("root.<xmlattr>.status_code", 401);
@@ -2033,6 +2034,7 @@ namespace nvhttp {
     }
 
     launch_session->authenticated_account = authenticated_identity(request);
+    launch_session->authenticated_peer = authentication_peer(request);
     launch_session->authentication_session = claim_authentication_session(request);
     if (!launch_session->authentication_session) {
       tree.put("root.<xmlattr>.status_code", 401);
