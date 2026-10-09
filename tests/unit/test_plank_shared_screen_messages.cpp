@@ -20,8 +20,9 @@ TEST(PlankSharedScreenMessages, EncodesJoinRequest) {
 }
 
 TEST(PlankSharedScreenMessages, EncodesCancelControlRequestAndState) {
-  EXPECT_EQ(nlohmann::json::parse(messages::request_cancel(3))["t"], "request_cancel");
-  EXPECT_EQ(nlohmann::json::parse(messages::request_cancel(3))["id"], 3);
+  EXPECT_EQ(nlohmann::json::parse(messages::request_cancel(3, "join"))["t"], "request_cancel");
+  EXPECT_EQ(nlohmann::json::parse(messages::request_cancel(3, "control"))["kind"], "control");
+  EXPECT_EQ(nlohmann::json::parse(messages::request_cancel(3, "join"))["id"], 3);
   const auto request = nlohmann::json::parse(messages::control_request(9, "alan"));
   EXPECT_EQ(request["t"], "control_request");
   EXPECT_EQ(request["id"], 9);

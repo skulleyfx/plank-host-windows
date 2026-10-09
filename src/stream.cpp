@@ -356,7 +356,7 @@ namespace stream {
       controller->control_token.take_back(owner_token_id);
     }
     if (pending != 0) {
-      queue_shared_message(controller, shared_messages::request_cancel(static_cast<std::uint32_t>(pending)));
+      queue_shared_message(controller, shared_messages::request_cancel(static_cast<std::uint32_t>(pending), "control"));
       queue_to_viewer(controller, pending, shared_messages::control_state(false, "denied"));
     }
     if (previous != owner_token_id) {
@@ -385,7 +385,7 @@ namespace stream {
     }
     if (expired != 0) {
       BOOST_LOG(info) << "Shared screen: a control request expired without an answer"sv;
-      queue_shared_message(controller, shared_messages::request_cancel(static_cast<std::uint32_t>(expired)));
+      queue_shared_message(controller, shared_messages::request_cancel(static_cast<std::uint32_t>(expired), "control"));
       queue_to_viewer(controller, expired, shared_messages::control_state(false, "denied"));
     }
   }
@@ -2377,7 +2377,7 @@ namespace stream {
         return owner_answer_e::gone;
       }
       BOOST_LOG(info) << "Shared screen: the owner did not answer for "sv << account;
-      queue_shared_message(controller.get(), shared_messages::request_cancel(id));
+      queue_shared_message(controller.get(), shared_messages::request_cancel(id, "join"));
       return owner_answer_e::timed_out;
     }
 
@@ -2523,7 +2523,7 @@ namespace stream {
           controller->control_token.leave(session.viewer_id);
         }
         if (was_pending) {
-          queue_shared_message(controller.get(), shared_messages::request_cancel(session.viewer_id));
+          queue_shared_message(controller.get(), shared_messages::request_cancel(session.viewer_id, "control"));
         }
         if (was_holder) {
           release_held_input(&session, controller.get());
