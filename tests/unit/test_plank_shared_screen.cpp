@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
 
 #include "../tests_common.h"
 
@@ -439,4 +440,54 @@ TEST(PlankSharedScreen, TokenOwnerTakesBackAfterAdminTakeover) {
   EXPECT_EQ(t.holder(), 1u);
   EXPECT_TRUE(t.accepts_input(1));
   EXPECT_FALSE(t.accepts_input(9));
+}
+
+TEST(PlankSharedScreen, HeldInputReleasesEverythingStillDown) {
+  using held = plank::shared_screen::held_input_t;
+  held input;
+  const std::uint8_t key_a_down[] {0x00, 0x41, held::press, 0x02, 0x07};
+  const std::uint8_t key_b_down[] {0x00, 0x42, held::press, 0x00, 0x00};
+  const std::uint8_t key_b_up[] {0x00, 0x42, held::release, 0x00, 0x00};
+  const std::uint8_t left_down[] {1, held::press};
+  const std::uint8_t right_down[] {3, held::press};
+  const std::uint8_t right_up[] {3, held::release};
+  input.record(held::keyboard_type, key_a_down, sizeof(key_a_down));
+  input.record(held::keyboard_type, key_b_down, sizeof(key_b_down));
+  input.record(held::keyboard_type, key_b_up, sizeof(key_b_up));
+  input.record(held::mouse_button_type, left_down, sizeof(left_down));
+  input.record(held::mouse_button_type, right_down, sizeof(right_down));
+  input.record(held::mouse_button_type, right_up, sizeof(right_up));
+  EXPECT_FALSE(input.empty());
+
+  const auto releases = input.take_releases();
+  ASSERT_EQ(releases.size(), 2u);
+  EXPECT_EQ(releases[0].type, held::keyboard_type);
+  EXPECT_EQ(releases[0].payload, (std::vector<std::uint8_t> {0x00, 0x41, held::release, 0x00, 0x07}));
+  EXPECT_EQ(releases[1].type, held::mouse_button_type);
+  EXPECT_EQ(releases[1].payload, (std::vector<std::uint8_t> {1, held::release}));
+  EXPECT_TRUE(input.empty());
+  EXPECT_TRUE(input.take_releases().empty());
+}
+
+TEST(PlankSharedScreen, HeldInputIgnoresOtherTypesAndShortPayloads) {
+  using held = plank::shared_screen::held_input_t;
+  held input;
+  const std::uint8_t motion[] {0, 1, 0, 2, 0, 3, 0, 4};
+  const std::uint8_t short_key[] {0x00, 0x41, held::press};
+  const std::uint8_t short_button[] {1};
+  input.record(1, motion, sizeof(motion));
+  input.record(held::keyboard_type, short_key, sizeof(short_key));
+  input.record(held::mouse_button_type, short_button, sizeof(short_button));
+  EXPECT_TRUE(input.empty());
+}
+
+TEST(PlankSharedScreen, KeyframeBudgetDropsAViewerThatKeepsAsking) {
+  plank::shared_screen::keyframe_budget_t budget;
+  const auto start = std::chrono::steady_clock::now();
+  for (int request = 0; request < 10; ++request) {
+    EXPECT_TRUE(budget.allow(start + std::chrono::seconds {request}, std::chrono::seconds {20}, 10));
+  }
+  EXPECT_FALSE(budget.allow(start + std::chrono::seconds {11}, std::chrono::seconds {20}, 10));
+  // A new window starts afresh.
+  EXPECT_TRUE(budget.allow(start + std::chrono::seconds {40}, std::chrono::seconds {20}, 10));
 }
