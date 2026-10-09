@@ -10,8 +10,13 @@
 #include <charconv>
 #include <cerrno>
 #include <cmath>
+#include <chrono>
 #include <cstring>
+#include <future>
 #include <list>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <numeric>
 #include <thread>
 #include <utility>
@@ -4148,6 +4153,85 @@ namespace video {
 #endif
 
     return 0;
+  }
+
+  bool should_reprobe_encoders(bool have_encoder, bool encoder_is_software,
+                               std::optional<std::chrono::steady_clock::time_point> last_attempt,
+                               std::chrono::steady_clock::time_point now,
+                               std::chrono::seconds min_interval) {
+    if (have_encoder && !encoder_is_software) {
+      return false;
+    }
+    return !last_attempt || now - *last_attempt >= min_interval;
+  }
+
+  bool reprobe_encoders_before_session() {
+    using clock = std::chrono::steady_clock;
+    constexpr auto min_interval = 30s;
+    constexpr auto max_wait = 20s;
+
+    static std::mutex state_mutex;
+    static std::optional<clock::time_point> last_attempt;
+    static bool in_flight = false;
+
+    {
+      std::lock_guard lock {state_mutex};
+      const auto now = clock::now();
+      if (in_flight || !should_reprobe_encoders(chosen_encoder != nullptr,
+                                                chosen_encoder && (chosen_encoder->flags & ALWAYS_REPROBE),
+                                                last_attempt, now, min_interval)) {
+        return false;
+      }
+      last_attempt = now;
+      in_flight = true;
+    }
+
+    const auto previous_name = chosen_encoder ? chosen_encoder->name : "none"sv;
+    BOOST_LOG(info) << "Selected encoder is ["sv << previous_name << "]; re-probing for a hardware encoder before this session"sv;
+
+    // Probe on a worker so a stalled driver cannot hold the HTTPS thread. The
+    // caller holds the session-start lock and no session is running, so nothing
+    // else touches the encoder state. If the wait times out the worker keeps
+    // going and in_flight stays set until it finishes.
+    auto previous = chosen_encoder;
+    auto result = std::make_shared<std::promise<int>>();
+    auto future = result->get_future();
+    std::thread([result] {
+      int status = -1;
+      try {
+        status = probe_encoders();
+      } catch (const std::exception &e) {
+        BOOST_LOG(warning) << "Encoder re-probe failed: "sv << e.what();
+      }
+      {
+        std::lock_guard lock {state_mutex};
+        in_flight = false;
+      }
+      result->set_value(status);
+    }).detach();
+
+    if (future.wait_for(max_wait) != std::future_status::ready) {
+      BOOST_LOG(warning) << "Encoder re-probe did not finish within "sv << max_wait.count() << "s; continuing"sv;
+      return false;
+    }
+
+    if (future.get() != 0 || chosen_encoder == nullptr) {
+      // probe_encoders() clears the selection before it tries; do not leave the host worse off.
+      if (chosen_encoder == nullptr) {
+        chosen_encoder = previous;
+      }
+      BOOST_LOG(info) << "Encoder re-probe found nothing better; keeping ["sv << previous_name << ']';
+      return false;
+    }
+
+    const bool upgraded = !(chosen_encoder->flags & ALWAYS_REPROBE);
+    if (upgraded) {
+      BOOST_LOG(info) << "Encoder re-probe switched from ["sv << previous_name << "] to hardware encoder ["sv
+                      << chosen_encoder->name << ']';
+    } else {
+      BOOST_LOG(info) << "Encoder re-probe kept software encoder ["sv << chosen_encoder->name << ']';
+    }
+    return upgraded;
   }
 
   // Linux only declaration
