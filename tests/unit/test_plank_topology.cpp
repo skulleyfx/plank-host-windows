@@ -211,3 +211,22 @@ TEST(PlankTopology, ClientFlagStoreRoundTripsAndToleratesCorruption) {
   EXPECT_EQ(partial.size(), 1U);
   EXPECT_EQ(partial.lookup("c"), 7U);
 }
+
+TEST(PlankTopology, ParsesAnyWidthByHeightMode) {
+  const auto size = topology::parse_mode_size("1680x1050");
+  EXPECT_EQ(size.width, 1680);
+  EXPECT_EQ(size.height, 1050);
+  EXPECT_EQ(topology::parse_mode_size("2880x1620").width, 2880);
+  EXPECT_EQ(topology::parse_mode_size("3200x1800").height, 1800);
+  // The fixed list still resolves through the same text form.
+  EXPECT_EQ(topology::parse_mode_size("3840x2160").width, topology::virtual_mode_size("3840x2160").width);
+}
+
+TEST(PlankTopology, RejectsMalformedModeText) {
+  for (const char *text : {"", "x", "1920x", "x1080", "1920", "1920x1080x2", "1920 x1080", "0x1080",
+                           "1920x0", "-1920x1080", "1920X1080", "99999x1080", "1920x1080 "}) {
+    const auto size = topology::parse_mode_size(text);
+    EXPECT_EQ(size.width, 0) << text;
+    EXPECT_EQ(size.height, 0) << text;
+  }
+}

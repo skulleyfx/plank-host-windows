@@ -129,3 +129,16 @@ TEST(DisplayFallback, PrimarySwitchKeepsRightDisplayBesideResizedPrimary) {
   EXPECT_EQ(switched[1].x, 2560);
   EXPECT_FALSE(switched[1].primary);
 }
+
+TEST(DisplayFallback, SubstitutesBelowSaneSizeAreNeverOffered) {
+  const std::vector<da::display_modes_t> displays {
+    display("\\\\.\\DISPLAY1", {1920, 1080, 60}, {{1920, 1080, 60}, {800, 600, 60}, {1024, 768, 60}, {1280, 720, 60}}),
+  };
+  const auto ranked = da::rank_mode_candidates(displays, 0, 2560, 1440, 0);
+  ASSERT_EQ(ranked.size(), 2U);
+  EXPECT_EQ(ranked[0].mode.width, 1920U);
+  EXPECT_EQ(ranked[1].mode.width, 1280U);
+  EXPECT_TRUE(da::acceptable_substitute(1280, 720));
+  EXPECT_FALSE(da::acceptable_substitute(1024, 768));
+  EXPECT_FALSE(da::acceptable_substitute(1920, 600));
+}

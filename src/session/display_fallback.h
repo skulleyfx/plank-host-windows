@@ -76,6 +76,16 @@ namespace plank::display_arrange {
     return "unknown";
   }
 
+  /**
+   * @brief Whether a size is sane to offer as a stand-in for the request.
+   *
+   * A display emulator may list 640x480 or 800x600; serving an artist a
+   * workstation at that size is worse than failing with a clear error.
+   */
+  constexpr bool acceptable_substitute(unsigned width, unsigned height) {
+    return width >= 1280 && height >= 720;
+  }
+
   namespace fallback_detail {
     inline std::uint64_t area(const mode_option_t &mode) {
       return static_cast<std::uint64_t>(mode.width) * mode.height;
@@ -170,7 +180,8 @@ namespace plank::display_arrange {
     const unsigned wanted = refresh_hz != 0 ? refresh_hz : display.current.refresh_hz;
     std::vector<mode_option_t> sizes;
     for (const auto &mode : display.modes) {
-      if (mode.width == 0 || mode.height == 0 || (mode.width == width && mode.height == height)) {
+      if (!acceptable_substitute(mode.width, mode.height) ||
+          (mode.width == width && mode.height == height)) {
         continue;
       }
       const bool seen = std::any_of(sizes.begin(), sizes.end(), [&mode](const auto &known) {

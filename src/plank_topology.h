@@ -146,6 +146,37 @@ namespace plank::topology {
     return {0, 0};
   }
 
+  /**
+   * @brief Size from a generic "WIDTHxHEIGHT" string.
+   *
+   * Unlike virtual_mode_size() this accepts any size, because a host that
+   * substitutes a mode the display supports records it as plain text, and the
+   * substitute need not be one of the sizes a client can ask for.
+   *
+   * @return The size, or {0, 0} when the text is not exactly two decimal
+   *         numbers around an 'x', or either is zero or above 16384.
+   */
+  constexpr mode_size parse_mode_size(std::string_view mode) {
+    constexpr int maximum_dimension = 16384;
+    int values[2] {0, 0};
+    int index = 0;
+    bool digits = false;
+    for (const char c : mode) {
+      if (c >= '0' && c <= '9') {
+        values[index] = values[index] * 10 + (c - '0');
+        if (values[index] > maximum_dimension) return {0, 0};
+        digits = true;
+      } else if (c == 'x' && index == 0 && digits) {
+        index = 1;
+        digits = false;
+      } else {
+        return {0, 0};
+      }
+    }
+    if (index != 1 || !digits || values[0] == 0 || values[1] == 0) return {0, 0};
+    return {values[0], values[1]};
+  }
+
   constexpr bool valid_layout(std::string_view layout) {
     return layout == "physical" ||
            layout == "single" ||
