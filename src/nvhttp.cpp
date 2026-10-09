@@ -32,6 +32,8 @@
 #include <utility>
 
 // lib includes
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/udp.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/context_base.hpp>
 #include <boost/algorithm/string/predicate.hpp>
@@ -354,8 +356,65 @@ namespace nvhttp {
     ), true);
   }
 
+  /// UDP ports above the host port that shared screen viewer listeners use:
+  /// port+1 .. port+8, one per viewer (shared_screen_max_viewers is at most 8).
+  /// A native endpoint accepts exactly one QUIC connection and owns its UDP
+  /// socket, so a viewer cannot share the controller's port. The host
+  /// firewall must admit this range for sunshine.exe.
+  constexpr int viewer_port_first_offset = 1;
+  constexpr int viewer_port_count = 8;
+
+  std::mutex viewer_ports_mutex;  ///< Guards viewer_ports_in_use.
+  std::set<std::uint16_t> viewer_ports_in_use;  ///< Viewer ports handed to live endpoints.
+
+  /**
+   * @brief Whether nothing else on this machine holds a UDP port.
+   *
+   * @param port Port to probe on all IPv4 addresses, as the endpoint binds.
+   * @return True when a test socket could bind it.
+   */
+  bool udp_port_free(const std::uint16_t port) {
+    boost::asio::io_context io;
+    boost::asio::ip::udp::socket socket {io};
+    boost::system::error_code error;
+    socket.open(boost::asio::ip::udp::v4(), error);
+    if (error) {
+      return false;
+    }
+    socket.bind({boost::asio::ip::address_v4::any(), port}, error);
+    return !error;
+  }
+
+  /**
+   * @brief Reserve a UDP port for one shared screen viewer's listener.
+   *
+   * @return The port, or no value when the whole range is busy.
+   */
+  std::optional<std::uint16_t> reserve_viewer_port() {
+    std::lock_guard lock {viewer_ports_mutex};
+    for (int offset = viewer_port_first_offset; offset < viewer_port_first_offset + viewer_port_count; ++offset) {
+      const auto port = net::map_port(offset);
+      if (viewer_ports_in_use.contains(port) || !udp_port_free(port)) {
+        continue;
+      }
+      viewer_ports_in_use.insert(port);
+      return port;
+    }
+    return std::nullopt;
+  }
+
+  /**
+   * @brief Return a viewer port once its endpoint is destroyed.
+   *
+   * @param port Port from reserve_viewer_port().
+   */
+  void release_viewer_port(const std::uint16_t port) {
+    std::lock_guard lock {viewer_ports_mutex};
+    viewer_ports_in_use.erase(port);
+  }
+
   bool start_plank_transport_data_plane(session_stream::launch_session_t &session,
-                                  pt::ptree &tree) {
+                                  pt::ptree &tree, const bool viewer = false) {
     const auto fingerprint = certificate_sha256(config::nvhttp.cert);
     if (!fingerprint) {
       tree.put("root.<xmlattr>.status_code", 503);
@@ -376,7 +435,22 @@ namespace nvhttp {
     ));
     OPENSSL_cleanse(token_bytes.data(), token_bytes.size());
 
-    const auto port = net::map_port(0);
+    // The controller listens on the host port. Each viewer gets its own port
+    // above it, released when its endpoint is destroyed.
+    std::uint16_t port = net::map_port(0);
+    if (viewer) {
+      const auto viewer_port = reserve_viewer_port();
+      if (!viewer_port) {
+        OPENSSL_cleanse(token.data(), token.size());
+        BOOST_LOG(error) << "No free UDP port for a shared screen viewer between "sv
+                         << net::map_port(viewer_port_first_offset) << " and "sv
+                         << net::map_port(viewer_port_first_offset + viewer_port_count - 1);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "No free port for another viewer");
+        return false;
+      }
+      port = *viewer_port;
+    }
     const std::string bind_address = "0.0.0.0:" + std::to_string(port);
     PlankTransportConfig endpoint_config {};
     endpoint_config.struct_size = sizeof(endpoint_config);
@@ -412,6 +486,9 @@ namespace nvhttp {
       if (endpoint != nullptr) {
         plank_transport_native_endpoint_destroy(endpoint);
       }
+      if (viewer) {
+        release_viewer_port(port);
+      }
       OPENSSL_cleanse(token.data(), token.size());
       BOOST_LOG(error) << "Unable to start PLANK transport listener: "sv
                        << error_message;
@@ -421,17 +498,21 @@ namespace nvhttp {
       return false;
     }
 
-    session.plank_transport_endpoint = std::shared_ptr<void>(endpoint, [](void *raw_endpoint) {
+    session.plank_transport_endpoint = std::shared_ptr<void>(endpoint, [viewer, port](void *raw_endpoint) {
       auto *endpoint = static_cast<PlankTransportNativeEndpoint *>(raw_endpoint);
       plank_transport_native_endpoint_stop(endpoint);
       plank_transport_native_endpoint_destroy(endpoint);
+      if (viewer) {
+        release_viewer_port(port);
+      }
     });
     tree.put("root.PlankTransportPort", port);
     tree.put("root.PlankTransportCertificateSha256", *fingerprint);
     tree.put("root.PlankTransportToken", token);
     tree.put("root.PlankQuicUdpPayloadMtu", session.quic_udp_payload_mtu);
     OPENSSL_cleanse(token.data(), token.size());
-    BOOST_LOG(info) << "Experimental plank_transport listener started on UDP port "sv << port
+    BOOST_LOG(info) << (viewer ? "Shared screen viewer plank_transport listener started on UDP port "sv :
+                                 "Experimental plank_transport listener started on UDP port "sv) << port
                     << " (idle timeout "sv << idle_ms << " ms, fixed QUIC UDP payload "sv
                     << session.quic_udp_payload_mtu << " bytes)"sv;
     return true;
@@ -2232,7 +2313,7 @@ namespace nvhttp {
     }
 
 #ifdef PLANK_TRANSPORT
-    if (!start_plank_transport_data_plane(*launch_session, tree)) {
+    if (!start_plank_transport_data_plane(*launch_session, tree, true)) {
       tree.put(result_field, 0);
       return true;
     }
