@@ -788,6 +788,9 @@ namespace nvhttp {
     std::string kind;
     bool virtual_layout {};
     std::vector<std::string> virtual_modes;
+    /// Mode the host set when it could not serve the first virtual mode as
+    /// asked; empty when the request was served exactly.
+    std::string applied_mode_1;
     bool temporary_physical_lease {};
     uid_t lease_uid {};
   };
@@ -808,6 +811,7 @@ namespace nvhttp {
       result.virtual_layout = true;
       result.virtual_modes = {runtime->mode_1};
       if (!runtime->mode_2.empty()) result.virtual_modes.push_back(runtime->mode_2);
+      result.applied_mode_1 = runtime->applied_mode_1;
       result.temporary_physical_lease = true;
       result.lease_uid = runtime->lease_uid;
       return result;
@@ -1009,9 +1013,11 @@ namespace nvhttp {
   }
 
   bool bind_host_layout(session_stream::launch_session_t &session,
-                        const std::vector<platf::display_info_t> &outputs,
+                        std::vector<platf::display_info_t> &outputs,
                         uid_t authenticated_uid,
-                        pt::ptree &tree) {
+                        pt::ptree &tree,
+                        bool just_transitioned = false,
+                        bool *transitioned = nullptr) {
     if (session.plank_protocol_version != plank_topology_version ||
         (session.plank_feature_flags & plank_feature_fixed_transport_mtu) == 0 ||
         (session.plank_feature_flags & plank_feature_host_layout_binding) == 0 ||
@@ -1077,6 +1083,21 @@ namespace nvhttp {
         authenticated_uid
       });
       if (transition == plank::session::display_request_status::submitted) {
+#ifdef _WIN32
+        // The Windows host applies the change before it answers, so the
+        // display is usually already in the new mode. Look again now, with no
+        // wait, and carry on when the capture reports it; a client that does
+        // not retry then connects first time. If the capture has not caught
+        // up, answer 425 as before.
+        if (!just_transitioned) {
+          if (transitioned != nullptr) {
+            *transitioned = true;
+          }
+          outputs = video::output_topology();
+          BOOST_LOG(info) << "PLANK host display transition applied; rechecking the layout"sv;
+          return bind_host_layout(session, outputs, authenticated_uid, tree, true, transitioned);
+        }
+#endif
         tree.put("root.<xmlattr>.status_code", 425);
         tree.put("root.<xmlattr>.status_message",
                  "PLANK host display transition started");
@@ -1101,7 +1122,10 @@ namespace nvhttp {
       return false;
     }
     if (live_layout.virtual_layout) {
-      const auto mode_1 = plank::topology::virtual_mode_size(actual_mode_1);
+      // A substituted mode is what the display is actually in.
+      const auto mode_1 = plank::topology::virtual_mode_size(
+        live_layout.applied_mode_1.empty() ? actual_mode_1 : live_layout.applied_mode_1
+      );
       const bool first_matches = ordered_outputs[0].get().width == mode_1.width &&
                                  ordered_outputs[0].get().height == mode_1.height;
       bool second_matches = true;
@@ -1113,6 +1137,14 @@ namespace nvhttp {
                            ordered_outputs[0].get().x + mode_1.width;
       }
       if (!first_matches || !second_matches) {
+        if (just_transitioned) {
+          // The change was applied but the capture still reports the old
+          // mode: let the client retry rather than fail the session.
+          tree.put("root.<xmlattr>.status_code", 425);
+          tree.put("root.<xmlattr>.status_message",
+                   "PLANK host display transition started");
+          return false;
+        }
         tree.put("root.<xmlattr>.status_code", 409);
         tree.put("root.<xmlattr>.status_message", "Configured host display modes are not live");
         return false;
@@ -1163,10 +1195,24 @@ namespace nvhttp {
   bool resolve_selected_output(session_stream::launch_session_t &session,
                                uid_t authenticated_uid,
                                pt::ptree &tree) {
-    const auto outputs = video::output_topology();
-    if (!bind_host_layout(session, outputs, authenticated_uid, tree)) {
+    auto outputs = video::output_topology();
+    bool transitioned = false;
+    if (!bind_host_layout(session, outputs, authenticated_uid, tree, false, &transitioned)) {
       return false;
     }
+    // The client read the topology before the host changed its displays, so a
+    // generation mismatch right after a transition means "retry", as it did
+    // before the host began answering without a retry.
+    const auto bind_generation_after_transition = [&]() {
+      if (bind_topology_generation(session, outputs, tree)) {
+        return true;
+      }
+      if (transitioned) {
+        tree.put("root.<xmlattr>.status_code", 425);
+        tree.put("root.<xmlattr>.status_message", "PLANK host display transition started");
+      }
+      return false;
+    };
     if (session.display_mode == "scaled-span" || session.display_mode == "separate-displays") {
       if (session.plank_protocol_version != plank_topology_version ||
           (session.plank_feature_flags & plank_feature_scaled_span) == 0 ||
@@ -1182,7 +1228,7 @@ namespace nvhttp {
         tree.put("root.<xmlattr>.status_message", "Host desktop topology is unavailable");
         return false;
       }
-      if (!bind_topology_generation(session, outputs, tree)) {
+      if (!bind_generation_after_transition()) {
         return false;
       }
       session.output_name.clear();
@@ -1213,7 +1259,7 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Invalid PLANK output negotiation");
       return false;
     }
-    if (!bind_topology_generation(session, outputs, tree)) {
+    if (!bind_generation_after_transition()) {
       return false;
     }
     const auto capture_name = video::resolve_output_capture_name(outputs, session.output_id);

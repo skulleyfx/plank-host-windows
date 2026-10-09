@@ -12,6 +12,7 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,27 @@ namespace plank::display_arrange {
    * @return True when Windows applied the mode.
    */
   bool apply_mode(const display_mode_t &display);
+
+  /**
+   * @brief Every mode a display reports, as sizes and refresh rates.
+   *
+   * @param name Display name, e.g. \\.\DISPLAY1.
+   * @param[out] sizes Unique width, height and refresh rate triples.
+   * @return Number of modes found; 0 when the display can't be enumerated.
+   */
+  std::size_t supported_modes(const std::string &name, std::vector<display_mode_t> &sizes);
+
+  /**
+   * @brief Apply a whole arrangement, all or nothing.
+   *
+   * Used to hand the Windows primary to another display for a session, which
+   * moves every display. Unlike restore_layout(), a refusal for any display
+   * drops the lot and leaves the desktop as it was.
+   *
+   * @param layout Positions, sizes and primary flag of every display to set.
+   * @return True when Windows applied the arrangement.
+   */
+  bool apply_arrangement(const std::vector<display_mode_t> &layout);
 
   /**
    * @brief Restore an arrangement captured by current_layout().
