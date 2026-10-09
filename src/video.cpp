@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <numeric>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -4214,6 +4215,40 @@ namespace video {
       static reprobe_worker_t worker;
       return worker;
     }
+
+    /// Start the background probe thread. The caller holds w.mutex and has checked that none runs.
+    /// @return False when the thread could not be created; no state is left claiming a probe runs.
+    bool start_reprobe_thread_locked(reprobe_worker_t &w, std::chrono::steady_clock::time_point now) {
+      w.last_attempt = now;
+      w.running = true;
+      w.status = -1;
+      encoder_reprobe_running = true;
+      // probe_encoders() builds its result in locals and publishes it atomically, so
+      // the encoder globals stay valid for readers while this runs.
+      try {
+        w.thread = std::thread([&w] {
+          int status = -1;
+          try {
+            status = probe_encoders();
+          } catch (const std::exception &e) {
+            BOOST_LOG(warning) << "Encoder re-probe failed: "sv << e.what();
+          }
+          std::lock_guard guard {w.mutex};
+          w.status = status;
+          w.running = false;
+          encoder_reprobe_running = false;
+          w.cv.notify_all();
+        });
+      } catch (const std::system_error &e) {
+        // Thread creation can fail under resource pressure. Leaving the flags set
+        // would refuse every launch for good, so undo them and keep the encoder.
+        BOOST_LOG(warning) << "Unable to start the encoder re-probe thread: "sv << e.what();
+        w.running = false;
+        encoder_reprobe_running = false;
+        return false;
+      }
+      return true;
+    }
   }  // namespace
 
   bool encoder_probe_in_flight() {
@@ -4257,25 +4292,9 @@ namespace video {
 
     if (step == reprobe_step_e::start_and_wait) {
       BOOST_LOG(info) << "Selected encoder is ["sv << w.previous_name << "]; re-probing for a hardware encoder before this session"sv;
-      w.last_attempt = now;
-      w.running = true;
-      w.status = -1;
-      encoder_reprobe_running = true;
-      // probe_encoders() builds its result in locals and publishes it atomically, so
-      // the encoder globals stay valid for readers while this runs.
-      w.thread = std::thread([&w] {
-        int status = -1;
-        try {
-          status = probe_encoders();
-        } catch (const std::exception &e) {
-          BOOST_LOG(warning) << "Encoder re-probe failed: "sv << e.what();
-        }
-        std::lock_guard guard {w.mutex};
-        w.status = status;
-        w.running = false;
-        encoder_reprobe_running = false;
-        w.cv.notify_all();
-      });
+      if (!start_reprobe_thread_locked(w, now)) {
+        return reprobe_result_e::kept;
+      }
     }
 
     w.cv.wait_for(lock, max_wait, [&w] { return !w.running; });
