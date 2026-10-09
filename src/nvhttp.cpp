@@ -2103,6 +2103,24 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Restart the lease start timer once a launch holding the lease is answered 200.
+   *
+   * The lease timer is otherwise cancelled only when the media session allocates, so a lease
+   * acquired ~90 s earlier by 425 retries could be restored before that happens. Call after
+   * the launch is raised so the timer also sees it as pending.
+   */
+  void claim_display_lease_for_launch(uid_t authenticated_uid, const select_output_outcome_t &outcome) {
+#ifdef _WIN32
+    if (outcome.lease_held) {
+      plank::session::claim_display_lease(authenticated_uid);
+    }
+#else
+    (void) authenticated_uid;
+    (void) outcome;
+#endif
+  }
+
+  /**
    * @brief Re-check the video encoders before the requested mode is validated.
    *
    * Only Windows hosts re-probe: they can start on the software encoder while another
@@ -2349,6 +2367,7 @@ namespace nvhttp {
     tree.put("root.PlankEncodingMode", launch_session->encoding_mode);
 
     session_stream::launch_session_raise(launch_session);
+    claim_display_lease_for_launch(lease_uid, output_outcome);
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -2522,6 +2541,7 @@ namespace nvhttp {
     tree.put("root.PlankEncodingMode", launch_session->encoding_mode);
 
     session_stream::launch_session_raise(launch_session);
+    claim_display_lease_for_launch(lease_uid, output_outcome);
   }
 
   void start() {

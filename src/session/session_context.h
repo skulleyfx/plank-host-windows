@@ -188,6 +188,15 @@ namespace plank::session {
   /** Mark a temporary physical-display lease active once native setup allocates its stream. */
   display_request_status activate_display_lease(uid_t account_uid);
 
+  /**
+   * @brief Note that a launch holding this account's lease was answered 200.
+   *
+   * Restarts the lease start timer from the answer, so a lease acquired ~90 s earlier by
+   * 425 retries is not restored before the media session allocates. Does not mark the
+   * stream started; allocation does that. No-op when the account holds no lease.
+   */
+  display_request_status claim_display_lease(uid_t account_uid);
+
   /** Release a temporary physical-display lease when its final stream ends. */
   display_request_status release_display_lease(uid_t account_uid);
 

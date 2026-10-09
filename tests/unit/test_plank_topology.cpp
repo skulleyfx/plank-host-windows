@@ -283,3 +283,16 @@ TEST(PlankTopology, LeaseTimerReleasesOnlyAnUnstartedCurrentLease) {
   // The lease was released and acquired again since the timer was armed.
   EXPECT_FALSE(topology::lease_timer_should_release(true, false, 4, 5));
 }
+
+TEST(PlankTopology, LeaseTimerWaitsForAnAcceptedLaunch) {
+  // An accepted launch still setting up: do not restore, wait again.
+  EXPECT_FALSE(topology::lease_timer_should_release(true, false, 4, 4, true));
+  EXPECT_TRUE(topology::lease_timer_should_rearm(true, false, 4, 4, true));
+  // No launch pending: restore as before, never re-arm.
+  EXPECT_TRUE(topology::lease_timer_should_release(true, false, 4, 4, false));
+  EXPECT_FALSE(topology::lease_timer_should_rearm(true, false, 4, 4, false));
+  // Stale, started or released leases are never re-armed.
+  EXPECT_FALSE(topology::lease_timer_should_rearm(true, false, 4, 5, true));
+  EXPECT_FALSE(topology::lease_timer_should_rearm(true, true, 4, 4, true));
+  EXPECT_FALSE(topology::lease_timer_should_rearm(false, false, 4, 4, true));
+}

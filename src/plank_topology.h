@@ -166,15 +166,33 @@ namespace plank::topology {
    * @param stream_started Whether a stream activated the lease since it was acquired.
    * @param armed_generation Generation of the lease the timer was armed for.
    * @param current_generation Generation of the lease held now.
+   * @param launch_pending Whether an accepted launch (a 200 answer) still owns native setup.
    * @return True when the displays must be restored.
    */
   constexpr bool lease_timer_should_release(
     bool lease_held,
     bool stream_started,
     std::uint64_t armed_generation,
-    std::uint64_t current_generation
+    std::uint64_t current_generation,
+    bool launch_pending = false
   ) {
-    return lease_held && !stream_started && armed_generation == current_generation;
+    return lease_held && !stream_started && armed_generation == current_generation && !launch_pending;
+  }
+
+  /**
+   * @brief Decide whether the lease timer should wait another period instead of restoring.
+   *
+   * True when the lease is still current and unstarted but an accepted launch is setting up
+   * its media session, so restoring the displays now would pull them out from under it.
+   */
+  constexpr bool lease_timer_should_rearm(
+    bool lease_held,
+    bool stream_started,
+    std::uint64_t armed_generation,
+    std::uint64_t current_generation,
+    bool launch_pending
+  ) {
+    return lease_held && !stream_started && armed_generation == current_generation && launch_pending;
   }
 
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {

@@ -636,6 +636,10 @@ namespace plank::session {
     });
   }
 
+  display_request_status claim_display_lease(uid_t) {
+    return display_request_status::unavailable;  // Only Windows has a start timer.
+  }
+
   display_request_status release_display_lease(uid_t account_uid) {
     return request_display_transition({
       display_request_t::action_t::release, {}, {}, {}, account_uid
