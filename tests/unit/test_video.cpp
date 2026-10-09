@@ -396,3 +396,25 @@ TEST(VideoReprobeTest, ReprobeDecisionFollowsEncoderKindAndRateLimit) {
   EXPECT_TRUE(video::should_reprobe_encoders(true, true, now - 30s, now, interval));
   EXPECT_TRUE(video::should_reprobe_encoders(false, false, now - 31s, now, interval));
 }
+
+TEST(VideoReprobeTest, GateStartsWaitsOrProceedsFromProbeState) {
+  using video::reprobe_step_e;
+  // Nothing running, nothing warranted: continue without waiting.
+  EXPECT_EQ(video::next_reprobe_step(false, false), reprobe_step_e::proceed);
+  // Warranted and idle: start a probe and wait briefly.
+  EXPECT_EQ(video::next_reprobe_step(false, true), reprobe_step_e::start_and_wait);
+  // A probe already running is never started twice, whatever the rate limit says.
+  EXPECT_EQ(video::next_reprobe_step(true, true), reprobe_step_e::wait);
+  EXPECT_EQ(video::next_reprobe_step(true, false), reprobe_step_e::wait);
+}
+
+TEST(VideoReprobeTest, LaunchRefusedWhileProbeStillRunningAfterWait) {
+  using video::reprobe_step_e;
+  using video::reprobe_verdict_e;
+  EXPECT_EQ(video::reprobe_launch_verdict(reprobe_step_e::proceed, true), reprobe_verdict_e::proceed);
+  EXPECT_EQ(video::reprobe_launch_verdict(reprobe_step_e::start_and_wait, true), reprobe_verdict_e::proceed);
+  EXPECT_EQ(video::reprobe_launch_verdict(reprobe_step_e::wait, true), reprobe_verdict_e::proceed);
+  // Still running: refuse, in both the freshly started and already running cases.
+  EXPECT_EQ(video::reprobe_launch_verdict(reprobe_step_e::start_and_wait, false), reprobe_verdict_e::refuse);
+  EXPECT_EQ(video::reprobe_launch_verdict(reprobe_step_e::wait, false), reprobe_verdict_e::refuse);
+}

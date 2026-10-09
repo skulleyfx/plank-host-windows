@@ -695,11 +695,11 @@ namespace video {
    */
   using hdr_info_t = std::unique_ptr<hdr_info_raw_t>;
 
-  extern bool last_encoder_probe_supported_ref_frames_invalidation;
-  extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
-  extern bool last_encoder_probe_supported_h264_10bit_444;  ///< Whether the selected encoder accepts H.264 10-bit 4:4:4 input.
-  extern bool last_encoder_probe_supported_h264_8bit_422;  ///< Whether the selected encoder accepts H.264 8-bit 4:2:2 input.
-  extern bool last_encoder_probe_supported_h264_10bit_422;  ///< Whether the selected encoder accepts H.264 10-bit 4:2:2 input.
+  extern std::atomic<bool> last_encoder_probe_supported_ref_frames_invalidation;
+  extern std::array<std::atomic<bool>, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
+  extern std::atomic<bool> last_encoder_probe_supported_h264_10bit_444;  ///< Whether the selected encoder accepts H.264 10-bit 4:4:4 input.
+  extern std::atomic<bool> last_encoder_probe_supported_h264_8bit_422;  ///< Whether the selected encoder accepts H.264 8-bit 4:2:2 input.
+  extern std::atomic<bool> last_encoder_probe_supported_h264_10bit_422;  ///< Whether the selected encoder accepts H.264 10-bit 4:2:2 input.
 
   void capture(
     safe::mail_t mail,
@@ -771,17 +771,58 @@ namespace video {
                                std::chrono::steady_clock::time_point now,
                                std::chrono::seconds min_interval);
 
+  /** What the launch path should do about an encoder re-probe. */
+  enum class reprobe_step_e {
+    proceed,         ///< Nothing to do; continue the launch.
+    start_and_wait,  ///< Start a background probe, then wait a short while for it.
+    wait,            ///< A probe is already running; only wait a short while for it.
+  };
+
+  /** What the launch path should do once the short wait is over. */
+  enum class reprobe_verdict_e {
+    proceed,  ///< No probe is in flight; the encoder state is stable.
+    refuse,   ///< The probe is still running; answer the launch with a retryable error.
+  };
+
+  /** Outcome of reprobe_encoders_before_session(). */
+  enum class reprobe_result_e {
+    kept,      ///< No probe was needed, or it found nothing better.
+    upgraded,  ///< A hardware encoder replaced a software or missing one.
+    busy,      ///< A probe is still running; the launch must be refused.
+  };
+
+  /**
+   * @brief Pure decision: what to do given the current probe state.
+   * @param probe_in_flight Whether a background probe is running right now.
+   * @param reprobe_warranted Result of should_reprobe_encoders() (ignored when a probe is running).
+   */
+  reprobe_step_e next_reprobe_step(bool probe_in_flight, bool reprobe_warranted);
+
+  /**
+   * @brief Pure decision: proceed or refuse after waiting for the probe.
+   * @param step The step that was taken.
+   * @param probe_finished Whether the probe is no longer running after the wait.
+   */
+  reprobe_verdict_e reprobe_launch_verdict(reprobe_step_e step, bool probe_finished);
+
   /**
    * @brief Re-run the encoder probe before a session when only software (or nothing) is selected.
    *
-   * Rate limited, bounded in time and run on its own thread so the caller (an HTTPS
-   * handler) never blocks on a hung driver. Keeps the previous selection if the
-   * probe fails or times out.
+   * Rate limited. The probe runs on a joinable background thread and publishes its
+   * result atomically, so readers never see a half-updated encoder. The caller waits
+   * at most about a second; if the probe is still running the result is busy and the
+   * launch must be refused (select_encoder_backend_for_session() also refuses while a
+   * probe runs). A hung driver therefore never holds the HTTPS thread.
    *
    * @warning Only call when no client is actively streaming.
-   * @return True when a hardware encoder replaced a software or missing one.
    */
-  bool reprobe_encoders_before_session();
+  reprobe_result_e reprobe_encoders_before_session();
+
+  /** Return whether a background encoder re-probe is currently running. */
+  bool encoder_probe_in_flight();
+
+  /** Wait (bounded) for a running re-probe at shutdown and join its thread. */
+  void shutdown_encoder_reprobe();
 
   /** Return whether a named PLANK per-session encoder was qualified at startup. */
   bool encoder_backend_available(std::string_view backend);

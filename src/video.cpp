@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <future>
 #include <list>
@@ -1708,16 +1709,21 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
-  bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
-  std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
-  bool last_encoder_probe_supported_h264_10bit_444 = false;  ///< H.264 10-bit 4:4:4 support discovered for the selected encoder.
-  bool last_encoder_probe_supported_h264_8bit_422 = false;  ///< H.264 8-bit 4:2:2 support discovered for the selected encoder.
-  bool last_encoder_probe_supported_h264_10bit_422 = false;  ///< H.264 10-bit 4:2:2 support discovered for the selected encoder.
+  /// Guards chosen_encoder and the encoder flags readers consult while a probe publishes its result.
+  static std::recursive_mutex encoder_state_mutex;
+  /// True while the background re-probe thread is running; launches must not touch encoder state.
+  static std::atomic<bool> encoder_reprobe_running = false;
+  std::atomic<bool> last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
+  std::array<std::atomic<bool>, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
+  std::atomic<bool> last_encoder_probe_supported_h264_10bit_444 = false;  ///< H.264 10-bit 4:4:4 support discovered for the selected encoder.
+  std::atomic<bool> last_encoder_probe_supported_h264_8bit_422 = false;  ///< H.264 8-bit 4:2:2 support discovered for the selected encoder.
+  std::atomic<bool> last_encoder_probe_supported_h264_10bit_422 = false;  ///< H.264 10-bit 4:2:2 support discovered for the selected encoder.
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
   static bool nvenc_direct_qualified = false;
 #endif
 
   bool nvenc_direct_supports_h264_444_8bit() {
+    std::lock_guard state_lock {encoder_state_mutex};
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     return nvenc_direct_qualified && nvenc_direct.h264[encoder_t::PASSED] &&
            nvenc_direct.h264[encoder_t::YUV444];
@@ -1736,6 +1742,7 @@ namespace video {
   }
 
   bool nvenc_direct_supports_hevc_420_8bit() {
+    std::lock_guard state_lock {encoder_state_mutex};
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     return nvenc_direct_qualified && codec_supports_8bit_420(nvenc_direct.hevc);
 #elif defined(_WIN32)
@@ -1749,6 +1756,7 @@ namespace video {
   }
 
   bool nvenc_direct_supports_hevc_444_8bit() {
+    std::lock_guard state_lock {encoder_state_mutex};
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     return nvenc_direct_qualified && nvenc_direct.hevc[encoder_t::PASSED] &&
            nvenc_direct.hevc[encoder_t::YUV444];
@@ -1761,6 +1769,7 @@ namespace video {
   }
 
   bool nvenc_direct_supports_hevc_444_10bit() {
+    std::lock_guard state_lock {encoder_state_mutex};
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     return nvenc_direct_qualified && nvenc_direct.hevc[encoder_t::PASSED] &&
            nvenc_direct.hevc[encoder_t::DYNAMIC_RANGE_YUV444];
@@ -1770,6 +1779,11 @@ namespace video {
   }
 
   bool encoder_backend_available(std::string_view backend) {
+    // Never answer from encoder state a re-probe is rewriting; the launch is refused instead.
+    if (encoder_reprobe_running) {
+      return false;
+    }
+    std::lock_guard state_lock {encoder_state_mutex};
 #if defined(_WIN32)
     if (backend == "nvenc-direct"sv) {
       return nvenc_direct_supports_hevc_420_8bit() ||
@@ -1793,6 +1807,7 @@ namespace video {
   }
 
   bool encoding_mode_available(std::string_view mode) {
+    std::lock_guard state_lock {encoder_state_mutex};
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
     const bool software_h264 = software_cuda.h264[encoder_t::PASSED];
     if (mode == "h264-8-422-software"sv) {
@@ -1844,6 +1859,7 @@ namespace video {
   }
 
   bool select_encoder_backend_for_session(std::string_view backend) {
+    std::lock_guard state_lock {encoder_state_mutex};
     if (!encoder_backend_available(backend)) {
       return false;
     }
@@ -4018,12 +4034,11 @@ namespace video {
       return 0;
     }
 
-    // Restart encoder selection
+    // Restart encoder selection. The result is built in locals and published at the
+    // end under encoder_state_mutex, so concurrent readers never see a cleared
+    // selection and a failed probe leaves the previous selection untouched.
     auto previous_encoder = chosen_encoder;
-    chosen_encoder = nullptr;
-    last_encoder_probe_supported_ref_frames_invalidation = false;
-    last_encoder_probe_supported_h264_8bit_422 = false;
-    last_encoder_probe_supported_h264_10bit_422 = false;
+    encoder_t *selected = nullptr;
 
     BOOST_LOG(info) << "// Testing for available encoders, this may generate errors. You can safely ignore those errors. //"sv;
 
@@ -4041,7 +4056,7 @@ namespace video {
       BOOST_LOG(fatal) << "No exact PLANK encoder backend is available."sv;
       return -1;
     }
-    chosen_encoder = software_cuda_qualified ? &software_cuda : &nvenc_direct;
+    selected = software_cuda_qualified ? &software_cuda : &nvenc_direct;
 #else
     KITTY_WHILE_LOOP(auto pos = std::begin(encoder_list), pos != std::end(encoder_list), {
         auto encoder = *pos;
@@ -4062,12 +4077,12 @@ namespace video {
         continue;
       }
 
-      chosen_encoder = encoder;
+      selected = encoder;
       break;
     });
 #endif
 
-    if (chosen_encoder == nullptr) {
+    if (selected == nullptr) {
       BOOST_LOG(fatal) << "Unable to find display or encoder during startup."sv;
       if (!config::video.adapter_name.empty()) {
         BOOST_LOG(fatal) << "Please ensure your manually chosen GPU is connected and available."sv;
@@ -4081,21 +4096,25 @@ namespace video {
     BOOST_LOG(info) << "// Ignore any errors mentioned above, they are not relevant. //"sv;
     BOOST_LOG(info);
 
-    auto &encoder = *chosen_encoder;
+    auto &encoder = *selected;
 
-    last_encoder_probe_supported_ref_frames_invalidation = (encoder.flags & REF_FRAMES_INVALIDATION);
-    last_encoder_probe_supported_yuv444_for_codec[0] = encoder.h264[encoder_t::PASSED] &&
-                                                       encoder.h264[encoder_t::YUV444];
-    last_encoder_probe_supported_h264_10bit_444 =
-      encoder.h264[encoder_t::PASSED] && encoder.h264[encoder_t::DYNAMIC_RANGE_YUV444];
-    last_encoder_probe_supported_h264_8bit_422 =
-      encoder.h264[encoder_t::PASSED] && encoder.h264[encoder_t::YUV422];
-    last_encoder_probe_supported_h264_10bit_422 =
-      encoder.h264[encoder_t::PASSED] && encoder.h264[encoder_t::DYNAMIC_RANGE_YUV422];
-    last_encoder_probe_supported_yuv444_for_codec[1] = encoder.hevc[encoder_t::PASSED] &&
-                                                       encoder.hevc[encoder_t::YUV444];
-    last_encoder_probe_supported_yuv444_for_codec[2] = encoder.av1[encoder_t::PASSED] &&
-                                                       encoder.av1[encoder_t::YUV444];
+    {
+      std::lock_guard state_lock {encoder_state_mutex};
+      chosen_encoder = selected;
+      last_encoder_probe_supported_ref_frames_invalidation = (encoder.flags & REF_FRAMES_INVALIDATION) != 0;
+      last_encoder_probe_supported_yuv444_for_codec[0] = encoder.h264[encoder_t::PASSED] &&
+                                                         encoder.h264[encoder_t::YUV444];
+      last_encoder_probe_supported_h264_10bit_444 =
+        encoder.h264[encoder_t::PASSED] && encoder.h264[encoder_t::DYNAMIC_RANGE_YUV444];
+      last_encoder_probe_supported_h264_8bit_422 =
+        encoder.h264[encoder_t::PASSED] && encoder.h264[encoder_t::YUV422];
+      last_encoder_probe_supported_h264_10bit_422 =
+        encoder.h264[encoder_t::PASSED] && encoder.h264[encoder_t::DYNAMIC_RANGE_YUV422];
+      last_encoder_probe_supported_yuv444_for_codec[1] = encoder.hevc[encoder_t::PASSED] &&
+                                                         encoder.hevc[encoder_t::YUV444];
+      last_encoder_probe_supported_yuv444_for_codec[2] = encoder.av1[encoder_t::PASSED] &&
+                                                         encoder.av1[encoder_t::YUV444];
+    }
 
     BOOST_LOG(debug) << "------  h264 ------"sv;
     for (int x = 0; x < encoder_t::MAX_FLAGS; ++x) {
@@ -4165,73 +4184,147 @@ namespace video {
     return !last_attempt || now - *last_attempt >= min_interval;
   }
 
-  bool reprobe_encoders_before_session() {
+  reprobe_step_e next_reprobe_step(bool probe_in_flight, bool reprobe_warranted) {
+    if (probe_in_flight) {
+      return reprobe_step_e::wait;
+    }
+    return reprobe_warranted ? reprobe_step_e::start_and_wait : reprobe_step_e::proceed;
+  }
+
+  reprobe_verdict_e reprobe_launch_verdict(reprobe_step_e step, bool probe_finished) {
+    if (step == reprobe_step_e::proceed || probe_finished) {
+      return reprobe_verdict_e::proceed;
+    }
+    return reprobe_verdict_e::refuse;
+  }
+
+  namespace {
+    /// State of the single background re-probe worker.
+    struct reprobe_worker_t {
+      std::mutex mutex;
+      std::condition_variable cv;
+      std::thread thread;
+      bool running = false;
+      int status = -1;
+      std::optional<std::chrono::steady_clock::time_point> last_attempt;
+      std::string_view previous_name = "none"sv;
+    };
+
+    reprobe_worker_t &reprobe_worker() {
+      static reprobe_worker_t worker;
+      return worker;
+    }
+  }  // namespace
+
+  bool encoder_probe_in_flight() {
+    return encoder_reprobe_running;
+  }
+
+  reprobe_result_e reprobe_encoders_before_session() {
     using clock = std::chrono::steady_clock;
     constexpr auto min_interval = 30s;
-    constexpr auto max_wait = 20s;
+    // The caller is the single HTTPS thread: every other client's serverinfo poll
+    // (2 s timeout) and the Duo sign-in replies queue behind it, so never wait long.
+    constexpr auto max_wait = 1000ms;
 
-    static std::mutex state_mutex;
-    static std::optional<clock::time_point> last_attempt;
-    static bool in_flight = false;
+    auto &w = reprobe_worker();
+    std::unique_lock lock {w.mutex};
 
+    // A finished worker is reaped here so a thread is never left unjoined.
+    if (!w.running && w.thread.joinable()) {
+      auto done = std::move(w.thread);
+      lock.unlock();
+      done.join();
+      lock.lock();
+    }
+
+    const auto now = clock::now();
+    bool warranted = false;
     {
-      std::lock_guard lock {state_mutex};
-      const auto now = clock::now();
-      if (in_flight || !should_reprobe_encoders(chosen_encoder != nullptr,
-                                                chosen_encoder && (chosen_encoder->flags & ALWAYS_REPROBE),
-                                                last_attempt, now, min_interval)) {
-        return false;
+      std::lock_guard state_lock {encoder_state_mutex};
+      warranted = should_reprobe_encoders(chosen_encoder != nullptr,
+                                          chosen_encoder && (chosen_encoder->flags & ALWAYS_REPROBE),
+                                          w.last_attempt, now, min_interval);
+      if (!w.running && warranted) {
+        w.previous_name = chosen_encoder ? chosen_encoder->name : "none"sv;
       }
-      last_attempt = now;
-      in_flight = true;
     }
 
-    const auto previous_name = chosen_encoder ? chosen_encoder->name : "none"sv;
-    BOOST_LOG(info) << "Selected encoder is ["sv << previous_name << "]; re-probing for a hardware encoder before this session"sv;
-
-    // Probe on a worker so a stalled driver cannot hold the HTTPS thread. The
-    // caller holds the session-start lock and no session is running, so nothing
-    // else touches the encoder state. If the wait times out the worker keeps
-    // going and in_flight stays set until it finishes.
-    auto previous = chosen_encoder;
-    auto result = std::make_shared<std::promise<int>>();
-    auto future = result->get_future();
-    std::thread([result] {
-      int status = -1;
-      try {
-        status = probe_encoders();
-      } catch (const std::exception &e) {
-        BOOST_LOG(warning) << "Encoder re-probe failed: "sv << e.what();
-      }
-      {
-        std::lock_guard lock {state_mutex};
-        in_flight = false;
-      }
-      result->set_value(status);
-    }).detach();
-
-    if (future.wait_for(max_wait) != std::future_status::ready) {
-      BOOST_LOG(warning) << "Encoder re-probe did not finish within "sv << max_wait.count() << "s; continuing"sv;
-      return false;
+    const auto step = next_reprobe_step(w.running, warranted);
+    if (step == reprobe_step_e::proceed) {
+      return reprobe_result_e::kept;
     }
 
-    if (future.get() != 0 || chosen_encoder == nullptr) {
-      // probe_encoders() clears the selection before it tries; do not leave the host worse off.
-      if (chosen_encoder == nullptr) {
-        chosen_encoder = previous;
-      }
-      BOOST_LOG(info) << "Encoder re-probe found nothing better; keeping ["sv << previous_name << ']';
-      return false;
+    if (step == reprobe_step_e::start_and_wait) {
+      BOOST_LOG(info) << "Selected encoder is ["sv << w.previous_name << "]; re-probing for a hardware encoder before this session"sv;
+      w.last_attempt = now;
+      w.running = true;
+      w.status = -1;
+      encoder_reprobe_running = true;
+      // probe_encoders() builds its result in locals and publishes it atomically, so
+      // the encoder globals stay valid for readers while this runs.
+      w.thread = std::thread([&w] {
+        int status = -1;
+        try {
+          status = probe_encoders();
+        } catch (const std::exception &e) {
+          BOOST_LOG(warning) << "Encoder re-probe failed: "sv << e.what();
+        }
+        std::lock_guard guard {w.mutex};
+        w.status = status;
+        w.running = false;
+        encoder_reprobe_running = false;
+        w.cv.notify_all();
+      });
+    }
+
+    w.cv.wait_for(lock, max_wait, [&w] { return !w.running; });
+    const bool finished = !w.running;
+    if (reprobe_launch_verdict(step, finished) == reprobe_verdict_e::refuse) {
+      BOOST_LOG(warning) << "Encoder re-probe still running after "sv << max_wait.count()
+                         << " ms; refusing this launch so it can be retried"sv;
+      return reprobe_result_e::busy;
+    }
+
+    const int status = w.status;
+    auto done = std::move(w.thread);
+    lock.unlock();
+    if (done.joinable()) {
+      done.join();
+    }
+
+    std::lock_guard state_lock {encoder_state_mutex};
+    if (status != 0 || chosen_encoder == nullptr) {
+      BOOST_LOG(info) << "Encoder re-probe found nothing better; keeping ["sv << w.previous_name << ']';
+      return reprobe_result_e::kept;
     }
 
     const bool upgraded = !(chosen_encoder->flags & ALWAYS_REPROBE);
     if (upgraded) {
-      BOOST_LOG(info) << "Encoder re-probe switched from ["sv << previous_name << "] to hardware encoder ["sv
+      BOOST_LOG(info) << "Encoder re-probe switched from ["sv << w.previous_name << "] to hardware encoder ["sv
                       << chosen_encoder->name << ']';
     } else {
       BOOST_LOG(info) << "Encoder re-probe kept software encoder ["sv << chosen_encoder->name << ']';
     }
-    return upgraded;
+    return upgraded ? reprobe_result_e::upgraded : reprobe_result_e::kept;
+  }
+
+  void shutdown_encoder_reprobe() {
+    auto &w = reprobe_worker();
+    std::unique_lock lock {w.mutex};
+    if (!w.thread.joinable()) {
+      return;
+    }
+    if (!w.cv.wait_for(lock, 5s, [&w] { return !w.running; })) {
+      // A driver call that never returns cannot be cancelled. The process is
+      // exiting, so leave the thread rather than hang the service stop.
+      BOOST_LOG(warning) << "Encoder re-probe did not finish during shutdown; abandoning it"sv;
+      w.thread.detach();
+      return;
+    }
+    auto done = std::move(w.thread);
+    lock.unlock();
+    done.join();
   }
 
   // Linux only declaration

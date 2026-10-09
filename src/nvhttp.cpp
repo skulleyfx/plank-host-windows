@@ -2164,8 +2164,17 @@ namespace nvhttp {
 #ifdef _WIN32
       // The host may have started with no usable output (another remote-desktop
       // product held the console) and settled on a software encoder. Look again
-      // now that someone is connecting. Rate limited and off this thread inside.
-      video::reprobe_encoders_before_session();
+      // now that someone is connecting. Rate limited; the probe runs on its own
+      // thread and this handler (the single HTTPS thread) waits about a second at
+      // most. If the probe is still running the launch is refused with a retryable
+      // 503 rather than proceeding while the encoder state is being rewritten.
+      if (video::reprobe_encoders_before_session() == video::reprobe_result_e::busy) {
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message",
+                 "Host is re-checking its video encoder; retry in a few seconds");
+        tree.put("root.gamesession", 0);
+        return;
+      }
 #endif
       if (!video::select_encoder_backend_for_session(
               launch_session->encoder_backend)) {
