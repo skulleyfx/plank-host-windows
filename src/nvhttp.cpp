@@ -70,6 +70,7 @@
   #include "session/display_arrange.h"
 #endif
 #include "stream.h"
+#include "plank_shared_screen.h"
 #include "plank_topology.h"
 #include "utility.h"
 #include "uuid.h"
@@ -302,6 +303,16 @@ namespace nvhttp {
   constexpr auto plank_feature_session_takeover =
     plank::topology::feature_session_takeover;
   constexpr auto plank_topology_features = plank::topology::feature_flags;
+
+  /**
+   * @brief Feature bits this host advertises, including shared screen when enabled.
+   *
+   * @return PLANK feature flags for serverinfo.
+   */
+  std::uint32_t advertised_feature_flags() {
+    return plank_topology_features |
+           (config::plank_auth.shared_screen ? plank::shared_screen::feature_shared_screen : 0U);
+  }
 
 #ifdef PLANK_TRANSPORT
   std::string plank_transport_last_error(PlankTransportNativeEndpoint *endpoint) {
@@ -1624,7 +1635,7 @@ namespace nvhttp {
     tree.put("root.PlankHostVersion", PROJECT_VERSION);
     tree.put("root.PlankWorkerInstance", worker_instance_id());
     tree.put("root.PlankTopologyVersion", plank_topology_version);
-    tree.put("root.PlankFeatureFlags", plank_topology_features);
+    tree.put("root.PlankFeatureFlags", advertised_feature_flags());
     tree.put("root.PlankCaptureSources", plank_capture_sources());
     tree.put("root.PlankEncoderBackends", "software-cuda,nvenc-direct");
     tree.put("root.PlankEncodingModes", get_plank_encoding_modes());
@@ -1658,6 +1669,20 @@ namespace nvhttp {
     tree.put("root.currentgame", current_appid);
     // Whether anyone is streaming, so clients can warn before taking over.
     tree.put("root.PlankStreamActive", stream::session::running_count() > 0 ? 1 : 0);
+    // What a shared screen viewer must match; only for authorized requests.
+    if (authorization_status == 1 && config::plank_auth.shared_screen) {
+      if (const auto shared = session_stream::shared_stream()) {
+        tree.put("root.PlankSharedStreamMode", std::to_string(shared->width) + 'x' +
+                                                 std::to_string(shared->height) + 'x' +
+                                                 std::to_string(shared->fps));
+        tree.put("root.PlankSharedStreamEncodingMode", shared->encoding_mode);
+        tree.put("root.PlankSharedStreamCaptureSource", shared->capture_source);
+        tree.put("root.PlankSharedStreamEncoderBackend", shared->encoder_backend);
+        tree.put("root.PlankSharedStreamBitrateKbps", shared->bitrate_kbps);
+        tree.put("root.PlankSharedStreamAudioChannels", shared->audio_channels);
+        tree.put("root.PlankSharedStreamViewers", stream::session::viewer_count());
+      }
+    }
 #ifdef _WIN32
     // The Windows account at the desktop is shown only to admin-group members.
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
@@ -1703,6 +1728,115 @@ namespace nvhttp {
     app.put("AppTitle"s, proc::desktop_app_name);
     app.put("ID", proc::desktop_app_id);
     apps.push_back(std::make_pair("App", std::move(app)));
+  }
+
+  /**
+   * @brief Admit a client that asked to watch the running stream view-only.
+   *
+   * Runs after the desktop auth gate, so only the desktop's own account or a
+   * PLANK admin using the desktop override can get here; other accounts need
+   * the owner's approval, which is a later slice. A viewer never terminates,
+   * reconfigures or takes over the controller's stream.
+   *
+   * @param args Launch query arguments.
+   * @param request Authorized HTTPS request.
+   * @param tree Response tree to fill.
+   * @param result_field "root.gamesession" or "root.resume".
+   * @return False when the client asked to be the controller (today's path);
+   *         true when the request was handled here, admitted or refused.
+   */
+  bool handle_viewer_join(const args_t &args, const req_https_t &request, pt::ptree &tree, const char *result_field) {
+    namespace shared = plank::shared_screen;
+    const auto role = shared::parse_role(get_arg(args, "plankSessionRole", ""));
+    if (!role) {
+      tree.put(result_field, 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid PLANK session role");
+      return true;
+    }
+    if (*role == shared::role_e::controller) {
+      return false;
+    }
+
+    const auto identity = authenticated_identity(request);
+    bool same_account = true;
+    bool admin_override = false;
+#ifdef _WIN32
+    same_account = plank::session::desktop_owner_relation(identity) !=
+                   plank::session::desktop_owner_e::different;
+    admin_override = config::plank_auth.admin_desktop_override &&
+                     plank::auth::account_is_plank_admin(identity);
+#endif
+    const auto consent = shared::decide_consent(
+      config::plank_auth.shared_screen, same_account, admin_override, false
+    );
+
+    auto launch_session = make_launch_session(false, args);
+    const auto running = session_stream::shared_stream();
+    const bool launch_matches = running &&
+      launch_session->width == running->width &&
+      launch_session->height == running->height &&
+      launch_session->fps == running->fps &&
+      launch_session->encoding_mode == running->encoding_mode &&
+      launch_session->capture_source == running->capture_source &&
+      launch_session->encoder_backend == running->encoder_backend;
+    const auto admission = shared::admit_viewer({
+      config::plank_auth.shared_screen,
+      launch_session->plank_protocol_version == plank_topology_version,
+      launch_session->plank_feature_flags,
+      running.has_value(),
+      static_cast<int>(stream::session::viewer_count()),
+      config::plank_auth.shared_screen_max_viewers,
+      launch_matches,
+    });
+    if (!admission.admitted() || consent == shared::consent_e::refuse ||
+        consent == shared::consent_e::ask_owner) {
+      const int status = !admission.admitted() ? admission.status : 403;
+      const std::string message = !admission.admitted() ?
+        std::string {admission.message} :
+        std::string {"Watching another account's desktop needs the owner's approval"};
+      BOOST_LOG(warning) << "Refusing shared screen viewer "sv << identity << ": "sv << message;
+      tree.put(result_field, 0);
+      tree.put("root.<xmlattr>.status_code", status);
+      tree.put("root.<xmlattr>.status_message", message);
+      return true;
+    }
+
+    if (!validate_capture_source(*launch_session, tree) ||
+        !validate_encoder_backend(*launch_session, tree) ||
+        !validate_transport_mtu(*launch_session, tree)) {
+      tree.put(result_field, 0);
+      return true;
+    }
+
+    launch_session->role = shared::role_e::viewer;
+    launch_session->admin_observer = consent == shared::consent_e::admit_admin_silently;
+    launch_session->authenticated_account = identity;
+    launch_session->authentication_session = claim_authentication_session(request);
+    if (!launch_session->authentication_session) {
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "A new operating-system login is required.");
+      tree.put(result_field, 0);
+      return true;
+    }
+
+#ifdef PLANK_TRANSPORT
+    if (!start_plank_transport_data_plane(*launch_session, tree)) {
+      tree.put(result_field, 0);
+      return true;
+    }
+#endif
+
+    tree.put("root.<xmlattr>.status_code", 200);
+    tree.put(result_field, 1);
+    tree.put("root.PlankWorkerInstance", worker_instance_id());
+    tree.put("root.PlankCaptureSource", launch_session->capture_source);
+    tree.put("root.PlankEncoderBackend", launch_session->encoder_backend);
+    tree.put("root.PlankEncodingMode", launch_session->encoding_mode);
+    tree.put("root.PlankSessionRole", std::string {shared::role_name(shared::role_e::viewer)});
+    BOOST_LOG(info) << "Shared screen viewer admitted for native setup"sv;
+    session_stream::viewer_launch_raise(launch_session);
+    return true;
   }
 
   /**
@@ -1754,6 +1888,10 @@ namespace nvhttp {
       tree.put("root.gamesession", 0);
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "The authenticated account does not own this desktop session");
+      return;
+    }
+
+    if (handle_viewer_join(args, request, tree, "root.gamesession")) {
       return;
     }
 
@@ -1928,6 +2066,10 @@ namespace nvhttp {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "The authenticated account does not own this desktop session");
+      return;
+    }
+
+    if (handle_viewer_join(request->parse_query_string(), request, tree, "root.resume")) {
       return;
     }
 
