@@ -15,6 +15,8 @@ extern "C" {
 #include <chrono>
 #include <optional>
 #include <set>
+#include <stop_token>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -116,9 +118,42 @@ namespace session_stream {
                       << session_slots_->size() << ']';
     }
 
+    /**
+     * @brief Record the running controller and what viewers must match.
+     */
+    void set_controller(const std::shared_ptr<stream::session_t> &session, shared_stream_t shape) {
+      auto lock = controller_.lock();
+      controller_->session = session;
+      controller_->stream = std::move(shape);
+    }
+
+    /**
+     * @brief The running controller, when it is still RUNNING.
+     */
+    std::shared_ptr<stream::session_t> controller(shared_stream_t *shape = nullptr) {
+      auto lock = controller_.lock();
+      auto session = controller_->session.lock();
+      if (!session || stream::session::state(*session) != stream::session::state_e::RUNNING) {
+        return nullptr;
+      }
+      if (shape) {
+        *shape = controller_->stream;
+      }
+      return session;
+    }
+
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;
+    safe::event_t<std::shared_ptr<launch_session_t>> viewer_event;  ///< Admitted shared screen viewers awaiting QUIC setup.
 
   private:
+    /**
+     * @brief The running controller and the stream viewers must match.
+     */
+    struct controller_t {
+      std::weak_ptr<stream::session_t> session;  ///< Controller session; expires when it is joined.
+      shared_stream_t stream;  ///< Stream shape published to viewers.
+    };
+    sync_util::sync_t<controller_t> controller_;  ///< Latest controller, for shared screen viewers.
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> session_slots_;
     // Retain ownership from HTTP acceptance through native setup. The setup
     // worker removes the request from launch_event while it waits for QUIC,
@@ -158,6 +193,20 @@ namespace session_stream {
 
   void notify_desktop_handoff() {
     server.notify_desktop_handoff();
+  }
+
+  std::optional<shared_stream_t> shared_stream() {
+    shared_stream_t shape;
+    const auto controller = server.controller(&shape);
+    if (!controller) {
+      return std::nullopt;
+    }
+    shape.owner_can_approve = stream::session::accepts_shared_messages(*controller);
+    return shape;
+  }
+
+  void viewer_launch_raise(std::shared_ptr<launch_session_t> launch_session) {
+    server.viewer_event.raise(std::move(launch_session));
   }
 
   struct native_start_result_t {
@@ -418,6 +467,16 @@ namespace session_stream {
 
     result.status = PLANK_TRANSPORT_SETUP_STATUS_OK;
     result.session = stream_session;
+    server.set_controller(stream_session, shared_stream_t {
+      config.monitor.width,
+      config.monitor.height,
+      config.monitor.framerate,
+      config.monitor.bitrate,
+      config.audio.channels,
+      launch_session->encoding_mode,
+      launch_session->capture_source,
+      launch_session->encoder_backend,
+    });
     const auto host_feature_flags =
       static_cast<std::uint32_t>(platf::get_capabilities() |
                                  platf::platform_caps::dynamic_video_bitrate |
@@ -446,9 +505,197 @@ namespace session_stream {
     return result;
   }
 
+  /**
+   * @brief Attach an admitted viewer to the running controller's stream.
+   *
+   * The viewer's native setup request must describe exactly the stream the
+   * controller is already encoding; nothing about the encoder, capture or
+   * displays changes when a viewer joins.
+   *
+   * @param launch_session Viewer launch.
+   * @param request Native setup request.
+   * @return Setup status, response and the started viewer.
+   */
+  native_start_result_t start_native_viewer_session(
+    const std::shared_ptr<launch_session_t> &launch_session,
+    const nlohmann::json &request
+  ) {
+    native_start_result_t result;
+    if (!launch_session || !request.is_object()) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_INVALID_REQUEST;
+      result.message = "Malformed native session request";
+      return result;
+    }
+
+    shared_stream_t shared;
+    const auto controller = server.controller(&shared);
+    if (!controller) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+      result.message = "There is no PLANK session to watch";
+      return result;
+    }
+    const auto &controller_config = stream::session::stream_config(*controller);
+
+    plank::shared_screen::stream_shape_t requested;
+    std::uint32_t requested_video_format {};
+    try {
+      const auto &video_request = request.at("video");
+      const auto &audio_request = request.at("audio");
+      requested.width = video_request.at("width").get<int>();
+      requested.height = video_request.at("height").get<int>();
+      requested.fps = video_request.at("fps").get<int>();
+      requested.encoder_csc_mode = video_request.at("encoder_csc_mode").get<int>();
+      requested.video_format = video_request.at("codec").get<int>();
+      requested.dynamic_range = video_request.at("ten_bit").get<bool>() ? 1 : 0;
+      requested.chroma = video_request.at("chroma").get<int>();
+      requested_video_format = video_request.at("negotiated_format").get<std::uint32_t>();
+      requested.audio_channels = audio_request.at("channels").get<int>();
+      requested.audio_packet_duration = audio_request.value("packet_duration_ms", 5);
+      requested.high_quality_audio = audio_request.value("high_quality", false);
+    } catch (const nlohmann::json::exception &) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_INVALID_REQUEST;
+      result.message = "Missing or invalid native session field";
+      return result;
+    }
+
+    const plank::shared_screen::stream_shape_t running {
+      controller_config.monitor.width,
+      controller_config.monitor.height,
+      controller_config.monitor.framerate,
+      controller_config.monitor.videoFormat,
+      controller_config.monitor.dynamicRange,
+      controller_config.monitor.chromaSamplingType,
+      controller_config.monitor.encoderCscMode,
+      controller_config.audio.channels,
+      controller_config.audio.packetDuration,
+      static_cast<bool>(controller_config.audio.flags[audio::config_t::HIGH_QUALITY]),
+    };
+    // Colour-conversion mode, Opus packet duration and the high-quality audio
+    // choice come from the viewer's own decoder, bitrate and network, not
+    // from its bookmark. The viewer decodes what the controller encodes and
+    // follows the audio layout in this reply, so they are not refused.
+    requested.encoder_csc_mode = running.encoder_csc_mode;
+    requested.audio_packet_duration = running.audio_packet_duration;
+    requested.high_quality_audio = running.high_quality_audio;
+    const auto mismatch = plank::shared_screen::shape_mismatch(running, requested);
+    const auto negotiated_video_format = negotiated_video_format_for_mode(shared.encoding_mode);
+    if (!mismatch.empty() || !negotiated_video_format ||
+        requested_video_format != *negotiated_video_format ||
+        launch_session->encoding_mode != shared.encoding_mode) {
+      BOOST_LOG(warning) << "Refusing shared screen viewer "sv << launch_session->authenticated_account
+                         << ": "sv << (mismatch.empty() ? "encoding mode"sv : mismatch)
+                         << " differs from the active stream"sv;
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+      result.message = "Shared screen settings differ from the active stream";
+      return result;
+    }
+    if (stream::session::viewer_count() >=
+        static_cast<unsigned>(config::plank_auth.shared_screen_max_viewers)) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+      result.message = "The shared screen viewer limit has been reached";
+      return result;
+    }
+
+    // Another account's viewer waits here, with its QUIC connection open,
+    // until the owner answers on the controller's client. The HTTP launch
+    // already returned: the HTTPS server must not block for the answer.
+    if (launch_session->owner_approval_required) {
+      if (!stream::session::accepts_shared_messages(*controller)) {
+        result.status = PLANK_TRANSPORT_SETUP_STATUS_AUTHORIZATION_FAILED;
+        result.message = "The owner's client cannot approve viewers";
+        return result;
+      }
+      switch (stream::session::ask_owner_to_admit(controller, launch_session->authenticated_account)) {
+        case stream::session::owner_answer_e::allowed:
+          break;
+        case stream::session::owner_answer_e::declined:
+          result.status = PLANK_TRANSPORT_SETUP_STATUS_AUTHORIZATION_FAILED;
+          result.message = "The owner declined";
+          return result;
+        case stream::session::owner_answer_e::timed_out:
+          result.status = PLANK_TRANSPORT_SETUP_STATUS_AUTHORIZATION_FAILED;
+          result.message = "The owner did not answer";
+          return result;
+        case stream::session::owner_answer_e::gone:
+          result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+          result.message = "There is no PLANK session to watch";
+          return result;
+      }
+      if (stream::session::state(*controller) != stream::session::state_e::RUNNING) {
+        result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+        result.message = "There is no PLANK session to watch";
+        return result;
+      }
+    }
+
+    // Pace the viewer at the controller's ceiling; the encoder is shared.
+    const auto ceiling = controller_config.monitor.bitrate;
+    const auto peak = ceiling * config::video.sw.vbv_maxrate_percentage / 100;
+    auto *endpoint = launch_session->plank_transport_endpoint ?
+      static_cast<PlankTransportNativeEndpoint *>(launch_session->plank_transport_endpoint.get()) :
+      nullptr;
+    if (!endpoint ||
+        plank_transport_native_set_video_bitrate(
+          endpoint, static_cast<std::uint32_t>(ceiling), static_cast<std::uint32_t>(peak)
+        ) != PLANK_TRANSPORT_OK) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_INTERNAL_ERROR;
+      result.message = "Unable to apply the shared video transport rate";
+      return result;
+    }
+
+    const auto audio_index = audio::map_stream(
+      controller_config.audio.channels,
+      controller_config.audio.flags[audio::config_t::HIGH_QUALITY]
+    );
+    if (audio_index < 0 || audio_index >= audio::MAX_STREAM_CONFIG) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+      result.message = "Unsupported audio layout";
+      return result;
+    }
+    const auto &opus = audio::stream_configs[audio_index];
+
+    auto viewer = stream::session::alloc_viewer(controller, *launch_session);
+    server.insert(viewer);
+    if (stream::session::start_viewer(*viewer)) {
+      server.remove(viewer);
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_INTERNAL_ERROR;
+      result.message = "Failed to attach the shared screen viewer";
+      return result;
+    }
+
+    result.status = PLANK_TRANSPORT_SETUP_STATUS_OK;
+    result.session = viewer;
+    const auto host_feature_flags =
+      static_cast<std::uint32_t>(platf::get_capabilities() |
+                                 platf::platform_caps::dynamic_video_bitrate |
+                                 platf::platform_caps::encoder_target_ack);
+    result.response = {
+      {"video_format", *negotiated_video_format},
+      {"host_feature_flags", host_feature_flags},
+      // The reference chain belongs to the controller; a viewer recovers
+      // from loss with a keyframe.
+      {"reference_frame_invalidation", 0},
+      {"audio", {
+        {"sample_rate", opus.sampleRate},
+        {"channels", opus.channelCount},
+        {"streams", opus.streams},
+        {"coupled_streams", opus.coupledStreams},
+        {"packet_duration_ms", controller_config.audio.packetDuration},
+        {"mapping", nlohmann::json::array()},
+      }},
+    };
+    for (int index = 0; index < opus.channelCount; ++index) {
+      result.response["audio"]["mapping"].push_back(opus.mapping[index]);
+    }
+    return result;
+  }
+
   void process_native_launch(const std::shared_ptr<launch_session_t> &launch_session) {
+    const bool viewer = launch_session &&
+                        launch_session->role == plank::shared_screen::role_e::viewer;
     auto complete_launch = util::fail_guard([&]() {
-      if (launch_session) {
+      // A viewer never took the controller's launch ownership.
+      if (launch_session && !viewer) {
         server.session_complete(launch_session->id);
       }
     });
@@ -496,7 +743,9 @@ namespace session_stream {
       nullptr,
       false
     );
-    auto start_result = start_native_session(launch_session, request_json);
+    auto start_result = viewer ?
+      start_native_viewer_session(launch_session, request_json) :
+      start_native_session(launch_session, request_json);
     nlohmann::json response_json = start_result.response;
     if (!start_result.message.empty()) {
       response_json["message"] = start_result.message;
@@ -527,6 +776,17 @@ namespace session_stream {
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     BOOST_LOG(info) << "Native QUIC session negotiation active"sv;
+    // Viewers negotiate on their own worker so a slow viewer never delays a
+    // controller launch. Sessions it starts are owned by the same server.
+    std::jthread viewer_worker {[&shutdown_event](std::stop_token stop_token) {
+      platf::set_thread_name("native-viewer-setup");
+      while (!stop_token.stop_requested() && !shutdown_event->peek()) {
+        auto launch_session = server.viewer_event.pop(500ms);
+        if (launch_session) {
+          process_native_launch(launch_session);
+        }
+      }
+    }};
     while (!shutdown_event->peek()) {
       auto launch_session = server.launch_event.pop(500ms);
       if (launch_session) {
@@ -538,6 +798,8 @@ namespace session_stream {
         server.clear(false);
       }
     }
+    viewer_worker.request_stop();
+    viewer_worker.join();
     terminate_sessions();
   }
 
