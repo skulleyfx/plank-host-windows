@@ -234,7 +234,7 @@ namespace platf::ndi_output {
         command_buffer.push_back(L'\0');
 
         // Suspended so it can be put in the job before it runs a single instruction.
-        PROCESS_INFORMATION info {};
+        PROCESS_INFORMATION process_info {};
         const BOOL created = CreateProcessW(
           exe_.c_str(),
           command_buffer.data(),
@@ -245,14 +245,14 @@ namespace platf::ndi_output {
           nullptr,
           exe_.parent_path().c_str(),
           &startup.StartupInfo,
-          &info
+          &process_info
         );
         DeleteProcThreadAttributeList(attrs);
         if (!created) {
           BOOST_LOG(error) << "NDI: could not start "sv << utf_utils::to_utf8(exe_.wstring()) << " ["sv << GetLastError() << ']';
           return false;
         }
-        handle_t process {info.hProcess}, thread {info.hThread};
+        handle_t process {process_info.hProcess}, thread {process_info.hThread};
 
         // Kill the helper if this process goes away, however it goes away.
         handle_t job {CreateJobObjectW(nullptr, nullptr)};
@@ -270,7 +270,7 @@ namespace platf::ndi_output {
         in_read_h.close();
         out_write_h.close();
 
-        BOOST_LOG(info) << "NDI helper started (pid "sv << info.dwProcessId << ')';
+        BOOST_LOG(info) << "NDI helper started (pid "sv << process_info.dwProcessId << ')';
         std::thread pump {pump_log, out_read};
 
         // Wait for exit or for a stop request (polled; the wait is short).
