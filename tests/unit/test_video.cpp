@@ -7,6 +7,8 @@
 
 // standard includes
 #include <algorithm>
+#include <chrono>
+#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -378,3 +380,19 @@ INSTANTIATE_TEST_SUITE_P(
     std::make_tuple(120, 11988, std::chrono::nanoseconds {8341666})  // 1e9 * 1001 / 120000
   )
 );
+
+TEST(VideoReprobeTest, ReprobeDecisionFollowsEncoderKindAndRateLimit) {
+  using clock = std::chrono::steady_clock;
+  const auto now = clock::now();
+  const auto interval = 30s;
+
+  // A hardware encoder is never re-probed.
+  EXPECT_FALSE(video::should_reprobe_encoders(true, false, std::nullopt, now, interval));
+  // Software or no encoder: re-probe when never attempted.
+  EXPECT_TRUE(video::should_reprobe_encoders(true, true, std::nullopt, now, interval));
+  EXPECT_TRUE(video::should_reprobe_encoders(false, false, std::nullopt, now, interval));
+  // Rate limited inside the interval, allowed at and after it.
+  EXPECT_FALSE(video::should_reprobe_encoders(true, true, now - 10s, now, interval));
+  EXPECT_TRUE(video::should_reprobe_encoders(true, true, now - 30s, now, interval));
+  EXPECT_TRUE(video::should_reprobe_encoders(false, false, now - 31s, now, interval));
+}

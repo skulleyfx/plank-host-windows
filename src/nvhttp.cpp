@@ -1876,6 +1876,12 @@ namespace nvhttp {
     }
 
     if (session_stream::session_count() == 0) {
+#ifdef _WIN32
+      // The host may have started with no usable output (another remote-desktop
+      // product held the console) and settled on a software encoder. Look again
+      // now that someone is connecting. Rate limited and off this thread inside.
+      video::reprobe_encoders_before_session();
+#endif
       if (!video::select_encoder_backend_for_session(
               launch_session->encoder_backend)) {
         tree.put("root.<xmlattr>.status_code", 503);
@@ -1916,6 +1922,7 @@ namespace nvhttp {
     }
 
     launch_session->authenticated_account = authenticated_identity(request);
+    launch_session->authenticated_peer = authentication_peer(request);
     launch_session->authentication_session = claim_authentication_session(request);
     if (!launch_session->authentication_session) {
       tree.put("root.<xmlattr>.status_code", 401);
@@ -2073,6 +2080,7 @@ namespace nvhttp {
     }
 
     launch_session->authenticated_account = authenticated_identity(request);
+    launch_session->authenticated_peer = authentication_peer(request);
     launch_session->authentication_session = claim_authentication_session(request);
     if (!launch_session->authentication_session) {
       tree.put("root.<xmlattr>.status_code", 401);

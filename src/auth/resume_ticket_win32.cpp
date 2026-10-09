@@ -9,12 +9,19 @@
  * keeps in memory only. Presenting it with the correct password skips the
  * second factor once; a new ticket is issued on every success.
  *
- * Tickets are bound to the account and client address, expire after
- * security.second_factor_resume_minutes (0 disables them), and are stored only
- * as SHA-256 hashes in %ProgramData%\PLANK so they survive host restarts.
+ * Tickets are bound to the account and client address and are stored only as
+ * SHA-256 hashes in %ProgramData%\PLANK so they survive host restarts. The
+ * window slides: a ticket is good for security.second_factor_resume_minutes
+ * (0 disables them) after the end of the last streaming activity, refreshed
+ * while a session is streaming and when it ends, but never later than
+ * security.second_factor_resume_max_hours after the sign-in that last used the
+ * second factor. Stored entries from the older format (a fixed expiry) are
+ * discarded, which costs one second-factor prompt after an upgrade.
  */
 
 #include "second_factor.h"
+
+#include "resume_window.h"
 
 #include <windows.h>
 
@@ -77,6 +84,20 @@ namespace plank::auth {
       return platf::appdata() / "resume-tickets.json";
     }
 
+    /// Whether a stored entry is in the current format and still inside both limits.
+    bool entry_is_current(const nlohmann::json &entry, std::int64_t now) {
+      if (!entry.is_object() || !entry.contains("format") || !entry["format"].is_number_integer() ||
+          entry["format"].get<int>() != resume_ticket_format || !entry.contains("hash") ||
+          !entry["hash"].is_string() || !entry.contains("signin") || !entry["signin"].is_number_integer() ||
+          !entry.contains("last_activity") || !entry["last_activity"].is_number_integer()) {
+        return false;
+      }
+      return resume_ticket_valid(now, entry["signin"].get<std::int64_t>(),
+                                 entry["last_activity"].get<std::int64_t>(),
+                                 config::plank_auth.second_factor_resume_minutes,
+                                 config::plank_auth.second_factor_resume_max_hours);
+    }
+
     nlohmann::json load_store() {
       std::ifstream in {store_path()};
       auto json = in ? nlohmann::json::parse(in, nullptr, false) : nlohmann::json::object();
@@ -86,7 +107,7 @@ namespace plank::auth {
       // Drop expired entries so the file cannot grow without bound.
       const auto now = unix_now();
       for (auto it = json.begin(); it != json.end();) {
-        if (!it->is_object() || it->value("expires", std::int64_t {0}) <= now) {
+        if (!entry_is_current(*it, now)) {
           it = json.erase(it);
         } else {
           ++it;
@@ -123,6 +144,17 @@ namespace plank::auth {
       static std::map<std::string, staged_t> staged;
       return staged;
     }
+
+    /// Original sign-in time of a ticket just spent, handed to the ticket issued next.
+    struct carried_t {
+      std::int64_t signin_at;
+      std::chrono::steady_clock::time_point carried_at;
+    };
+
+    std::map<std::string, carried_t> &carried_signins() {
+      static std::map<std::string, carried_t> carried;
+      return carried;
+    }
   }  // namespace
 
   void stage_resume_ticket(std::string_view username, std::string_view remote_host, std::string ticket) {
@@ -143,6 +175,7 @@ namespace plank::auth {
     }
     const auto key = key_for(username, remote_host);
     std::lock_guard lock {store_mutex()};
+    carried_signins().erase(key);
     const auto staged = staged_tickets().find(key);
     if (staged == staged_tickets().end()) {
       return false;
@@ -156,8 +189,12 @@ namespace plank::auth {
 
     auto store = load_store();
     const auto entry = store.find(key);
+    // load_store() has already dropped entries that are expired or in another format.
     const bool valid = entry != store.end() && entry->value("hash", "").size() == presented_hash.size() &&
                        CRYPTO_memcmp(entry->value("hash", "").data(), presented_hash.data(), presented_hash.size()) == 0;
+    if (valid) {
+      carried_signins()[key] = {entry->value("signin", std::int64_t {0}), std::chrono::steady_clock::now()};
+    }
     // Single use: whatever the outcome, the stored ticket is spent.
     if (entry != store.end()) {
       store.erase(entry);
@@ -180,11 +217,38 @@ namespace plank::auth {
     }
     std::lock_guard lock {store_mutex()};
     auto store = load_store();
-    store[key_for(username, remote_host)] = {
+    const auto key = key_for(username, remote_host);
+    const auto now = unix_now();
+    auto signin_at = now;
+    // A ticket issued after a resume keeps the time of the real second factor.
+    if (const auto carried = carried_signins().find(key); carried != carried_signins().end()) {
+      if (std::chrono::steady_clock::now() - carried->second.carried_at <= staged_lifetime) {
+        signin_at = carried->second.signin_at;
+      }
+      carried_signins().erase(carried);
+    }
+    store[key] = {
+      {"format", resume_ticket_format},
       {"hash", sha256_hex(ticket)},
-      {"expires", unix_now() + static_cast<std::int64_t>(minutes) * 60},
+      {"signin", signin_at},
+      {"last_activity", now},
     };
     save_store(store);
     return ticket;
+  }
+
+  void touch_resume_ticket(std::string_view username, std::string_view remote_host) {
+    if (config::plank_auth.second_factor_resume_minutes <= 0 || username.empty()) {
+      return;
+    }
+    const auto key = key_for(username, remote_host);
+    std::lock_guard lock {store_mutex()};
+    auto store = load_store();
+    const auto entry = store.find(key);
+    if (entry == store.end()) {
+      return;
+    }
+    (*entry)["last_activity"] = unix_now();
+    save_store(store);
   }
 }  // namespace plank::auth

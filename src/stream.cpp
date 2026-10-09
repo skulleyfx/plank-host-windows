@@ -124,6 +124,8 @@ namespace stream {
     uid_t plank_display_lease_uid {};  ///< PAM account that owns the display lease.
     std::shared_ptr<void> authentication_session;  ///< PAM lifetime retained until this stream is destroyed.
     std::string authenticated_account;  ///< Account that authenticated this stream.
+    std::string authenticated_peer;  ///< Client address that authenticated this stream.
+    std::chrono::steady_clock::time_point resume_ticket_next_touch {};  ///< When to next refresh the resume ticket's activity time.
     std::uint32_t plank_client_features {};  ///< PLANK feature bits the client advertised.
     std::uint32_t clipboard_generation {};  ///< Host clipboard change counter last seen by this stream.
     std::chrono::steady_clock::time_point clipboard_next_poll {};  ///< When to look at the host clipboard again.
@@ -246,6 +248,24 @@ namespace stream {
     if (!queue_clipboard_offer(session, text)) {
       BOOST_LOG(warning) << "Couldn't offer clipboard text to the client"sv;
     }
+  }
+
+  /**
+   * @brief Refresh the second-factor resume ticket's activity time about once a minute.
+   */
+  void poll_resume_ticket(session_t *session) {
+#ifdef _WIN32
+    // Keep the reconnect window open while this stream is up, so a drop at any
+    // point in a long session can still resume without a second-factor prompt.
+    const auto now = std::chrono::steady_clock::now();
+    if (now < session->resume_ticket_next_touch) {
+      return;
+    }
+    session->resume_ticket_next_touch = now + 60s;
+    plank::auth::touch_resume_ticket(session->authenticated_account, session->authenticated_peer);
+#else
+    (void) session;
+#endif
   }
 
   /**
@@ -1226,6 +1246,7 @@ namespace stream {
           }
 
           poll_clipboard(session);
+          poll_resume_ticket(session);
 #ifdef PLANK_TRANSPORT
           poll_adaptive_bitrate(session);
 #endif
@@ -1746,6 +1767,11 @@ namespace stream {
       }
 #endif
 
+#ifdef _WIN32
+      // The reconnect window counts from the end of streaming, so stamp it now.
+      plank::auth::touch_resume_ticket(session.authenticated_account, session.authenticated_peer);
+#endif
+
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
@@ -1844,6 +1870,7 @@ namespace stream {
         launch_session.plank_display_lease_uid;
       session->authentication_session = launch_session.authentication_session;
       session->authenticated_account = launch_session.authenticated_account;
+      session->authenticated_peer = launch_session.authenticated_peer;
       session->plank_client_features = launch_session.plank_feature_flags;
       session->plank_transport_endpoint = launch_session.plank_transport_endpoint;
       session->plank_feature_flags = launch_session.plank_feature_flags;

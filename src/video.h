@@ -752,6 +752,37 @@ namespace video {
    */
   int probe_encoders();
 
+  /**
+   * @brief Decide whether the encoder probe should be run again before a session.
+   *
+   * A host can start while another remote-desktop product holds the console, find
+   * no usable output, and settle on a software encoder that only does 8-bit 4:2:0.
+   * Re-probing when a session is about to start lets it pick up the GPU later.
+   *
+   * @param have_encoder Whether the last probe selected any encoder.
+   * @param encoder_is_software Whether the selected encoder is a software one.
+   * @param last_attempt When the previous re-probe was attempted, if ever.
+   * @param now Current time.
+   * @param min_interval Minimum time between re-probe attempts.
+   * @return True when a re-probe should be run now.
+   */
+  bool should_reprobe_encoders(bool have_encoder, bool encoder_is_software,
+                               std::optional<std::chrono::steady_clock::time_point> last_attempt,
+                               std::chrono::steady_clock::time_point now,
+                               std::chrono::seconds min_interval);
+
+  /**
+   * @brief Re-run the encoder probe before a session when only software (or nothing) is selected.
+   *
+   * Rate limited, bounded in time and run on its own thread so the caller (an HTTPS
+   * handler) never blocks on a hung driver. Keeps the previous selection if the
+   * probe fails or times out.
+   *
+   * @warning Only call when no client is actively streaming.
+   * @return True when a hardware encoder replaced a software or missing one.
+   */
+  bool reprobe_encoders_before_session();
+
   /** Return whether a named PLANK per-session encoder was qualified at startup. */
   bool encoder_backend_available(std::string_view backend);
 
