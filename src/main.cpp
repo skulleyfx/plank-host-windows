@@ -454,6 +454,7 @@ int main(int argc, char *argv[]) {
 
   httpThread.join();
   nativeSessionThread.join();
+  video::shutdown_encoder_reprobe();
 
   task_pool.stop();
   task_pool.join();
