@@ -2294,8 +2294,10 @@ namespace nvhttp {
       return false;
     }
     const auto identity = authenticated_identity(request);
+    // Only an account that is clearly not the desktop's owner is turned away. "none" (the Windows
+    // login screen) must still connect so the user can sign in or take over.
     if (identity.empty() ||
-        plank::session::desktop_owner_relation(identity) == plank::session::desktop_owner_e::same ||
+        plank::session::desktop_owner_relation(identity) != plank::session::desktop_owner_e::different ||
         (config::plank_auth.admin_desktop_override && plank::auth::account_is_plank_admin(identity))) {
       return false;
     }
