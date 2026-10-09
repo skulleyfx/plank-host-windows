@@ -160,6 +160,9 @@ namespace session_stream {
     bool start_viewer_setup(std::shared_ptr<launch_session_t> launch_session,
                             void (*negotiate)(const std::shared_ptr<launch_session_t> &)) {
       auto lock = viewer_setups_.lock();
+      if (closing_) {
+        return false;  // shutting down: join_viewer_setups() has run or is running
+      }
       std::erase_if(*viewer_setups_, [](const std::unique_ptr<viewer_setup_t> &setup) {
         return setup->done.load();
       });
@@ -179,12 +182,30 @@ namespace session_stream {
     }
 
     /**
+     * @brief Whether another viewer setup could start right now (advisory; start_viewer_setup decides).
+     */
+    bool viewer_setup_has_room() {
+      auto lock = viewer_setups_.lock();
+      if (closing_) {
+        return false;
+      }
+      std::size_t active = 0;
+      for (const auto &setup : *viewer_setups_) {
+        if (!setup->done.load()) {
+          ++active;
+        }
+      }
+      return active < static_cast<std::size_t>(config::plank_auth.shared_screen_max_viewers);
+    }
+
+    /**
      * @brief Wait for every viewer setup thread; used at shutdown.
      */
     void join_viewer_setups() {
       std::vector<std::unique_ptr<viewer_setup_t>> setups;
       {
         auto lock = viewer_setups_.lock();
+        closing_ = true;
         setups.swap(*viewer_setups_);
       }
       setups.clear();  // jthread joins
@@ -208,6 +229,7 @@ namespace session_stream {
       std::jthread thread;  ///< Negotiation thread; joined on destruction.
     };
     sync_util::sync_t<std::vector<std::unique_ptr<viewer_setup_t>>> viewer_setups_;  ///< Viewers being negotiated.
+    bool closing_ {false};  ///< Set once shutdown began; guarded by viewer_setups_.
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> session_slots_;
     // Retain ownership from HTTP acceptance through native setup. The setup
     // worker removes the request from launch_event while it waits for QUIC,
@@ -260,6 +282,10 @@ namespace session_stream {
   }
 
   void process_native_launch(const std::shared_ptr<launch_session_t> &launch_session);
+
+  bool viewer_launch_has_room() {
+    return server.viewer_setup_has_room();
+  }
 
   bool viewer_launch_raise(std::shared_ptr<launch_session_t> launch_session) {
     return server.start_viewer_setup(std::move(launch_session), &process_native_launch);
@@ -561,6 +587,42 @@ namespace session_stream {
     return result;
   }
 
+  /// Slots claimed by viewer setups that have passed the limit check but are not attached yet.
+  std::atomic_uint pending_viewer_slots {0};
+
+  /**
+   * @brief One viewer slot, reserved atomically against the attached viewers and the other setups.
+   *
+   * The plain viewer_count() check is not atomic with start_viewer(), so parallel setups could each
+   * pass it and overshoot the limit. Released on destruction: by then the viewer is either attached
+   * and counted, or the setup failed.
+   */
+  class viewer_slot_t {
+  public:
+    viewer_slot_t() = default;
+    viewer_slot_t(const viewer_slot_t &) = delete;
+    viewer_slot_t &operator=(const viewer_slot_t &) = delete;
+    ~viewer_slot_t() {
+      if (held_) {
+        --pending_viewer_slots;
+      }
+    }
+
+    bool reserve() {
+      const auto max = static_cast<unsigned>(config::plank_auth.shared_screen_max_viewers);
+      const unsigned before = pending_viewer_slots.fetch_add(1);
+      if (stream::session::viewer_count() + before >= max) {
+        --pending_viewer_slots;
+        return false;
+      }
+      held_ = true;
+      return true;
+    }
+
+  private:
+    bool held_ {false};
+  };
+
   /**
    * @brief Attach an admitted viewer to the running controller's stream.
    *
@@ -682,13 +744,15 @@ namespace session_stream {
         result.message = "There is no PLANK session to watch";
         return result;
       }
-      // Others may have joined while the owner was deciding.
-      if (stream::session::viewer_count() >=
-          static_cast<unsigned>(config::plank_auth.shared_screen_max_viewers)) {
-        result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
-        result.message = "The shared screen viewer limit has been reached";
-        return result;
-      }
+    }
+
+    // Others may have joined while the owner was deciding, and viewers set up in parallel: take a
+    // slot atomically, held until the viewer is attached (and so counted) or this setup fails.
+    viewer_slot_t slot;
+    if (!slot.reserve()) {
+      result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+      result.message = "The shared screen viewer limit has been reached";
+      return result;
     }
 
     // Pace the viewer at the controller's ceiling; the encoder is shared.

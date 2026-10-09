@@ -81,6 +81,11 @@ namespace session_stream {
   std::optional<shared_stream_t> shared_stream();
 
   /**
+   * @brief Whether another viewer setup could start now (a cheap pre-check; viewer_launch_raise decides).
+   */
+  bool viewer_launch_has_room();
+
+  /**
    * @brief Queue an admitted viewer launch for native QUIC negotiation.
    *
    * Each viewer is negotiated on its own thread and never takes the

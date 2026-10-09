@@ -2212,6 +2212,13 @@ namespace nvhttp {
     launch_session->admin_observer = consent == shared::consent_e::admit_admin_silently;
     launch_session->owner_approval_required = consent == shared::consent_e::ask_owner;
     launch_session->authenticated_account = identity;
+    // Checked before the sign-in is claimed, so a retry after "too many viewers" does not cost a new sign-in.
+    if (!session_stream::viewer_launch_has_room()) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Too many viewers are joining; try again");
+      tree.put(result_field, 0);
+      return true;
+    }
     launch_session->authentication_session = claim_authentication_session(request);
     if (!launch_session->authentication_session) {
       tree.put("root.<xmlattr>.status_code", 401);
