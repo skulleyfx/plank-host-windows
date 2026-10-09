@@ -146,11 +146,14 @@ namespace session_stream {
     safe::event_t<std::shared_ptr<launch_session_t>> viewer_event;  ///< Admitted shared screen viewers awaiting QUIC setup.
 
   private:
+    /**
+     * @brief The running controller and the stream viewers must match.
+     */
     struct controller_t {
-      std::weak_ptr<stream::session_t> session;
-      shared_stream_t stream;
+      std::weak_ptr<stream::session_t> session;  ///< Controller session; expires when it is joined.
+      shared_stream_t stream;  ///< Stream shape published to viewers.
     };
-    sync_util::sync_t<controller_t> controller_;
+    sync_util::sync_t<controller_t> controller_;  ///< Latest controller, for shared screen viewers.
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> session_slots_;
     // Retain ownership from HTTP acceptance through native setup. The setup
     // worker removes the request from launch_event while it waits for QUIC,
