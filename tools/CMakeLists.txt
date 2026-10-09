@@ -56,6 +56,9 @@ target_link_libraries(plank-ndi
         ${CMAKE_THREAD_LIBS_INIT}
         d3d11
         dxgi
+        dxguid
+        uuid
+        shell32
         user32
         ${PLATFORM_LIBRARIES})
 target_compile_options(plank-ndi PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
