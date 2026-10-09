@@ -418,3 +418,17 @@ TEST(VideoReprobeTest, LaunchRefusedWhileProbeStillRunningAfterWait) {
   EXPECT_EQ(video::reprobe_launch_verdict(reprobe_step_e::start_and_wait, false), reprobe_verdict_e::refuse);
   EXPECT_EQ(video::reprobe_launch_verdict(reprobe_step_e::wait, false), reprobe_verdict_e::refuse);
 }
+
+TEST(VideoReprobeTest, ReprobeRunsBeforeModeValidationOnlyWhenIdle) {
+  // The re-probe has to come first or a software-encoder host refuses every mode.
+  EXPECT_TRUE(video::reprobe_precedes_mode_validation(false));
+  // A stream or pending launch owns the encoder state; never re-probe under it.
+  EXPECT_FALSE(video::reprobe_precedes_mode_validation(true));
+}
+
+TEST(VideoReprobeTest, StatusPollKicksBackgroundProbeOnlyWhenIdleAndWarranted) {
+  EXPECT_TRUE(video::should_kick_background_reprobe(false, false, true));
+  EXPECT_FALSE(video::should_kick_background_reprobe(true, false, true));
+  EXPECT_FALSE(video::should_kick_background_reprobe(false, true, true));
+  EXPECT_FALSE(video::should_kick_background_reprobe(false, false, false));
+}

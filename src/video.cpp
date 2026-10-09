@@ -4328,6 +4328,41 @@ namespace video {
     return upgraded ? reprobe_result_e::upgraded : reprobe_result_e::kept;
   }
 
+  void kick_encoder_reprobe_async() {
+    using clock = std::chrono::steady_clock;
+    constexpr auto min_interval = 30s;
+
+    auto &w = reprobe_worker();
+    std::unique_lock lock {w.mutex};
+    if (w.running) {
+      return;
+    }
+    // A finished worker is reaped here so a thread is never left unjoined.
+    if (w.thread.joinable()) {
+      auto done = std::move(w.thread);
+      lock.unlock();
+      done.join();
+      lock.lock();
+      if (w.running) {
+        return;
+      }
+    }
+
+    const auto now = clock::now();
+    {
+      std::lock_guard state_lock {encoder_state_mutex};
+      if (!should_kick_background_reprobe(false, w.running,
+                                          should_reprobe_encoders(chosen_encoder != nullptr,
+                                                                  chosen_encoder && (chosen_encoder->flags & ALWAYS_REPROBE),
+                                                                  w.last_attempt, now, min_interval))) {
+        return;
+      }
+      w.previous_name = chosen_encoder ? chosen_encoder->name : "none"sv;
+    }
+    BOOST_LOG(info) << "Selected encoder is ["sv << w.previous_name << "]; re-probing for a hardware encoder in the background"sv;
+    start_reprobe_thread_locked(w, now);
+  }
+
   void shutdown_encoder_reprobe() {
     auto &w = reprobe_worker();
     std::unique_lock lock {w.mutex};

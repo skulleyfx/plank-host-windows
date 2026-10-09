@@ -1949,6 +1949,17 @@ namespace nvhttp {
 
     auto local_endpoint = request->local_endpoint();
 
+#ifdef _WIN32
+    // A host that settled on the software encoder advertises no PLANK modes. Look
+    // for the hardware encoder again in the background (rate limited, never waits)
+    // so it is usually back by the time someone clicks connect.
+    if (!video::encoder_probe_in_flight() &&
+        video::reprobe_precedes_mode_validation(session_stream::session_count() > 0 ||
+                                                session_stream::launch_session_pending())) {
+      video::kick_encoder_reprobe_async();
+    }
+#endif
+
     pt::ptree tree;
 
     tree.put("root.<xmlattr>.status_code", 200);
@@ -2046,6 +2057,34 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Re-check the video encoders before the requested mode is validated.
+   *
+   * Only Windows hosts re-probe: they can start on the software encoder while another
+   * remote-desktop product holds the console. The probe runs on its own thread and this
+   * waits about a second at most; if it is still running the launch is refused with a
+   * retryable 503 rather than proceeding while the encoder state is being rewritten.
+   *
+   * @param active_session Whether a stream is active or a launch is pending.
+   * @param tree Response tree to fill when the launch must be refused.
+   * @return False when the launch must be refused.
+   */
+  bool reprobe_encoders_if_idle(bool active_session, pt::ptree &tree) {
+#ifdef _WIN32
+    if (video::reprobe_precedes_mode_validation(active_session) &&
+        video::reprobe_encoders_before_session() == video::reprobe_result_e::busy) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message",
+               "Host is re-checking its video encoder; retry in a few seconds");
+      return false;
+    }
+#else
+    (void) active_session;
+    (void) tree;
+#endif
+    return true;
+  }
+
+  /**
    * @brief Launch the requested application for a GameStream session.
    *
    * @param host_audio Host audio.
@@ -2123,6 +2162,10 @@ namespace nvhttp {
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args);
     if (!validate_capture_source(*launch_session, tree)) {
+      tree.put("root.gamesession", 0);
+      return;
+    }
+    if (!reprobe_encoders_if_idle(active_session, tree)) {
       tree.put("root.gamesession", 0);
       return;
     }
@@ -2329,6 +2372,10 @@ namespace nvhttp {
     }
     const auto launch_session = make_launch_session(host_audio, args);
     if (!validate_capture_source(*launch_session, tree)) {
+      tree.put("root.resume", 0);
+      return;
+    }
+    if (!reprobe_encoders_if_idle(active_session, tree)) {
       tree.put("root.resume", 0);
       return;
     }

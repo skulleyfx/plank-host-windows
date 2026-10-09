@@ -818,6 +818,41 @@ namespace video {
    */
   reprobe_result_e reprobe_encoders_before_session();
 
+  /**
+   * @brief Pure decision: whether a launch re-probes the encoders before it validates the requested mode.
+   *
+   * On Windows the exact encoding modes are only advertised for a hardware encoder, so a host
+   * that started on the software encoder would refuse every mode before a later re-probe could
+   * run. The re-probe therefore comes first, and only when no session is using the encoder.
+   *
+   * @param session_active Whether a stream is active or a launch is pending.
+   */
+  constexpr bool reprobe_precedes_mode_validation(bool session_active) {
+    return !session_active;
+  }
+
+  /**
+   * @brief Pure decision: whether a status poll should start a background re-probe.
+   *
+   * @param session_active Whether a stream is active or a launch is pending.
+   * @param probe_in_flight Whether a probe is already running.
+   * @param reprobe_warranted Result of should_reprobe_encoders(), which includes the rate limit.
+   */
+  constexpr bool should_kick_background_reprobe(bool session_active, bool probe_in_flight, bool reprobe_warranted) {
+    return !session_active && !probe_in_flight && reprobe_warranted;
+  }
+
+  /**
+   * @brief Start a re-probe in the background without waiting for it.
+   *
+   * Used by status polls while the host sits on a software encoder, so the hardware encoder is
+   * usually back before the user connects. Rate limited like reprobe_encoders_before_session()
+   * and a no-op while a probe runs.
+   *
+   * @warning Only call when no client is streaming and no launch is pending.
+   */
+  void kick_encoder_reprobe_async();
+
   /** Return whether a background encoder re-probe is currently running. */
   bool encoder_probe_in_flight();
 
