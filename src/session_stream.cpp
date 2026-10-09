@@ -12,7 +12,9 @@ extern "C" {
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stop_token>
@@ -143,7 +145,50 @@ namespace session_stream {
     }
 
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;
-    safe::event_t<std::shared_ptr<launch_session_t>> viewer_event;  ///< Admitted shared screen viewers awaiting QUIC setup.
+
+    /**
+     * @brief Start one admitted viewer's native setup on its own thread.
+     *
+     * Each viewer may wait up to 30 s for the owner's answer, so viewers are
+     * negotiated concurrently, never queued behind one another or behind a
+     * controller launch. Bounded by the viewer limit.
+     *
+     * @param launch_session Admitted viewer launch.
+     * @param negotiate Setup function to run.
+     * @return False when too many viewers are already joining.
+     */
+    bool start_viewer_setup(std::shared_ptr<launch_session_t> launch_session,
+                            void (*negotiate)(const std::shared_ptr<launch_session_t> &)) {
+      auto lock = viewer_setups_.lock();
+      std::erase_if(*viewer_setups_, [](const std::unique_ptr<viewer_setup_t> &setup) {
+        return setup->done.load();
+      });
+      if (viewer_setups_->size() >=
+          static_cast<std::size_t>(config::plank_auth.shared_screen_max_viewers)) {
+        return false;
+      }
+      auto setup = std::make_unique<viewer_setup_t>();
+      auto *done = &setup->done;
+      setup->thread = std::jthread {[negotiate, done, launch_session = std::move(launch_session)]() {
+        platf::set_thread_name("native-viewer-setup");
+        negotiate(launch_session);
+        done->store(true);
+      }};
+      viewer_setups_->push_back(std::move(setup));
+      return true;
+    }
+
+    /**
+     * @brief Wait for every viewer setup thread; used at shutdown.
+     */
+    void join_viewer_setups() {
+      std::vector<std::unique_ptr<viewer_setup_t>> setups;
+      {
+        auto lock = viewer_setups_.lock();
+        setups.swap(*viewer_setups_);
+      }
+      setups.clear();  // jthread joins
+    }
 
   private:
     /**
@@ -154,6 +199,15 @@ namespace session_stream {
       shared_stream_t stream;  ///< Stream shape published to viewers.
     };
     sync_util::sync_t<controller_t> controller_;  ///< Latest controller, for shared screen viewers.
+
+    /**
+     * @brief One viewer's setup thread.
+     */
+    struct viewer_setup_t {
+      std::atomic_bool done {false};  ///< Set when negotiation finished.
+      std::jthread thread;  ///< Negotiation thread; joined on destruction.
+    };
+    sync_util::sync_t<std::vector<std::unique_ptr<viewer_setup_t>>> viewer_setups_;  ///< Viewers being negotiated.
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> session_slots_;
     // Retain ownership from HTTP acceptance through native setup. The setup
     // worker removes the request from launch_event while it waits for QUIC,
@@ -205,8 +259,10 @@ namespace session_stream {
     return shape;
   }
 
-  void viewer_launch_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.viewer_event.raise(std::move(launch_session));
+  void process_native_launch(const std::shared_ptr<launch_session_t> &launch_session);
+
+  bool viewer_launch_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.start_viewer_setup(std::move(launch_session), &process_native_launch);
   }
 
   struct native_start_result_t {
@@ -626,6 +682,13 @@ namespace session_stream {
         result.message = "There is no PLANK session to watch";
         return result;
       }
+      // Others may have joined while the owner was deciding.
+      if (stream::session::viewer_count() >=
+          static_cast<unsigned>(config::plank_auth.shared_screen_max_viewers)) {
+        result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+        result.message = "The shared screen viewer limit has been reached";
+        return result;
+      }
     }
 
     // Pace the viewer at the controller's ceiling; the encoder is shared.
@@ -776,17 +839,6 @@ namespace session_stream {
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     BOOST_LOG(info) << "Native QUIC session negotiation active"sv;
-    // Viewers negotiate on their own worker so a slow viewer never delays a
-    // controller launch. Sessions it starts are owned by the same server.
-    std::jthread viewer_worker {[&shutdown_event](std::stop_token stop_token) {
-      platf::set_thread_name("native-viewer-setup");
-      while (!stop_token.stop_requested() && !shutdown_event->peek()) {
-        auto launch_session = server.viewer_event.pop(500ms);
-        if (launch_session) {
-          process_native_launch(launch_session);
-        }
-      }
-    }};
     while (!shutdown_event->peek()) {
       auto launch_session = server.launch_event.pop(500ms);
       if (launch_session) {
@@ -798,8 +850,8 @@ namespace session_stream {
         server.clear(false);
       }
     }
-    viewer_worker.request_stop();
-    viewer_worker.join();
+    // Viewer setups notice the shutdown event within a quarter second.
+    server.join_viewer_setups();
     terminate_sessions();
   }
 

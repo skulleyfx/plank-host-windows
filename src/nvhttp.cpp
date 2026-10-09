@@ -2073,7 +2073,7 @@ namespace nvhttp {
         tree.put("root.PlankSharedStreamEncoderBackend", shared->encoder_backend);
         tree.put("root.PlankSharedStreamBitrateKbps", shared->bitrate_kbps);
         tree.put("root.PlankSharedStreamAudioChannels", shared->audio_channels);
-        tree.put("root.PlankSharedStreamViewers", stream::session::viewer_count());
+        tree.put("root.PlankSharedStreamViewers", stream::session::visible_viewer_count());
       }
     }
 #ifdef _WIN32
@@ -2227,6 +2227,14 @@ namespace nvhttp {
     }
 #endif
 
+    if (!session_stream::viewer_launch_raise(launch_session)) {
+      // Drop every launch credential just issued; the endpoint stops with it.
+      tree.clear();
+      tree.put(result_field, 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Too many viewers are joining; try again");
+      return true;
+    }
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put(result_field, 1);
     tree.put("root.PlankWorkerInstance", worker_instance_id());
@@ -2235,7 +2243,6 @@ namespace nvhttp {
     tree.put("root.PlankEncodingMode", launch_session->encoding_mode);
     tree.put("root.PlankSessionRole", std::string {shared::role_name(shared::role_e::viewer)});
     BOOST_LOG(info) << "Shared screen viewer admitted for native setup"sv;
-    session_stream::viewer_launch_raise(launch_session);
     return true;
   }
 
@@ -2265,6 +2272,43 @@ namespace nvhttp {
     (void) tree;
 #endif
     return true;
+  }
+
+  /**
+   * @brief Tell another account that the desktop is busy, so its client can offer to watch.
+   *
+   * With shared screen on, a launch from an account that neither owns the
+   * desktop nor is an admin with the override would be refused by the
+   * ownership gate, which also revokes its sign-in. While a stream is live
+   * that account can still ask to watch, so answer with the ordinary
+   * "session is active" conflict instead and keep its sign-in.
+   *
+   * @param request Authorized HTTPS request.
+   * @param tree Response tree to fill.
+   * @param result_field "root.gamesession" or "root.resume".
+   * @return True when the conflict was returned.
+   */
+  bool shared_screen_busy_for_other_account(const req_https_t &request, pt::ptree &tree, const char *result_field) {
+#ifdef _WIN32
+    if (!config::plank_auth.shared_screen || !session_stream::shared_stream()) {
+      return false;
+    }
+    const auto identity = authenticated_identity(request);
+    if (identity.empty() ||
+        plank::session::desktop_owner_relation(identity) == plank::session::desktop_owner_e::same ||
+        (config::plank_auth.admin_desktop_override && plank::auth::account_is_plank_admin(identity))) {
+      return false;
+    }
+    tree.put(result_field, 0);
+    tree.put("root.<xmlattr>.status_code", 409);
+    tree.put("root.<xmlattr>.status_message", "PLANK workstation session is active");
+    return true;
+#else
+    (void) request;
+    (void) tree;
+    (void) result_field;
+    return false;
+#endif
   }
 
   /**
@@ -2322,7 +2366,8 @@ namespace nvhttp {
 
     // A viewer asks to watch; it never owns the desktop, so it skips the
     // ownership gate and is admitted (or held for the owner) separately.
-    if (handle_viewer_join(args, request, tree, "root.gamesession")) {
+    if (handle_viewer_join(args, request, tree, "root.gamesession") ||
+        shared_screen_busy_for_other_account(request, tree, "root.gamesession")) {
       return;
     }
 
@@ -2531,7 +2576,8 @@ namespace nvhttp {
       }
     });
 
-    if (handle_viewer_join(request->parse_query_string(), request, tree, "root.resume")) {
+    if (handle_viewer_join(request->parse_query_string(), request, tree, "root.resume") ||
+        shared_screen_busy_for_other_account(request, tree, "root.resume")) {
       return;
     }
 

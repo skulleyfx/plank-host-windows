@@ -83,11 +83,15 @@ namespace plank::shared_screen::messages {
   /**
    * @brief Host to controller: a pending request ended without an answer.
    *
-   * @param id Request id.
+   * Join request ids and viewer ids are separate counters, so the kind says
+   * which prompt to close.
+   *
+   * @param id Request id (join) or viewer id (control).
+   * @param kind "join" or "control".
    * @return Encoded message.
    */
-  inline std::string request_cancel(const std::uint32_t id) {
-    return dump({{"t", "request_cancel"}, {"id", id}});
+  inline std::string request_cancel(const std::uint32_t id, const std::string_view kind) {
+    return dump({{"t", "request_cancel"}, {"id", id}, {"kind", std::string {kind}}});
   }
 
   /**

@@ -11,10 +11,14 @@
 
 // standard includes
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace plank::shared_screen {
   /// Client and host PLANK feature bit for shared screen. High bit, clear of
@@ -216,6 +220,110 @@ namespace plank::shared_screen {
   inline bool keyframe_request_allowed(const std::chrono::steady_clock::time_point last, const std::chrono::steady_clock::time_point now, const std::chrono::steady_clock::duration minimum_interval) {
     return last == std::chrono::steady_clock::time_point {} || now - last >= minimum_interval;
   }
+
+  /**
+   * @brief Keys and mouse buttons one input source is holding down on the host.
+   *
+   * When control moves away from a source, everything it still holds is
+   * released on the host, so a key pressed at the moment of hand-off cannot
+   * stay down. Works on raw KyProto payloads; the type and action values are
+   * the transport's (checked against its header where it is available).
+   */
+  class held_input_t {
+  public:
+    static constexpr std::uint8_t mouse_button_type = 2;  ///< KyProto mouse button.
+    static constexpr std::uint8_t keyboard_type = 5;  ///< KyProto keyboard.
+    static constexpr std::uint8_t press = 1;  ///< KyProto press action.
+    static constexpr std::uint8_t release = 0;  ///< KyProto release action.
+
+    /**
+     * @brief One synthetic release to inject.
+     */
+    struct release_t {
+      std::uint8_t type {};  ///< KyProto input type.
+      std::vector<std::uint8_t> payload;  ///< KyProto payload.
+    };
+
+    /**
+     * @brief Note an input message that was applied to the desktop.
+     *
+     * @param type KyProto input type.
+     * @param payload Payload.
+     * @param size Payload size.
+     */
+    void record(const std::uint8_t type, const std::uint8_t *payload, const std::size_t size) {
+      if (type == mouse_button_type && size >= 2) {
+        if (payload[1] == press) {
+          buttons_.insert(payload[0]);
+        } else if (payload[1] == release) {
+          buttons_.erase(payload[0]);
+        }
+      } else if (type == keyboard_type && size >= 5) {
+        const auto code = static_cast<std::uint16_t>((payload[0] << 8) | payload[1]);
+        if (payload[2] == press) {
+          keys_[code] = payload[4];
+        } else if (payload[2] == release) {
+          keys_.erase(code);
+        }
+      }
+    }
+
+    /**
+     * @brief Releases for everything held, and forget it.
+     *
+     * @return Messages to inject, keys first.
+     */
+    std::vector<release_t> take_releases() {
+      std::vector<release_t> releases;
+      for (const auto &[code, flags] : keys_) {
+        releases.push_back({keyboard_type, {static_cast<std::uint8_t>(code >> 8), static_cast<std::uint8_t>(code & 0xFF), release, 0, flags}});
+      }
+      for (const auto button : buttons_) {
+        releases.push_back({mouse_button_type, {button, release}});
+      }
+      keys_.clear();
+      buttons_.clear();
+      return releases;
+    }
+
+    /**
+     * @brief Whether nothing is held.
+     * @return True when no key or button is down.
+     */
+    bool empty() const {
+      return keys_.empty() && buttons_.empty();
+    }
+
+  private:
+    std::map<std::uint16_t, std::uint8_t> keys_;  ///< Held key code to its flags byte.
+    std::set<std::uint8_t> buttons_;  ///< Held mouse buttons.
+  };
+
+  /**
+   * @brief Counts one viewer's keyframe requests to drop a viewer that keeps asking.
+   */
+  class keyframe_budget_t {
+  public:
+    /**
+     * @brief Count a request and say whether the viewer is still within budget.
+     *
+     * @param now Current time.
+     * @param window Counting window.
+     * @param limit Most requests allowed in one window.
+     * @return False once the viewer has asked more than limit times in one window.
+     */
+    bool allow(const std::chrono::steady_clock::time_point now, const std::chrono::steady_clock::duration window, const int limit) {
+      if (count_ == 0 || now - window_start_ >= window) {
+        window_start_ = now;
+        count_ = 0;
+      }
+      return ++count_ <= limit;
+    }
+
+  private:
+    std::chrono::steady_clock::time_point window_start_ {};  ///< Start of the current window.
+    int count_ {};  ///< Requests in the current window.
+  };
 
   /**
    * @brief Single control token shared by the sessions of one host.

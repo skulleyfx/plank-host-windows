@@ -85,8 +85,24 @@ namespace stream {
   /// fan-out lock entirely when nobody is watching.
   static std::atomic_uint attached_viewers {0};
 
-  /// Shortest gap between keyframes one viewer may force on the shared encoder.
-  constexpr auto viewer_keyframe_interval = 1s;
+  /// Shortest gap between keyframes viewers may force on a controller's encoder, all viewers together.
+  constexpr auto viewer_keyframe_interval = 2s;
+
+  /// A viewer asking for more keyframes than this within viewer_keyframe_window is disconnected.
+  constexpr int viewer_keyframe_limit = 10;
+
+  /// Window for viewer_keyframe_limit.
+  constexpr auto viewer_keyframe_window = 20s;
+
+#ifdef PLANK_TRANSPORT
+  static_assert(plank::shared_screen::held_input_t::mouse_button_type == PLANK_TRANSPORT_INPUT_MOUSE_BUTTON);
+  static_assert(plank::shared_screen::held_input_t::keyboard_type == PLANK_TRANSPORT_INPUT_KEYBOARD);
+  static_assert(plank::shared_screen::held_input_t::press == PLANK_TRANSPORT_INPUT_ACTION_PRESS);
+  static_assert(plank::shared_screen::held_input_t::release == PLANK_TRANSPORT_INPUT_ACTION_RELEASE);
+#endif
+
+  /// Admin observers among the attached viewers; never shown to anyone.
+  static std::atomic_uint attached_admin_observers {0};
 
   /// Control-token id of a controller itself; viewer ids are 32-bit and never collide.
   constexpr std::uint64_t owner_token_id = 1ULL << 32;
@@ -175,7 +191,13 @@ namespace stream {
     const session_t *controller_id {};  ///< Viewer only: identity of that controller for fan-out matching.
     std::atomic_bool awaiting_keyframe {false};  ///< Viewer only: hold video until the next keyframe.
     std::uint64_t frame_base {};  ///< Viewer only: controller frame number just before its first keyframe.
-    std::chrono::steady_clock::time_point last_keyframe_request {};  ///< Viewer only: last keyframe it forced.
+    plank::shared_screen::keyframe_budget_t keyframe_budget;  ///< Viewer only: its keyframe requests (control thread).
+    std::atomic_bool viewer_keyframe_due {false};  ///< Controller only: a viewer needs a keyframe.
+    std::chrono::steady_clock::time_point last_viewer_keyframe {};  ///< Controller only: last viewer-forced keyframe (control thread).
+    std::optional<video::hdr_info_raw_t> last_hdr;  ///< Controller only: last HDR state sent, for viewers that join later (control thread).
+
+    std::mutex held_mutex;  ///< Guards held_input.
+    plank::shared_screen::held_input_t held_input;  ///< Keys and buttons this client holds down on the desktop.
     bool admin_observer {};  ///< Viewer only: a PLANK admin watching through the desktop override.
     std::uint32_t viewer_id {};  ///< Viewer only: host-assigned id the controller sees.
 
@@ -247,6 +269,50 @@ namespace stream {
   }
 
   /**
+   * @brief Release on the desktop every key and button a source still holds.
+   *
+   * Called whenever control moves away from a source, so nothing it pressed
+   * stays down. Injects into the controller's input devices without
+   * resetting them, so a connected tablet is not disturbed.
+   *
+   * @param source Client that lost control.
+   * @param controller Controller whose input devices drive the desktop.
+   */
+  static void release_held_input(session_t *source, session_t *controller) {
+#ifdef PLANK_TRANSPORT
+    std::vector<plank::shared_screen::held_input_t::release_t> releases;
+    {
+      std::lock_guard lock {source->held_mutex};
+      releases = source->held_input.take_releases();
+    }
+    for (auto &release : releases) {
+      input::native(controller->input, release.type, release.payload.data(), release.payload.size());
+    }
+#else
+    (void) source;
+    (void) controller;
+#endif
+  }
+
+  /**
+   * @brief Release what one viewer of a controller still holds.
+   *
+   * @param controller Controller.
+   * @param viewer_id Viewer that lost control.
+   */
+  static void release_viewer_input(session_t *controller, const std::uint64_t viewer_id) {
+    if (!controller->broadcast_ref || viewer_id == 0) {
+      return;
+    }
+    auto viewers = controller->broadcast_ref->viewers.lock();
+    for (auto *viewer : *controller->broadcast_ref->viewers) {
+      if (viewer->controller_id == controller && viewer->viewer_id == viewer_id) {
+        release_held_input(viewer, controller);
+      }
+    }
+  }
+
+  /**
    * @brief Send the controller the current list of visible viewers.
    *
    * Admins observing through the desktop override are never listed.
@@ -292,10 +358,11 @@ namespace stream {
       controller->control_token.take_back(owner_token_id);
     }
     if (pending != 0) {
-      queue_shared_message(controller, shared_messages::request_cancel(static_cast<std::uint32_t>(pending)));
+      queue_shared_message(controller, shared_messages::request_cancel(static_cast<std::uint32_t>(pending), "control"));
       queue_to_viewer(controller, pending, shared_messages::control_state(false, "denied"));
     }
     if (previous != owner_token_id) {
+      release_viewer_input(controller, previous);
       BOOST_LOG(info) << "Shared screen: the owner took control back"sv;
       queue_to_viewer(controller, previous, shared_messages::control_state(false, reason));
       queue_shared_message(controller, shared_messages::control_state(true, reason));
@@ -320,7 +387,7 @@ namespace stream {
     }
     if (expired != 0) {
       BOOST_LOG(info) << "Shared screen: a control request expired without an answer"sv;
-      queue_shared_message(controller, shared_messages::request_cancel(static_cast<std::uint32_t>(expired)));
+      queue_shared_message(controller, shared_messages::request_cancel(static_cast<std::uint32_t>(expired), "control"));
       queue_to_viewer(controller, expired, shared_messages::control_state(false, "denied"));
     }
   }
@@ -405,8 +472,10 @@ namespace stream {
         queue_to_viewer(session, message.id, shared_messages::control_state(message.allow, message.allow ? "granted" : "denied"));
         if (message.allow) {
           if (previous == owner_token_id) {
+            release_held_input(session, session);
             queue_shared_message(session, shared_messages::control_state(false, "granted"));
           } else {
+            release_viewer_input(session, previous);
             queue_to_viewer(session, previous, shared_messages::control_state(false, "taken_back"));
           }
           publish_watchers(session);
@@ -419,7 +488,8 @@ namespace stream {
       case client_type_e::control_request: {
         auto controller = session->controller.lock();
         auto result = plank::shared_screen::control_token_t::result_e::not_allowed;
-        if (controller && accepts_shared_messages(controller.get())) {
+        // An admin observes silently; to drive the desktop it uses takeover.
+        if (controller && !session->admin_observer && accepts_shared_messages(controller.get())) {
           std::lock_guard lock {controller->shared_mutex};
           result = controller->control_token.request(session->viewer_id);
           if (result == plank::shared_screen::control_token_t::result_e::ok) {
@@ -449,6 +519,7 @@ namespace stream {
           }
         }
         if (held) {
+          release_held_input(session, controller.get());
           BOOST_LOG(info) << "Shared screen viewer "sv << session->authenticated_account << " gave control back"sv;
           queue_shared_message(session, shared_messages::control_state(false, "released"));
           queue_shared_message(controller.get(), shared_messages::control_state(true, "returned"));
@@ -1200,7 +1271,9 @@ namespace stream {
     auto next_cursor_sample = std::chrono::steady_clock::now();
 
     while (!stop_token.stop_requested()) {
-      if (std::chrono::steady_clock::now() >= next_ownership_check) {
+      // A viewer may be another account the owner allowed to watch; the
+      // controller's own recheck ends it (and its viewers) on a desktop change.
+      if (!is_viewer(session) && std::chrono::steady_clock::now() >= next_ownership_check) {
         next_ownership_check = std::chrono::steady_clock::now() + ownership_check_period;
         if (plank::session::desktop_owner_relation(session->authenticated_account) ==
             plank::session::desktop_owner_e::different) {
@@ -1433,22 +1506,49 @@ namespace stream {
 #endif
 
   /**
-   * @brief Force a keyframe on a viewer's controller, at most once a second per viewer.
+   * @brief Ask for a keyframe on a viewer's controller.
    *
    * The reference chain belongs to the controller, so a viewer's loss can
-   * only be repaired with a keyframe that every client receives.
+   * only be repaired with a keyframe that every client receives. Requests
+   * from all viewers are coalesced and forced at most once per
+   * viewer_keyframe_interval by the control thread; a viewer that keeps
+   * asking is disconnected so it cannot degrade the owner's stream.
    *
    * @param viewer Viewer that lost video.
    */
   void request_controller_keyframe(session_t *viewer) {
-    const auto now = std::chrono::steady_clock::now();
-    if (!plank::shared_screen::keyframe_request_allowed(viewer->last_keyframe_request, now, viewer_keyframe_interval)) {
+    if (!viewer->keyframe_budget.allow(std::chrono::steady_clock::now(), viewer_keyframe_window, viewer_keyframe_limit)) {
+      BOOST_LOG(warning) << "Shared screen viewer "sv << viewer->authenticated_account
+                         << " keeps losing video (more than "sv << viewer_keyframe_limit
+                         << " keyframe requests in 20 s); disconnecting it to protect the owner's stream"sv;
+#ifdef PLANK_TRANSPORT
+      session::stop(*viewer, PLANK_TRANSPORT_TERMINATION_GRACEFUL);
+#else
+      session::stop(*viewer);
+#endif
       return;
     }
-    viewer->last_keyframe_request = now;
     if (auto controller = viewer->controller.lock()) {
-      controller->video.idr_events->raise(true);
+      controller->viewer_keyframe_due.store(true, std::memory_order_release);
     }
+  }
+
+  /**
+   * @brief Force a pending viewer keyframe on a controller, no more often than viewer_keyframe_interval.
+   *
+   * @param controller Controller, from the control thread.
+   */
+  void service_viewer_keyframe(session_t *controller) {
+    if (!controller->viewer_keyframe_due.load(std::memory_order_acquire)) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!plank::shared_screen::keyframe_request_allowed(controller->last_viewer_keyframe, now, viewer_keyframe_interval)) {
+      return;
+    }
+    controller->viewer_keyframe_due.store(false, std::memory_order_release);
+    controller->last_viewer_keyframe = now;
+    controller->video.idr_events->raise(true);
   }
 
 #ifdef PLANK_TRANSPORT
@@ -1646,7 +1746,17 @@ namespace stream {
           }
 
           if (!session->cursorThread.joinable()) {
+            // First pass after the setup reply. A viewer that joins after an
+            // HDR change gets the controller's current state.
+            if (is_viewer(session)) {
+              if (auto controller = session->controller.lock(); controller && controller->last_hdr) {
+                send_hdr_mode(session, std::make_unique<video::hdr_info_raw_t>(*controller->last_hdr));
+              }
+            }
             session->cursorThread = std::jthread(localCursorThread, session);
+          }
+          if (!is_viewer(session)) {
+            service_viewer_keyframe(session);
           }
 
           {
@@ -1681,6 +1791,9 @@ namespace stream {
           auto &hdr_queue = session->control.hdr_queue;
           while (hdr_queue->peek()) {
             auto hdr_info = hdr_queue->pop();
+            if (hdr_info && config::plank_auth.shared_screen) {
+              session->last_hdr.emplace(*hdr_info);
+            }
             if (hdr_info && attached_viewers.load() != 0) {
               auto viewers = ctx->viewers.lock();
               for (auto *viewer : *ctx->viewers) {
@@ -2146,6 +2259,9 @@ namespace stream {
         if (!controller) {
           continue;
         }
+        // Held across the token check and delivery, so a hand-off that
+        // releases this viewer's keys cannot miss one it is delivering now.
+        std::lock_guard held_lock {session->held_mutex};
         {
           std::lock_guard lock {controller->shared_mutex};
           if (!controller->control_token.accepts_input(session->viewer_id)) {
@@ -2155,6 +2271,8 @@ namespace stream {
         if (!input::native(controller->input, type, payload.data(), payload_size)) {
           BOOST_LOG(warning) << "Ignoring malformed input from a shared screen viewer: type="sv
                              << static_cast<unsigned>(type);
+        } else {
+          session->held_input.record(type, payload.data(), payload_size);
         }
         continue;
       }
@@ -2176,6 +2294,12 @@ namespace stream {
                          << static_cast<unsigned>(type) << ", size="sv << payload_size;
         session::stop(*session);
         return;
+      }
+      if (config::plank_auth.shared_screen) {
+        // Remember what the owner holds down, to release it if control is
+        // handed to a viewer mid-press.
+        std::lock_guard held_lock {session->held_mutex};
+        session->held_input.record(type, payload.data(), payload_size);
       }
     }
   }
@@ -2199,9 +2323,9 @@ namespace stream {
       session.setup_response_sent.store(true, std::memory_order_release);
       if (is_viewer(&session)) {
         // Keyframe on join: the viewer sees nothing until the shared encoder
-        // emits one, so ask for it now instead of waiting for loss recovery.
+        // emits one. Joins are coalesced with other viewers' requests.
         if (auto controller = session.controller.lock()) {
-          controller->video.idr_events->raise(true);
+          controller->viewer_keyframe_due.store(true, std::memory_order_release);
         }
       }
     }
@@ -2216,6 +2340,12 @@ namespace stream {
 
     unsigned viewer_count() {
       return attached_viewers.load();
+    }
+
+    unsigned visible_viewer_count() {
+      const auto all = attached_viewers.load();
+      const auto admins = attached_admin_observers.load();
+      return all > admins ? all - admins : 0;
     }
 
     bool accepts_shared_messages(const session_t &session) {
@@ -2242,11 +2372,13 @@ namespace stream {
                             std::chrono::seconds {shared_messages::answer_timeout_seconds};
       int answer = 0;
       bool gone = false;
+      auto shutdown_event = mail::man->event<bool>(mail::shutdown);
       {
         std::unique_lock lock {join_requests.mutex};
         while (true) {
           answer = join_requests.pending[id].answer;
-          gone = state(*controller) != state_e::RUNNING;
+          // A service stop must not wait out the owner's 30 seconds.
+          gone = state(*controller) != state_e::RUNNING || shutdown_event->peek();
           if (answer != 0 || gone || std::chrono::steady_clock::now() >= deadline) {
             break;
           }
@@ -2266,7 +2398,7 @@ namespace stream {
         return owner_answer_e::gone;
       }
       BOOST_LOG(info) << "Shared screen: the owner did not answer for "sv << account;
-      queue_shared_message(controller.get(), shared_messages::request_cancel(id));
+      queue_shared_message(controller.get(), shared_messages::request_cancel(id, "join"));
       return owner_answer_e::timed_out;
     }
 
@@ -2393,6 +2525,9 @@ namespace stream {
         if (found != list.end()) {
           list.erase(found);
           remaining = --attached_viewers;
+          if (session.admin_observer) {
+            --attached_admin_observers;
+          }
         } else {
           remaining = attached_viewers.load();
         }
@@ -2409,9 +2544,10 @@ namespace stream {
           controller->control_token.leave(session.viewer_id);
         }
         if (was_pending) {
-          queue_shared_message(controller.get(), shared_messages::request_cancel(session.viewer_id));
+          queue_shared_message(controller.get(), shared_messages::request_cancel(session.viewer_id, "control"));
         }
         if (was_holder) {
+          release_held_input(&session, controller.get());
           queue_shared_message(controller.get(), shared_messages::control_state(true, "returned"));
         }
         publish_watchers(controller.get());
@@ -2580,6 +2716,9 @@ namespace stream {
         auto viewers = session.broadcast_ref->viewers.lock();
         session.broadcast_ref->viewers->push_back(&session);
         viewers_now = ++attached_viewers;
+        if (session.admin_observer) {
+          ++attached_admin_observers;
+        }
       }
 #ifdef PLANK_TRANSPORT
       session.inputThread = std::jthread {nativeInputThread, &session};
