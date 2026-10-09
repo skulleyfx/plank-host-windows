@@ -101,6 +101,13 @@ namespace stream {
     unsigned viewer_count();
 
     /**
+     * @brief Number of attached viewers other than silent admin observers.
+     *
+     * @return Viewers anyone may be told about.
+     */
+    unsigned visible_viewer_count();
+
+    /**
      * @brief Whether a session's client understands shared screen messages.
      *
      * @param session Streaming session.

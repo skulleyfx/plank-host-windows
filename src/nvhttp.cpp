@@ -1680,7 +1680,7 @@ namespace nvhttp {
         tree.put("root.PlankSharedStreamEncoderBackend", shared->encoder_backend);
         tree.put("root.PlankSharedStreamBitrateKbps", shared->bitrate_kbps);
         tree.put("root.PlankSharedStreamAudioChannels", shared->audio_channels);
-        tree.put("root.PlankSharedStreamViewers", stream::session::viewer_count());
+        tree.put("root.PlankSharedStreamViewers", stream::session::visible_viewer_count());
       }
     }
 #ifdef _WIN32
