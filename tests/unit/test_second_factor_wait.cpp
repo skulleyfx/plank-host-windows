@@ -15,7 +15,8 @@ using namespace std::chrono_literals;
 using approval_e = fw::pending_approval_t::state_e;
 
 TEST(SecondFactorWait, ClampsRoundBudgetBelowTheClientRequestTimeout) {
-  EXPECT_EQ(fw::round_budget(fw::round_wait_default_ms), 3500ms);
+  EXPECT_EQ(fw::round_budget(fw::round_wait_default_ms), 3800ms);
+  EXPECT_EQ(fw::round_wait_default_ms, 3800);
   EXPECT_EQ(fw::round_budget(4000), 4000ms);
   EXPECT_EQ(fw::round_budget(0), 500ms);
   EXPECT_EQ(fw::round_budget(-1), 500ms);
@@ -37,12 +38,12 @@ TEST(SecondFactorWait, SixteenRoundClientCoversTheDuoPushLifetime) {
   // Alan's client allows 16 responses; the first carries the password and
   // the result of the 16th is never read, so 15 rounds wait on the push.
   constexpr int waiting_rounds = 15;
-  // 15 x 3.5 s = 52.5 s: DUO's push lifetime is about a minute, and the
-  // push is sent during the first round, so this leaves the usual margin.
-  EXPECT_GE(fw::client_coverage(waiting_rounds, fw::round_budget(fw::round_wait_default_ms)), 52s);
+  // 15 x 3.8 s = 57 s: just under DUO's 60 s push lifetime, and the push is
+  // sent during the first round, so nearly the whole lifetime is covered.
+  EXPECT_GE(fw::client_coverage(waiting_rounds, fw::round_budget(fw::round_wait_default_ms)), 57s);
   // The default must leave room inside the client's 5 s timeout for a new
-  // TCP + TLS handshake, the transfer and io-thread queueing.
-  EXPECT_LE(fw::round_budget(fw::round_wait_default_ms), 3500ms);
+  // TCP + TLS handshake, the transfer and io-thread queueing (1.2 s here).
+  EXPECT_LE(fw::round_budget(fw::round_wait_default_ms), 3800ms);
   // The previous fixed 1.5 s budget gave about 22 s.
   EXPECT_LT(fw::client_coverage(waiting_rounds, 1500ms), 25s);
   EXPECT_EQ(fw::client_coverage(-3, 4000ms), 0ms);
