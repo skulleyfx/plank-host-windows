@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -72,7 +73,15 @@ namespace stream {
     std::jthread audio_thread;  ///< Thread that sends encoded audio packets.
     std::jthread control_thread;  ///< Thread that runs native control and event delivery.
     sync_util::sync_t<std::vector<session_t *>> sessions;  ///< Active native sessions.
+    sync_util::sync_t<std::vector<session_t *>> viewers;  ///< View-only sessions fed by a controller's encoder.
   };
+
+  /// Viewers attached to any controller; lets the media threads skip the
+  /// fan-out lock entirely when nobody is watching.
+  static std::atomic_uint attached_viewers {0};
+
+  /// Shortest gap between keyframes one viewer may force on the shared encoder.
+  constexpr auto viewer_keyframe_interval = 1s;
 
   /**
    * @brief Runtime state for one audio/video streaming session.
@@ -147,7 +156,25 @@ namespace stream {
 
     std::atomic<session::state_e> state;  ///< Current lifecycle state observed by stream workers.
     std::atomic_bool setup_response_sent {false};  ///< Native setup reply delivered; control data may follow.
+
+    plank::shared_screen::role_e role {plank::shared_screen::role_e::controller};  ///< Controller, or a view-only viewer.
+    std::weak_ptr<session_t> controller;  ///< Viewer only: the session whose encoder feeds it.
+    const session_t *controller_id {};  ///< Viewer only: identity of that controller for fan-out matching.
+    std::atomic_bool awaiting_keyframe {false};  ///< Viewer only: hold video until the next keyframe.
+    std::uint64_t frame_base {};  ///< Viewer only: controller frame number just before its first keyframe.
+    std::chrono::steady_clock::time_point last_keyframe_request {};  ///< Viewer only: last keyframe it forced.
+    bool admin_observer {};  ///< Viewer only: a PLANK admin watching through the desktop override.
   };
+
+  /**
+   * @brief Whether a session is a view-only viewer.
+   *
+   * @param session Streaming session.
+   * @return True for viewers.
+   */
+  static bool is_viewer(const session_t *session) {
+    return session->role == plank::shared_screen::role_e::viewer;
+  }
 
   /**
    * @brief Start process-wide native media and control workers.
@@ -1048,6 +1075,25 @@ namespace stream {
   }
 #endif
 
+  /**
+   * @brief Force a keyframe on a viewer's controller, at most once a second per viewer.
+   *
+   * The reference chain belongs to the controller, so a viewer's loss can
+   * only be repaired with a keyframe that every client receives.
+   *
+   * @param viewer Viewer that lost video.
+   */
+  void request_controller_keyframe(session_t *viewer) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!plank::shared_screen::keyframe_request_allowed(viewer->last_keyframe_request, now, viewer_keyframe_interval)) {
+      return;
+    }
+    viewer->last_keyframe_request = now;
+    if (auto controller = viewer->controller.lock()) {
+      controller->video.idr_events->raise(true);
+    }
+  }
+
 #ifdef PLANK_TRANSPORT
   /**
    * @brief Handle a client event packet, currently clipboard text only.
@@ -1061,6 +1107,9 @@ namespace stream {
     }
     if (event.type != plank_event_clipboard_text) {
       return false;
+    }
+    if (is_viewer(session)) {
+      return true;  // a viewer never writes the host clipboard
     }
     if ((session->plank_client_features & plank::topology::feature_clipboard_text) == 0 ||
         !config::input.clipboard_text) {
@@ -1136,7 +1185,11 @@ namespace stream {
             session::stop(*session);
             return;
           }
-          session->video.idr_events->raise(true);
+          if (is_viewer(session)) {
+            request_controller_keyframe(session);
+          } else {
+            session->video.idr_events->raise(true);
+          }
           break;
         case PLANK_TRANSPORT_CONTROL_INVALIDATE_REFERENCE_FRAMES:
           if (control.payload_size != 2 * sizeof(std::uint32_t) ||
@@ -1145,6 +1198,10 @@ namespace stream {
             BOOST_LOG(error) << "Rejected malformed PlankTransport reference-frame request"sv;
             session::stop(*session);
             return;
+          }
+          if (is_viewer(session)) {
+            request_controller_keyframe(session);
+            break;
           }
           session->video.invalidate_ref_frames_events->raise(
             std::make_pair(plank_transport_control_read_u32(control.payload),
@@ -1159,6 +1216,12 @@ namespace stream {
             BOOST_LOG(error) << "Rejected malformed PlankTransport bitrate request"sv;
             session::stop(*session);
             return;
+          }
+          if (is_viewer(session)) {
+            // A viewer shares the controller's encoder; it is paced at the
+            // controller's ceiling and never changes the encoder target.
+            send_video_bitrate_applied(session, session->config.monitor.bitrate);
+            break;
           }
           session->mail->event<int>(mail::video_bitrate)->raise(*bitrate);
           send_video_bitrate_applied(session, *bitrate);
@@ -1225,14 +1288,26 @@ namespace stream {
             session->cursorThread = std::jthread(localCursorThread, session);
           }
 
-          poll_clipboard(session);
+          if (!is_viewer(session)) {
+            poll_clipboard(session);
 #ifdef PLANK_TRANSPORT
-          poll_adaptive_bitrate(session);
+            poll_adaptive_bitrate(session);
 #endif
+          }
 
           auto &hdr_queue = session->control.hdr_queue;
           while (hdr_queue->peek()) {
-            send_hdr_mode(session, hdr_queue->pop());
+            auto hdr_info = hdr_queue->pop();
+            if (hdr_info && attached_viewers.load() != 0) {
+              auto viewers = ctx->viewers.lock();
+              for (auto *viewer : *ctx->viewers) {
+                if (viewer->controller_id == session &&
+                    viewer->setup_response_sent.load(std::memory_order_acquire)) {
+                  send_hdr_mode(viewer, std::make_unique<video::hdr_info_raw_t>(*hdr_info));
+                }
+              }
+            }
+            send_hdr_mode(session, std::move(hdr_info));
           }
 
           auto &raw_hid_feedback_queue = session->control.raw_hid_feedback_queue;
@@ -1307,6 +1382,85 @@ namespace stream {
       session->controlEnd.raise(true);
     }
   }
+
+#ifdef PLANK_TRANSPORT
+  /**
+   * @brief Send one encoded frame to every viewer of the controller that encoded it.
+   *
+   * Encode once, send N times: viewers receive the controller's exact
+   * payload. A viewer that just joined waits for the next keyframe, and its
+   * frame numbers are rebased so its first frame is 1.
+   *
+   * @param controller Session whose encoder produced the frame.
+   * @param controller_info Frame description sent to the controller.
+   * @param payload Encoded frame, after IDR replacements.
+   */
+  void fan_out_video(session_t *controller, const PlankTransportNativeVideoFrameInfo &controller_info, const std::string_view payload) {
+    if (attached_viewers.load() == 0 || !controller->broadcast_ref) {
+      return;
+    }
+    const bool keyframe = (controller_info.flags & PLANK_TRANSPORT_NATIVE_VIDEO_FLAG_KEY) != 0;
+    auto viewers = controller->broadcast_ref->viewers.lock();
+    for (auto *viewer : *controller->broadcast_ref->viewers) {
+      if (viewer->controller_id != controller ||
+          viewer->state.load(std::memory_order_acquire) != session::state_e::RUNNING ||
+          !viewer->setup_response_sent.load(std::memory_order_acquire) ||
+          !viewer->plank_transport_endpoint) {
+        continue;
+      }
+      if (viewer->awaiting_keyframe.load(std::memory_order_acquire)) {
+        if (!keyframe) {
+          continue;
+        }
+        viewer->frame_base = controller_info.frame_number - 1;
+        viewer->awaiting_keyframe.store(false, std::memory_order_release);
+      }
+      auto frame_info = controller_info;
+      frame_info.frame_number = controller_info.frame_number - viewer->frame_base;
+      auto *endpoint = static_cast<PlankTransportNativeEndpoint *>(viewer->plank_transport_endpoint.get());
+      const auto result = plank_transport_native_video_send(
+        endpoint, &frame_info,
+        reinterpret_cast<const std::uint8_t *>(payload.data()), payload.size()
+      );
+      if (result < PLANK_TRANSPORT_OK) {
+        BOOST_LOG(info) << "Shared screen viewer video peer has closed (result "sv << result << ')';
+        session::stop(*viewer);
+      }
+    }
+  }
+
+  /**
+   * @brief Send one Opus packet to every viewer of the controller that captured it.
+   *
+   * @param controller Session whose audio capture produced the packet.
+   * @param packet_info Packet description sent to the controller; pts is per viewer.
+   * @param data Opus payload.
+   * @param size Payload size in bytes.
+   */
+  void fan_out_audio(session_t *controller, const PlankTransportNativeAudioPacketInfo &packet_info, const std::uint8_t *data, const std::size_t size) {
+    if (attached_viewers.load() == 0 || !controller->broadcast_ref) {
+      return;
+    }
+    auto viewers = controller->broadcast_ref->viewers.lock();
+    for (auto *viewer : *controller->broadcast_ref->viewers) {
+      if (viewer->controller_id != controller ||
+          viewer->state.load(std::memory_order_acquire) != session::state_e::RUNNING ||
+          !viewer->setup_response_sent.load(std::memory_order_acquire) ||
+          !viewer->plank_transport_endpoint) {
+        continue;
+      }
+      auto viewer_info = packet_info;
+      viewer_info.pts = viewer->audio.timestamp;
+      viewer->audio.timestamp += viewer->config.audio.packetDuration;
+      auto *endpoint = static_cast<PlankTransportNativeEndpoint *>(viewer->plank_transport_endpoint.get());
+      const auto result = plank_transport_native_audio_send(endpoint, &viewer_info, data, size);
+      if (result < PLANK_TRANSPORT_OK) {
+        BOOST_LOG(info) << "Shared screen viewer audio peer has closed (result "sv << result << ')';
+        session::stop(*viewer);
+      }
+    }
+  }
+#endif
 
   /**
    * @brief Submit complete encoded video frames to the native transport.
@@ -1415,6 +1569,7 @@ namespace stream {
       } else if (result == PLANK_TRANSPORT_DROPPED) {
         BOOST_LOG(warning) << "PlankTransport native video queue replaced an old frame"sv;
       }
+      fan_out_video(session, frame_info, payload);
 #else
       BOOST_LOG(error) << "PLANK Host was built without native video transport"sv;
       session::stop(*session);
@@ -1475,6 +1630,7 @@ namespace stream {
       } else if (result == PLANK_TRANSPORT_DROPPED) {
         BOOST_LOG(warning) << "PlankTransport native audio queue replaced an old packet"sv;
       }
+      fan_out_audio(session, packet_info, packet_data.begin(), packet_data.size());
 #else
       BOOST_LOG(error) << "PLANK Host was built without native audio transport"sv;
       session::stop(*session);
@@ -1596,6 +1752,11 @@ namespace stream {
         session::stop(*session);
         return;
       }
+      if (is_viewer(session)) {
+        // View-only: drain and discard. Neither input nor clipboard offers
+        // from a viewer ever reach the desktop.
+        continue;
+      }
       if (type == PLANK_TRANSPORT_INPUT_CLIPBOARD_OFFER) {
         if (!handle_client_clipboard_offer(
               session, payload.data(), payload_size)) {
@@ -1631,6 +1792,25 @@ namespace stream {
 
     void mark_setup_response_sent(session_t &session) {
       session.setup_response_sent.store(true, std::memory_order_release);
+      if (is_viewer(&session)) {
+        // Keyframe on join: the viewer sees nothing until the shared encoder
+        // emits one, so ask for it now instead of waiting for loss recovery.
+        if (auto controller = session.controller.lock()) {
+          controller->video.idr_events->raise(true);
+        }
+      }
+    }
+
+    plank::shared_screen::role_e role(const session_t &session) {
+      return session.role;
+    }
+
+    const config_t &stream_config(const session_t &session) {
+      return session.config;
+    }
+
+    unsigned viewer_count() {
+      return attached_viewers.load();
     }
 
     /**
@@ -1648,6 +1828,22 @@ namespace stream {
       session.cursorThread.request_stop();
       session.clipboardThread.request_stop();
       session.inputThread.request_stop();
+
+      // A viewer has nothing to show without its controller's encoder.
+      if (!is_viewer(&session) && attached_viewers.load() != 0 && session.broadcast_ref) {
+        auto viewers = session.broadcast_ref->viewers.lock();
+        for (auto *viewer : *session.broadcast_ref->viewers) {
+          if (viewer->controller_id == &session) {
+            BOOST_LOG(info) << "Ending shared screen viewer "sv << viewer->authenticated_account
+                            << " because the controlling stream stopped"sv;
+#ifdef PLANK_TRANSPORT
+            stop(*viewer, PLANK_TRANSPORT_TERMINATION_GRACEFUL);
+#else
+            stop(*viewer);
+#endif
+          }
+        }
+      }
     }
 
     void stop(session_t &session, const std::uint32_t termination_reason) {
@@ -1676,9 +1872,90 @@ namespace stream {
     }
 
     /**
+     * @brief Log why a session's native endpoint ended and its transport totals.
+     *
+     * @param session Session being joined.
+     */
+    void log_endpoint_summary(session_t &session) {
+#ifdef PLANK_TRANSPORT
+      if (session.plank_transport_endpoint) {
+        PlankTransportNativeStats stats {};
+        stats.struct_size = sizeof(stats);
+        auto *endpoint = static_cast<PlankTransportNativeEndpoint *>(session.plank_transport_endpoint.get());
+        std::array<char, 1024> endpoint_error {};
+        const auto endpoint_error_size = plank_transport_native_endpoint_last_error(
+          endpoint, endpoint_error.data(), endpoint_error.size()
+        );
+        if (endpoint_error_size != 0) {
+          BOOST_LOG(error) << "PlankTransport native endpoint ended: "sv
+                           << endpoint_error.data();
+        }
+        if (plank_transport_native_endpoint_stats(endpoint, &stats) == PLANK_TRANSPORT_OK) {
+          BOOST_LOG(info) << "PlankTransport native transport: video_sent="sv
+                          << stats.video_frames_sent << " frames/"sv
+                          << stats.video_bytes_sent << " bytes, send_queue_drops="sv
+                          << stats.video_send_drops << "; audio_sent="sv
+                          << stats.audio_packets_sent << " packets/"sv
+                          << stats.audio_bytes_sent << " bytes, send_queue_drops="sv
+                          << stats.audio_send_drops << "; input_received="sv
+                          << stats.input_packets_received << "; data_sent="sv
+                          << stats.data_packets_sent << " packets, data_received="sv
+                          << stats.data_packets_received << " packets, QUIC_packets_lost="sv
+                          << stats.quic_packets_lost << ", RTT="sv
+                          << stats.quic_rtt_us << " us, KyProto_drops="sv
+                          << stats.kyproto_packets_dropped;
+        }
+      }
+#else
+      (void) session;
+#endif
+    }
+
+    /**
+     * @brief Wait for a viewer's workers and detach it from the fan-out.
+     *
+     * A viewer owns no capture, encoder, input devices or display lease, so
+     * none of the controller's teardown applies to it.
+     *
+     * @param session Viewer session.
+     */
+    void join_viewer(session_t &session) {
+      if (session.cursorThread.joinable()) {
+        session.cursorThread.join();
+      }
+      if (session.inputThread.joinable()) {
+        session.inputThread.join();
+      }
+      session.controlEnd.view();
+
+      unsigned remaining = 0;
+      if (session.broadcast_ref) {
+        auto viewers = session.broadcast_ref->viewers.lock();
+        auto &list = *session.broadcast_ref->viewers;
+        const auto found = std::find(list.begin(), list.end(), &session);
+        if (found != list.end()) {
+          list.erase(found);
+          remaining = --attached_viewers;
+        } else {
+          remaining = attached_viewers.load();
+        }
+      }
+      log_endpoint_summary(session);
+      if (session.admin_observer) {
+        BOOST_LOG(info) << plank::shared_screen::admin_audit_line(session.authenticated_account, "observe"sv, false);
+      }
+      BOOST_LOG(info) << "Shared screen viewer "sv << session.authenticated_account
+                      << " left [viewers: "sv << remaining << ']';
+    }
+
+    /**
      * @brief Wait for worker threads owned by the session to exit.
      */
     void join(session_t &session) {
+      if (is_viewer(&session)) {
+        join_viewer(session);
+        return;
+      }
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
       // The alternative is that Sunshine can never start another session until it's manually restarted.
@@ -1715,36 +1992,7 @@ namespace stream {
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input, session.input_connection_id);
 
-#ifdef PLANK_TRANSPORT
-      if (session.plank_transport_endpoint) {
-        PlankTransportNativeStats stats {};
-        stats.struct_size = sizeof(stats);
-        auto *endpoint = static_cast<PlankTransportNativeEndpoint *>(session.plank_transport_endpoint.get());
-        std::array<char, 1024> endpoint_error {};
-        const auto endpoint_error_size = plank_transport_native_endpoint_last_error(
-          endpoint, endpoint_error.data(), endpoint_error.size()
-        );
-        if (endpoint_error_size != 0) {
-          BOOST_LOG(error) << "PlankTransport native endpoint ended: "sv
-                           << endpoint_error.data();
-        }
-        if (plank_transport_native_endpoint_stats(endpoint, &stats) == PLANK_TRANSPORT_OK) {
-          BOOST_LOG(info) << "PlankTransport native transport: video_sent="sv
-                          << stats.video_frames_sent << " frames/"sv
-                          << stats.video_bytes_sent << " bytes, send_queue_drops="sv
-                          << stats.video_send_drops << "; audio_sent="sv
-                          << stats.audio_packets_sent << " packets/"sv
-                          << stats.audio_bytes_sent << " bytes, send_queue_drops="sv
-                          << stats.audio_send_drops << "; input_received="sv
-                          << stats.input_packets_received << "; data_sent="sv
-                          << stats.data_packets_sent << " packets, data_received="sv
-                          << stats.data_packets_received << " packets, QUIC_packets_lost="sv
-                          << stats.quic_packets_lost << ", RTT="sv
-                          << stats.quic_rtt_us << " us, KyProto_drops="sv
-                          << stats.kyproto_packets_dropped;
-        }
-      }
-#endif
+      log_endpoint_summary(session);
 
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
@@ -1825,6 +2073,85 @@ namespace stream {
       }
 
       return 0;
+    }
+
+    int start_viewer(session_t &session) {
+      auto controller = session.controller.lock();
+      if (!is_viewer(&session) || !controller || !session.plank_transport_endpoint ||
+          state(*controller) != state_e::RUNNING || !controller->broadcast_ref) {
+        BOOST_LOG(error) << "Refusing to start a shared screen viewer without a running controller"sv;
+        return -1;
+      }
+
+      // Share the controller's broadcast context so the fan-out and the
+      // control thread see this viewer next to its controller.
+      session.broadcast_ref = broadcast.ref();
+      if (!session.broadcast_ref) {
+        return -1;
+      }
+
+      unsigned viewers_now = 0;
+      {
+        auto sessions = session.broadcast_ref->sessions.lock();
+        session.broadcast_ref->sessions->push_back(&session);
+      }
+      {
+        auto viewers = session.broadcast_ref->viewers.lock();
+        session.broadcast_ref->viewers->push_back(&session);
+        viewers_now = ++attached_viewers;
+      }
+#ifdef PLANK_TRANSPORT
+      session.inputThread = std::jthread {nativeInputThread, &session};
+#endif
+      session.state.store(state_e::RUNNING, std::memory_order_release);
+
+      if (session.admin_observer) {
+        BOOST_LOG(info) << plank::shared_screen::admin_audit_line(session.authenticated_account, "observe"sv, true);
+      }
+      BOOST_LOG(info) << "Shared screen viewer "sv << session.authenticated_account
+                      << " joined [viewers: "sv << viewers_now << ']';
+
+      // The controller may have stopped while this viewer was being attached;
+      // its stop() could not see the viewer yet.
+      if (state(*controller) != state_e::RUNNING) {
+        stop(session);
+      }
+      return 0;
+    }
+
+    std::shared_ptr<session_t> alloc_viewer(const std::shared_ptr<session_t> &controller, session_stream::launch_session_t &launch_session) {
+      auto session = std::make_shared<session_t>();
+      auto mail = std::make_shared<safe::mail_raw_t>();
+
+      session->role = plank::shared_screen::role_e::viewer;
+      session->controller = controller;
+      session->controller_id = controller.get();
+      session->awaiting_keyframe.store(true, std::memory_order_release);
+      session->admin_observer = launch_session.admin_observer;
+      session->config = controller->config;
+      session->shutdown_event = mail->event<bool>(mail::shutdown);
+      session->authentication_session = launch_session.authentication_session;
+      session->authenticated_account = launch_session.authenticated_account;
+      session->plank_transport_endpoint = launch_session.plank_transport_endpoint;
+      // Clipboard is never shared with a viewer, whatever the client offered.
+      session->plank_client_features = launch_session.plank_feature_flags &
+                                       ~plank::topology::feature_clipboard_sync;
+      session->plank_feature_flags = session->plank_client_features;
+
+      session->control.hdr_queue = mail->event<video::hdr_info_t>(mail::hdr);
+      session->control.raw_hid_feedback_queue = mail->queue<std::vector<std::uint8_t>>(mail::raw_hid_feedback);
+      session->control.cursor_shape_queue =
+        mail->queue<std::vector<std::vector<std::uint8_t>>>(mail::cursor_shape);
+      session->control.cursor_position_event =
+        mail->event<PLANK_CURSOR_POSITION_WIRE_MESSAGE>(mail::cursor_position);
+      session->control.clipboard_offer_queue =
+        mail->event<std::vector<std::vector<std::uint8_t>>>(mail::clipboard_offer);
+      session->video.idr_events = mail->event<bool>(mail::idr);
+      session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      session->audio.timestamp = 0;
+      session->state.store(state_e::STOPPED, std::memory_order_relaxed);
+      session->mail = std::move(mail);
+      return session;
     }
 
     /**

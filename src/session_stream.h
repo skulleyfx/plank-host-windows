@@ -9,9 +9,13 @@
 // standard includes
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <sys/types.h>
+
+// local includes
+#include "src/plank_shared_screen.h"
 
 namespace session_stream {
   /**
@@ -49,7 +53,39 @@ namespace session_stream {
     std::shared_ptr<void> authentication_session;  ///< PAM lifetime retained by PLANK streams.
     std::string authenticated_account;  ///< Account that authenticated this launch.
     std::shared_ptr<void> plank_transport_endpoint;  ///< Experimental QUIC data-plane lifetime.
+    plank::shared_screen::role_e role {plank::shared_screen::role_e::controller};  ///< Controller, or a shared screen viewer.
+    bool admin_observer {};  ///< Viewer admitted through the PLANK admin desktop override.
   };
+
+  /**
+   * @brief What a shared screen viewer must match, published while a controller streams.
+   */
+  struct shared_stream_t {
+    int width {};  ///< Encoded width.
+    int height {};  ///< Encoded height.
+    int fps {};  ///< Encoded frame rate.
+    int bitrate_kbps {};  ///< Controller's encoder ceiling.
+    int audio_channels {};  ///< Opus channel count.
+    std::string encoding_mode;  ///< Accepted PLANK encoding mode.
+    std::string capture_source;  ///< Accepted PLANK capture source.
+    std::string encoder_backend;  ///< Accepted PLANK encoder backend.
+  };
+
+  /**
+   * @brief The running controller's stream, if any.
+   * @return Stream a viewer must match, or no value when nothing is streaming.
+   */
+  std::optional<shared_stream_t> shared_stream();
+
+  /**
+   * @brief Queue an admitted viewer launch for native QUIC negotiation.
+   *
+   * Viewer setup runs on its own worker and never takes the controller's
+   * launch ownership, so a viewer connecting cannot block a controller.
+   *
+   * @param launch_session Viewer launch prepared by the launch handler.
+   */
+  void viewer_launch_raise(std::shared_ptr<launch_session_t> launch_session);
 
   /**
    * @brief Queue an authorized launch for native QUIC negotiation.

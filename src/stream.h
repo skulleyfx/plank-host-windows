@@ -14,6 +14,7 @@
 // local includes
 #include "audio.h"
 #include "crypto.h"
+#include "plank_shared_screen.h"
 #include "video.h"
 
 namespace stream {
@@ -58,6 +59,44 @@ namespace stream {
      * @return Allocated object or identifier, or an error value on failure.
      */
     std::shared_ptr<session_t> alloc(config_t &config, session_stream::launch_session_t &launch_session);
+    /**
+     * @brief Allocate a view-only session fed by a running controller's encoder.
+     *
+     * The viewer copies the controller's stream configuration and owns only
+     * its own transport endpoint; it never captures, encodes or injects input.
+     *
+     * @param controller Running controller session.
+     * @param launch_session Viewer launch session carrying its endpoint and account.
+     * @return Allocated viewer session.
+     */
+    std::shared_ptr<session_t> alloc_viewer(const std::shared_ptr<session_t> &controller, session_stream::launch_session_t &launch_session);
+    /**
+     * @brief Attach a view-only session to its controller's media fan-out.
+     *
+     * @param session Viewer from alloc_viewer().
+     * @return 0 on success; nonzero when the controller is gone.
+     */
+    int start_viewer(session_t &session);
+    /**
+     * @brief Role of a session.
+     *
+     * @param session Streaming session.
+     * @return Controller or viewer.
+     */
+    plank::shared_screen::role_e role(const session_t &session);
+    /**
+     * @brief Stream configuration negotiated for a session.
+     *
+     * @param session Streaming session.
+     * @return The session's configuration.
+     */
+    const config_t &stream_config(const session_t &session);
+    /**
+     * @brief Number of view-only sessions currently attached.
+     *
+     * @return Attached viewer count.
+     */
+    unsigned viewer_count();
     /**
      * @brief Start a streaming session for the supplied peer address.
      *
@@ -106,7 +145,7 @@ namespace stream {
     void mark_setup_response_sent(session_t &session);
 
     /**
-     * @brief Number of streams currently running.
+     * @brief Number of controller streams currently running; viewers are not counted.
      *
      * @return Running stream count.
      */
