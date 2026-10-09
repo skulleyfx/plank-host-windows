@@ -424,7 +424,7 @@ namespace plank::auth {
                       config::plank_auth.duo_integration_key, config::plank_auth.duo_secret_key,
                       config::plank_auth.duo_api_host, admission.id)
             .detach();
-        } catch (const std::system_error &e) {
+        } catch (const std::exception &e) {
           exchange_->cancel();
           duo_pushes().finish(admission.id);
           exchange_.reset();

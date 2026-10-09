@@ -2006,8 +2006,12 @@ namespace nvhttp {
     // A host that settled on the software encoder advertises no PLANK modes. Look
     // for the hardware encoder again in the background (rate limited, never waits)
     // so it is usually back by the time someone clicks connect.
-    if (!video::encoder_probe_in_flight() &&
-        video::reprobe_precedes_mode_validation(session_stream::session_count() > 0 ||
+    //
+    // Check the cheap encoder condition first so hardware-encoder hosts pay nothing,
+    // and never use session_count() here: it joins STOPPING sessions, which can take
+    // seconds on a status poll. running_count() and launch_session_pending() only read.
+    if (video::encoder_is_software_or_missing() && !video::encoder_probe_in_flight() &&
+        video::reprobe_precedes_mode_validation(stream::session::running_count() > 0 ||
                                                 session_stream::launch_session_pending())) {
       video::kick_encoder_reprobe_async();
     }
@@ -2254,6 +2258,24 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Restart the lease start timer once a launch holding the lease is answered 200.
+   *
+   * The lease timer is otherwise cancelled only when the media session allocates, so a lease
+   * acquired ~90 s earlier by 425 retries could be restored before that happens. Call after
+   * the launch is raised so the timer also sees it as pending.
+   */
+  void claim_display_lease_for_launch(uid_t authenticated_uid, const select_output_outcome_t &outcome) {
+#ifdef _WIN32
+    if (outcome.lease_held) {
+      plank::session::claim_display_lease(authenticated_uid);
+    }
+#else
+    (void) authenticated_uid;
+    (void) outcome;
+#endif
+  }
+
+  /**
    * @brief Re-check the video encoders before the requested mode is validated.
    *
    * Only Windows hosts re-probe: they can start on the software encoder while another
@@ -2467,21 +2489,6 @@ namespace nvhttp {
     }
 
     if (session_stream::session_count() == 0) {
-#ifdef _WIN32
-      // The host may have started with no usable output (another remote-desktop
-      // product held the console) and settled on a software encoder. Look again
-      // now that someone is connecting. Rate limited; the probe runs on its own
-      // thread and this handler (the single HTTPS thread) waits about a second at
-      // most. If the probe is still running the launch is refused with a retryable
-      // 503 rather than proceeding while the encoder state is being rewritten.
-      if (video::reprobe_encoders_before_session() == video::reprobe_result_e::busy) {
-        tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message",
-                 "Host is re-checking its video encoder; retry in a few seconds");
-        tree.put("root.gamesession", 0);
-        return;
-      }
-#endif
       if (!video::select_encoder_backend_for_session(
               launch_session->encoder_backend)) {
         tree.put("root.<xmlattr>.status_code", 503);
@@ -2546,6 +2553,7 @@ namespace nvhttp {
     tree.put("root.PlankEncodingMode", launch_session->encoding_mode);
 
     session_stream::launch_session_raise(launch_session);
+    claim_display_lease_for_launch(lease_uid, output_outcome);
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -2724,6 +2732,7 @@ namespace nvhttp {
     tree.put("root.PlankEncodingMode", launch_session->encoding_mode);
 
     session_stream::launch_session_raise(launch_session);
+    claim_display_lease_for_launch(lease_uid, output_outcome);
   }
 
   void start() {

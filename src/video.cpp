@@ -4251,6 +4251,11 @@ namespace video {
     }
   }  // namespace
 
+  bool encoder_is_software_or_missing() {
+    std::lock_guard state_lock {encoder_state_mutex};
+    return chosen_encoder == nullptr || (chosen_encoder->flags & ALWAYS_REPROBE);
+  }
+
   bool encoder_probe_in_flight() {
     return encoder_reprobe_running;
   }

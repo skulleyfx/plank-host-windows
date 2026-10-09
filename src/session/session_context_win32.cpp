@@ -37,6 +37,7 @@
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/plank_topology.h"
+#include "src/session_stream.h"
 
 using namespace std::literals;
 
@@ -382,8 +383,17 @@ namespace plank::session {
       const auto armed = lease_generation();
       lease_timer_id() = task_pool.pushDelayed([armed]() {
         std::lock_guard lock {lease_mutex()};
+        // An accepted launch still setting up its media session owns the displays;
+        // wait another period for it instead of restoring them underneath it.
+        const bool launch_pending = session_stream::launch_session_pending();
+        if (plank::topology::lease_timer_should_rearm(display_lease().has_value(), lease_stream_started(),
+                                                      armed, lease_generation(), launch_pending)) {
+          lease_timer_id() = nullptr;
+          arm_lease_timer_locked();
+          return;
+        }
         if (!plank::topology::lease_timer_should_release(display_lease().has_value(), lease_stream_started(),
-                                                         armed, lease_generation())) {
+                                                         armed, lease_generation(), launch_pending)) {
           return;
         }
         BOOST_LOG(warning) << "No PLANK stream started within "sv << lease_start_timeout.count()
@@ -620,6 +630,16 @@ namespace plank::session {
     // A stream now owns the lease; it is released when that stream ends.
     lease_stream_started() = true;
     cancel_lease_timer_locked();
+    return display_request_status::submitted;
+  }
+
+  display_request_status claim_display_lease(uid_t account_uid) {
+    std::lock_guard lock {lease_mutex()};
+    if (!display_lease() || display_lease()->lease_uid != account_uid) {
+      return display_request_status::unavailable;
+    }
+    // The launch was answered 200: give native setup a full period from now.
+    arm_lease_timer_locked();
     return display_request_status::submitted;
   }
 
