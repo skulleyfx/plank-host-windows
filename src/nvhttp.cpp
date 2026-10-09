@@ -1995,8 +1995,12 @@ namespace nvhttp {
     // A host that settled on the software encoder advertises no PLANK modes. Look
     // for the hardware encoder again in the background (rate limited, never waits)
     // so it is usually back by the time someone clicks connect.
-    if (!video::encoder_probe_in_flight() &&
-        video::reprobe_precedes_mode_validation(session_stream::session_count() > 0 ||
+    //
+    // Check the cheap encoder condition first so hardware-encoder hosts pay nothing,
+    // and never use session_count() here: it joins STOPPING sessions, which can take
+    // seconds on a status poll. running_count() and launch_session_pending() only read.
+    if (video::encoder_is_software_or_missing() && !video::encoder_probe_in_flight() &&
+        video::reprobe_precedes_mode_validation(stream::session::running_count() > 0 ||
                                                 session_stream::launch_session_pending())) {
       video::kick_encoder_reprobe_async();
     }

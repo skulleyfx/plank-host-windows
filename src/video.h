@@ -853,6 +853,9 @@ namespace video {
    */
   void kick_encoder_reprobe_async();
 
+  /** Return whether no encoder or only a software encoder is selected (cheap; takes the encoder state lock briefly). */
+  bool encoder_is_software_or_missing();
+
   /** Return whether a background encoder re-probe is currently running. */
   bool encoder_probe_in_flight();
 
