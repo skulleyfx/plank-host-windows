@@ -159,7 +159,7 @@ namespace platf::ndi_output {
       bool wait(std::chrono::milliseconds period) {
         std::unique_lock lock {mutex_};
         cv_.wait_for(lock, period, [this] {
-          return stop_;
+          return stop_.load();
         });
         return stop_;
       }
