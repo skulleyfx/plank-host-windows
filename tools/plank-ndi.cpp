@@ -26,6 +26,7 @@
 #define WIN32_LEAN_AND_MEAN
 // clang-format off
 #include <Windows.h>
+#include <shellapi.h>
 #include <d3d11.h>
 #include <dxgi1_5.h>
 // clang-format on
@@ -645,10 +646,20 @@ namespace {
   }
 }  // namespace
 
-int main(int argc, char *argv[]) {
+int main() {
+  // The narrow argv is in the ANSI code page, which turns non-ASCII source names
+  // and groups into '?'. The host passes UTF-16 on the command line, so read that
+  // (works with or without -municode) and hand NDI UTF-8.
   std::vector<std::string> args;
-  for (int i = 1; i < argc; ++i) {
-    args.emplace_back(argv[i]);
+  {
+    int wide_argc = 0;
+    LPWSTR *wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    if (wide_argv) {
+      for (int i = 1; i < wide_argc; ++i) {
+        args.push_back(to_utf8(wide_argv[i]));
+      }
+      LocalFree(wide_argv);
+    }
   }
   const auto options = pn::parse_helper_args(args);
   if (!options) {
