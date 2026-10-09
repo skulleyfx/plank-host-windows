@@ -568,6 +568,13 @@ namespace session_stream {
       controller_config.audio.packetDuration,
       static_cast<bool>(controller_config.audio.flags[audio::config_t::HIGH_QUALITY]),
     };
+    // Colour-conversion mode, Opus packet duration and the high-quality audio
+    // choice come from the viewer's own decoder, bitrate and network, not
+    // from its bookmark. The viewer decodes what the controller encodes and
+    // follows the audio layout in this reply, so they are not refused.
+    requested.encoder_csc_mode = running.encoder_csc_mode;
+    requested.audio_packet_duration = running.audio_packet_duration;
+    requested.high_quality_audio = running.high_quality_audio;
     const auto mismatch = plank::shared_screen::shape_mismatch(running, requested);
     const auto negotiated_video_format = negotiated_video_format_for_mode(shared.encoding_mode);
     if (!mismatch.empty() || !negotiated_video_format ||
