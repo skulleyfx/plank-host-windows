@@ -12,13 +12,17 @@ namespace topology = plank::topology;
 
 TEST(PlankTopology, PublishesVersionThirteenFeatureContract) {
   EXPECT_EQ(topology::protocol_version, 13U);
-#if defined(__linux__) && defined(SUNSHINE_BUILD_X11)
-  EXPECT_EQ(topology::feature_flags, 0x47FFFFU);
+#if (defined(__linux__) && defined(SUNSHINE_BUILD_X11)) || defined(_WIN32)
+  EXPECT_EQ(topology::feature_flags, 0x1C7FFFFU);
   EXPECT_NE(topology::feature_flags & topology::feature_clipboard_sync, 0U);
 #else
-  EXPECT_EQ(topology::feature_flags, 0x7FFFFU);
+  EXPECT_EQ(topology::feature_flags, 0x187FFFFU);
   EXPECT_EQ(topology::feature_flags & topology::feature_clipboard_sync, 0U);
 #endif
+  // PLANK 1.1 assigned 0x2000000 to Linux virtual-connector binding; this
+  // host must not advertise it, and its own bits must stay clear of it.
+  EXPECT_EQ(topology::feature_virtual_primary_connector, 0x2000000U);
+  EXPECT_EQ(topology::feature_flags & topology::feature_virtual_primary_connector, 0U);
   EXPECT_NE(topology::feature_flags & topology::feature_nvfbc_hevc10_nvenc, 0U);
   EXPECT_NE(topology::feature_flags & topology::feature_fixed_transport_mtu, 0U);
   EXPECT_NE(topology::feature_flags & topology::feature_session_takeover, 0U);

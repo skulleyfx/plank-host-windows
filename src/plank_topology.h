@@ -52,6 +52,10 @@ namespace plank::topology {
   constexpr std::uint32_t feature_two_screen_capture = 0x800000;
   // The client may ask the host to fit the encoder to its link per session.
   constexpr std::uint32_t feature_adaptive_bitrate = 0x1000000;
+  // PLANK 1.1 Linux hosts bind their first virtual connector (X11 DP-0) to the
+  // client-primary side under this bit. Windows hosts have no such connector,
+  // so they never advertise it; it is listed only so the value is not reused.
+  constexpr std::uint32_t feature_virtual_primary_connector = 0x2000000;
   constexpr std::uint32_t feature_flags =
     feature_output_topology |
     feature_selected_output |

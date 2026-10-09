@@ -2065,7 +2065,15 @@ namespace nvhttp {
     tree.put("root.PairStatus", authorization_status);
     tree.put("root.currentgame", current_appid);
     // Whether anyone is streaming, so clients can warn before taking over.
-    tree.put("root.PlankStreamActive", stream::session::running_count() > 0 ? 1 : 0);
+    const bool stream_active = stream::session::running_count() > 0;
+    tree.put("root.PlankStreamActive", stream_active ? 1 : 0);
+    // PLANK 1.1 clients show "In Session" from this nameless bit: a stream owns
+    // the host (or is being admitted), or someone is signed in at the desktop.
+    bool occupied = stream_active || session_stream::launch_session_pending();
+#ifdef _WIN32
+    occupied = occupied || !plank::session::signed_in_account().empty();
+#endif
+    tree.put("root.PlankOccupied", occupied ? 1 : 0);
     // What a shared screen viewer must match; only for authorized requests.
     if (authorization_status == 1 && config::plank_auth.shared_screen) {
       if (const auto shared = session_stream::shared_stream()) {
