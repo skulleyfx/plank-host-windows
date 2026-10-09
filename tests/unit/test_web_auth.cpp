@@ -1,7 +1,10 @@
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -170,4 +173,120 @@ TEST(WebAuthManager, ResolvesOnlyValidOperatingSystemAccounts) {
   embedded_nul.push_back('\0');
   embedded_nul.append("another-account");
   EXPECT_FALSE(auth::account_uid(embedded_nul));
+}
+
+namespace {
+  /**
+   * @brief Conversation whose response blocks until released, like a DUO wait.
+   */
+  class blocking_conversation_t: public auth::conversation_i {
+  public:
+    struct gate_t {
+      std::mutex mutex;
+      std::condition_variable changed;
+      bool entered = false;
+      bool released = false;
+      int responses = 0;
+    };
+
+    explicit blocking_conversation_t(std::shared_ptr<gate_t> gate):
+        gate_ {std::move(gate)} {
+    }
+
+    auth::step_t begin(std::uint64_t, std::string_view, std::string_view) override {
+      return {auth::step_t::state_e::challenge, {{4, "Waiting"}}, auth::phase_e::authenticate, 0};
+    }
+
+    auth::step_t respond(std::vector<std::string>) override {
+      std::unique_lock lock {gate_->mutex};
+      ++gate_->responses;
+      gate_->entered = true;
+      gate_->changed.notify_all();
+      gate_->changed.wait(lock, [this] {
+        return gate_->released;
+      });
+      return {auth::step_t::state_e::authenticated, {}, auth::phase_e::authenticated, 0};
+    }
+
+  private:
+    std::shared_ptr<gate_t> gate_;
+  };
+}  // namespace
+
+TEST(WebAuthManager, WaitingRoundOwnsItsConversationWithoutBlockingOthers) {
+  auto gate = std::make_shared<blocking_conversation_t::gate_t>();
+  int next = 0;
+  auth::web_auth_manager_t manager {
+    [gate]() { return std::make_unique<blocking_conversation_t>(gate); },
+    [&next](std::size_t) { return "id-" + std::to_string(next++); },
+  };
+  const auto challenge = manager.begin("test-user", "client");
+  ASSERT_EQ(challenge.state, auth::step_t::state_e::challenge);
+
+  auth::web_auth_step_t waited;
+  std::thread round([&] {
+    waited = manager.respond(challenge.conversation_id, "client", {""});
+  });
+  {
+    std::unique_lock lock {gate->mutex};
+    ASSERT_TRUE(gate->changed.wait_for(lock, std::chrono::seconds {5}, [&] {
+      return gate->entered;
+    }));
+  }
+
+  // Other requests proceed while the round waits: the manager mutex is free.
+  EXPECT_FALSE(manager.authorize("unknown-token", "client"));
+  // A replayed or concurrent response for the waiting conversation is refused
+  // and never reaches the conversation.
+  EXPECT_EQ(manager.respond(challenge.conversation_id, "client", {""}).state,
+            auth::step_t::state_e::denied);
+
+  {
+    std::lock_guard lock {gate->mutex};
+    gate->released = true;
+  }
+  gate->changed.notify_all();
+  round.join();
+
+  EXPECT_EQ(waited.state, auth::step_t::state_e::authenticated);
+  EXPECT_FALSE(waited.session_token.empty());
+  EXPECT_TRUE(manager.authorize(waited.session_token, "client"));
+  EXPECT_EQ(gate->responses, 1);
+  // The conversation became a token, so its ID cannot complete a second sign-in.
+  EXPECT_EQ(manager.respond(challenge.conversation_id, "client", {""}).state,
+            auth::step_t::state_e::denied);
+}
+
+TEST(WebAuthManager, WaitingRoundsCountTowardTheConversationLimit) {
+  auto gate = std::make_shared<blocking_conversation_t::gate_t>();
+  int next = 0;
+  auth::web_auth_manager_t manager {
+    [gate]() { return std::make_unique<blocking_conversation_t>(gate); },
+    [&next](std::size_t) { return "id-" + std::to_string(next++); },
+  };
+  std::vector<std::string> ids;
+  for (int i = 0; i < 32; ++i) {
+    const auto step = manager.begin("test-user", "client");
+    ASSERT_EQ(step.state, auth::step_t::state_e::challenge);
+    ids.push_back(step.conversation_id);
+  }
+  EXPECT_EQ(manager.begin("test-user", "client").state, auth::step_t::state_e::denied);
+
+  std::thread round([&] {
+    manager.respond(ids.front(), "client", {""});
+  });
+  {
+    std::unique_lock lock {gate->mutex};
+    ASSERT_TRUE(gate->changed.wait_for(lock, std::chrono::seconds {5}, [&] {
+      return gate->entered;
+    }));
+  }
+  // The waiting conversation is out of the map but still counts.
+  EXPECT_EQ(manager.begin("test-user", "client").state, auth::step_t::state_e::denied);
+  {
+    std::lock_guard lock {gate->mutex};
+    gate->released = true;
+  }
+  gate->changed.notify_all();
+  round.join();
 }

@@ -13,6 +13,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -63,6 +64,21 @@ namespace plank::auth {
      * @return Next challenge or a terminal result.
      */
     virtual factor_step_t respond(std::vector<std::string> responses) = 0;
+
+    /**
+     * @brief Record when the current sign-in round began.
+     *
+     * A provider that waits for an out-of-band decision charges earlier work
+     * in the same round (such as the password check) to its per-round budget.
+     *
+     * @param started Round start.
+     */
+    void start_round(std::chrono::steady_clock::time_point started) {
+      round_started_ = started;
+    }
+
+  protected:
+    std::chrono::steady_clock::time_point round_started_ {std::chrono::steady_clock::now()};  ///< Current round start.
   };
 
   /**

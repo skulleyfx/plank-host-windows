@@ -21,8 +21,10 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -55,6 +57,7 @@
 #include "auth/web_auth.h"
 #ifdef _WIN32
   #include "auth/second_factor.h"
+  #include "auth/second_factor_wait.h"
 #endif
 #include "display_device.h"
 #include "globals.h"
@@ -626,6 +629,76 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Advance a network PAM conversation and build its reply.
+   *
+   * May wait for a second factor for up to security.second_factor_round_wait_ms,
+   * so on Windows it runs on an auth-round worker, never the HTTPS thread.
+   *
+   * @param conversation_id Opaque conversation identifier.
+   * @param peer Normalized TLS peer address.
+   * @param responses Prompt responses; erased by the conversation.
+   * @return JSON reply body.
+   */
+  nlohmann::json advance_auth_conversation(const std::string &conversation_id, const std::string &peer,
+                                           std::vector<std::string> responses) {
+    const auto step = web_auth->respond(conversation_id, peer, std::move(responses));
+    auto result = auth_step_json(step);
+#ifdef _WIN32
+    if (step.state == plank::auth::step_t::state_e::authenticated) {
+      if (const auto identity = web_auth->identity(step.session_token, peer)) {
+        if (auto ticket = plank::auth::issue_resume_ticket(*identity, peer); !ticket.empty()) {
+          result["resume_ticket"] = std::move(ticket);
+        }
+      }
+    }
+#endif
+    return result;
+  }
+
+#ifdef _WIN32
+  /**
+   * @brief An authentication reply finished by an auth-round worker.
+   *
+   * Simple-Web-Server sends a response when its last reference is released,
+   * posting the write to the connection's strand, so another thread may
+   * finish it - but only while the server object exists. Shutdown therefore
+   * withdraws every pending reply before the server is destroyed, and a
+   * worker that finds its reply withdrawn drops its result.
+   */
+  struct deferred_auth_reply_t {
+    std::mutex mutex;  ///< Guards response.
+    resp_https_t response;  ///< Null once sent or withdrawn.
+  };
+
+  /// Most sign-in rounds advanced at once. Each lasts at most one round wait
+  /// plus the password check, and a busy reply makes the client stop cleanly.
+  constexpr std::size_t max_auth_round_workers = 16;
+
+  std::mutex deferred_auth_mutex;  ///< Guards deferred_auth_replies.
+  std::set<std::shared_ptr<deferred_auth_reply_t>> deferred_auth_replies;  ///< Replies a worker still owes.
+
+  plank::auth::factor_wait::worker_slots_t &auth_round_workers() {
+    static plank::auth::factor_wait::worker_slots_t slots {max_auth_round_workers};
+    return slots;
+  }
+
+  /**
+   * @brief Drop every reply still owed by a worker; called before the server is destroyed.
+   */
+  void withdraw_deferred_auth_replies() {
+    std::set<std::shared_ptr<deferred_auth_reply_t>> pending;
+    {
+      std::lock_guard lock {deferred_auth_mutex};
+      pending.swap(deferred_auth_replies);
+    }
+    for (const auto &reply : pending) {
+      std::lock_guard lock {reply->mutex};
+      reply->response.reset();
+    }
+  }
+#endif
+
+  /**
    * @brief Advance a network PAM conversation.
    *
    * @param response HTTPS response.
@@ -656,20 +729,66 @@ namespace nvhttp {
         explicit_bzero(stored.data(), stored.size());
       }
     }
-    const auto conversation_id = body["conversation_id"].get<std::string>();
-    const auto step = web_auth->respond(conversation_id, authentication_peer(request),
-                                        std::move(responses));
-    auto result = auth_step_json(step);
+    auto conversation_id = body["conversation_id"].get<std::string>();
+    auto peer = authentication_peer(request);
 #ifdef _WIN32
-    if (step.state == plank::auth::step_t::state_e::authenticated) {
-      if (const auto identity = web_auth->identity(step.session_token, authentication_peer(request))) {
-        if (auto ticket = plank::auth::issue_resume_ticket(*identity, authentication_peer(request)); !ticket.empty()) {
-          result["resume_ticket"] = std::move(ticket);
+    // A round may wait seconds for a DUO push and this server has one thread,
+    // so the round runs on a worker and the reply is sent from there. Other
+    // clients' serverinfo polls are answered meanwhile.
+    auto &workers = auth_round_workers();
+    if (!workers.try_acquire()) {
+      for (auto &value : responses) {
+        explicit_bzero(value.data(), value.size());
+      }
+      BOOST_LOG(warning) << "PLANK sign-in round refused: "sv << max_auth_round_workers << " rounds already in progress"sv;
+      write_auth_json(response, SimpleWeb::StatusCode::success_ok, {{"state", "busy"}});
+      return;
+    }
+    auto reply = std::make_shared<deferred_auth_reply_t>();
+    reply->response = response;
+    {
+      std::lock_guard lock {deferred_auth_mutex};
+      deferred_auth_replies.insert(reply);
+    }
+    auto finish = [reply, &workers](const nlohmann::json &result) {
+      {
+        std::lock_guard lock {reply->mutex};
+        if (reply->response) {
+          write_auth_json(reply->response, SimpleWeb::StatusCode::success_ok, result);
+          reply->response.reset();  // sends it
         }
       }
+      {
+        std::lock_guard lock {deferred_auth_mutex};
+        deferred_auth_replies.erase(reply);
+      }
+      workers.release();
+    };
+    // Shared so the password can still be erased if the worker fails to start.
+    auto owned = std::make_shared<std::vector<std::string>>(std::move(responses));
+    try {
+      std::thread([finish, owned, conversation_id = std::move(conversation_id), peer = std::move(peer)]() {
+        platf::set_thread_name("auth-round");
+        nlohmann::json result;
+        try {
+          result = advance_auth_conversation(conversation_id, peer, std::move(*owned));
+        } catch (const std::exception &e) {
+          BOOST_LOG(error) << "PLANK sign-in round failed: "sv << e.what();
+          result = auth_step_json({});  // denied
+        }
+        finish(result);
+      }).detach();
+    } catch (const std::system_error &e) {
+      for (auto &value : *owned) {
+        explicit_bzero(value.data(), value.size());
+      }
+      BOOST_LOG(error) << "PLANK sign-in round worker could not start: "sv << e.what();
+      finish({{"state", "busy"}});
     }
+#else
+    write_auth_json(response, SimpleWeb::StatusCode::success_ok,
+                    advance_auth_conversation(conversation_id, peer, std::move(responses)));
 #endif
-    write_auth_json(response, SimpleWeb::StatusCode::success_ok, result);
   }
 
   /**
@@ -2140,6 +2259,13 @@ namespace nvhttp {
     https_server.stop();
 
     ssl.join();
+#ifdef _WIN32
+    // Auth-round workers must not finish a reply once the server is gone.
+    withdraw_deferred_auth_replies();
+    if (!auth_round_workers().wait_idle(10s)) {
+      BOOST_LOG(warning) << "PLANK sign-in rounds still running at shutdown"sv;
+    }
+#endif
   }
 
 }  // namespace nvhttp

@@ -721,6 +721,7 @@ namespace config {
     30,  // lock_on_disconnect_delay
     {},  // admin_group: BUILTIN\Administrators
     false,  // admin_desktop_override: an admin cannot seize another user's desktop unless enabled
+    4000,  // second_factor_round_wait_ms: 15 waiting rounds of a 16-round client cover DUO's 60 s push
   };
 
   video_t video {
@@ -1593,6 +1594,8 @@ namespace config {
     int_between_f(vars, "lock_on_disconnect_delay", plank_auth.lock_on_disconnect_delay, {0, 3600});
     string_f(vars, "admin_group", plank_auth.admin_group);
     bool_f(vars, "admin_desktop_override", plank_auth.admin_desktop_override);
+    // Clients abandon a request after 5 s; see src/auth/second_factor_wait.h.
+    int_between_f(vars, "second_factor_round_wait_ms", plank_auth.second_factor_round_wait_ms, {500, 4500});
 
     bool_f(vars, "clipboard_text", input.clipboard_text);
 

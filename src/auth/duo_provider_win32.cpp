@@ -9,11 +9,15 @@
  * Only push approval is offered. The PLANK client answers every hidden-input
  * prompt with the account password, so a passcode prompt would send that
  * password to DUO; this provider therefore never issues one. A push is
- * awaited in short rounds of informational challenges because each client
- * request times out after five seconds.
+ * awaited in rounds of informational challenges because each client request
+ * times out after five seconds. The push and its polling run on a worker per
+ * sign-in; each round waits on it for security.second_factor_round_wait_ms
+ * (see second_factor_wait.h). Rounds run off the HTTPS thread, so the wait
+ * does not delay other clients.
  */
 
 #include "second_factor.h"
+#include "second_factor_wait.h"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -30,6 +34,7 @@
 #include <format>
 #include <map>
 #include <optional>
+#include <system_error>
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -50,11 +55,16 @@ namespace plank::auth {
   namespace {
     constexpr std::int32_t prompt_style_text_info = 4;  ///< PAM_TEXT_INFO.
 
-    /// Longest a login round waits for DUO. The client abandons a request after
-    /// 5 s and its host-status poll after 2 s, and both share one server thread.
-    constexpr auto round_budget = 1500ms;
     /// DUO expires a push after about a minute.
     constexpr auto push_deadline = 70s;
+    /// Most DUO workers at once. A worker lives for at most push_deadline plus
+    /// one poll after its sign-in ends, and needs a valid password to start.
+    constexpr std::size_t max_duo_workers = 16;
+
+    factor_wait::worker_slots_t &duo_workers() {
+      static factor_wait::worker_slots_t slots {max_duo_workers};
+      return slots;
+    }
 
     std::wstring widen(std::string_view text) {
       if (text.empty()) {
@@ -355,16 +365,19 @@ namespace plank::auth {
      * @brief State shared between a DUO exchange and its worker thread.
      *
      * The worker outlives the provider if a DUO call is still in flight when
-     * the login is abandoned, so the state is reference counted.
+     * the login is abandoned, so the state is reference counted. The first
+     * decision is final (see pending_approval_t).
      */
-    struct duo_exchange_t {
-      std::mutex mutex;
-      std::condition_variable changed;
-      factor_step_t::state_e state {factor_step_t::state_e::challenge};
-      std::string message {"Contacting DUO..."};
-      std::string detail;
-      std::string user_message;
-      std::atomic_bool cancelled {false};
+    using duo_exchange_t = factor_wait::pending_approval_t;
+    using approval_e = factor_wait::pending_approval_t::state_e;
+
+    /**
+     * @brief Return a worker slot when the DUO worker exits by any path.
+     */
+    struct worker_slot_guard_t {
+      ~worker_slot_guard_t() {
+        duo_workers().release();
+      }
     };
 
     class duo_provider_t final: public second_factor_t {
@@ -375,16 +388,29 @@ namespace plank::auth {
 
       ~duo_provider_t() override {
         if (exchange_) {
-          exchange_->cancelled = true;
+          exchange_->cancel();
         }
       }
 
       factor_step_t begin(std::string_view username, std::string_view remote_host) override {
-        exchange_ = std::make_shared<duo_exchange_t>();
-        std::thread(run, exchange_, duo_username(username), std::string {remote_host}, failmode_,
-                    config::plank_auth.duo_integration_key, config::plank_auth.duo_secret_key,
-                    config::plank_auth.duo_api_host)
-          .detach();
+        if (!duo_workers().try_acquire()) {
+          // Fail closed: never degrade to password-only because DUO is busy.
+          return {factor_step_t::state_e::denied, {},
+                  std::format("{} DUO sign-ins already waiting", max_duo_workers),
+                  "Too many sign-ins are waiting for DUO. Try again in a minute."};
+        }
+        exchange_ = std::make_shared<duo_exchange_t>("Contacting DUO...");
+        try {
+          std::thread(run, exchange_, duo_username(username), std::string {remote_host}, failmode_,
+                      config::plank_auth.duo_integration_key, config::plank_auth.duo_secret_key,
+                      config::plank_auth.duo_api_host)
+            .detach();
+        } catch (const std::system_error &e) {
+          duo_workers().release();
+          exchange_.reset();
+          return {factor_step_t::state_e::denied, {}, std::string {"DUO worker could not start: "} + e.what(),
+                  "DUO could not be reached, so sign-in was refused."};
+        }
         return wait_round();
       }
 
@@ -396,33 +422,30 @@ namespace plank::auth {
       }
 
     private:
-      /// Wait briefly for the worker so a login round never outlasts the client's timeout.
+      /// Wait for the worker, but end the round before the client's 5 s request timeout.
       factor_step_t wait_round() {
-        std::unique_lock lock {exchange_->mutex};
-        exchange_->changed.wait_for(lock, round_budget, [this] {
-          return exchange_->state != factor_step_t::state_e::challenge;
-        });
-        if (exchange_->state == factor_step_t::state_e::challenge) {
-          return {factor_step_t::state_e::challenge,
-                  {prompt_t {prompt_style_text_info, exchange_->message}}, "waiting for DUO"};
+        const auto budget = factor_wait::round_budget(config::plank_auth.second_factor_round_wait_ms);
+        const auto result = exchange_->wait_until(round_started_ + budget);
+        switch (result.state) {
+          case approval_e::approved:
+            return {factor_step_t::state_e::approved, {}, result.detail, result.user_message};
+          case approval_e::denied:
+            return {factor_step_t::state_e::denied, {}, result.detail, result.user_message};
+          case approval_e::waiting:
+          default:
+            return {factor_step_t::state_e::challenge,
+                    {prompt_t {prompt_style_text_info, result.message}}, "waiting for DUO"};
         }
-        return {exchange_->state, {}, exchange_->detail, exchange_->user_message};
       }
 
       static void finish(duo_exchange_t &exchange, factor_step_t::state_e state, std::string detail,
                          std::string user_message = {}) {
-        {
-          std::lock_guard lock {exchange.mutex};
-          exchange.state = state;
-          exchange.detail = std::move(detail);
-          exchange.user_message = std::move(user_message);
-        }
-        exchange.changed.notify_all();
+        exchange.settle(state == factor_step_t::state_e::approved ? approval_e::approved : approval_e::denied,
+                        std::move(detail), std::move(user_message));
       }
 
       static void progress(duo_exchange_t &exchange, std::string message) {
-        std::lock_guard lock {exchange.mutex};
-        exchange.message = std::move(message);
+        exchange.progress(std::move(message));
       }
 
       static void unreachable(duo_exchange_t &exchange, factor_failmode_e failmode,
@@ -440,6 +463,7 @@ namespace plank::auth {
 
       static void run(std::shared_ptr<duo_exchange_t> exchange, std::string username, std::string remote_host,
                       factor_failmode_e failmode, std::string ikey, std::string skey, std::string host) {
+        const worker_slot_guard_t slot;  // taken by begin()
         platf::set_thread_name("duo-auth");
         const duo_client_t client {std::move(ikey), std::move(skey), std::move(host)};
         std::map<std::string, std::string> params {{"username", username}};
@@ -514,11 +538,12 @@ namespace plank::auth {
           return;
         }
         const auto txid = auth->value("txid", "");
-        BOOST_LOG(info) << "DUO push sent for " << username << " to " << device_name;
+        BOOST_LOG(info) << "DUO push sent for " << username << " to " << device_name << "; sign-in rounds wait up to "
+                        << factor_wait::round_budget(config::plank_auth.second_factor_round_wait_ms).count() << " ms";
         progress(*exchange, "DUO push sent to " + device_name + ". Approve it to continue.");
 
         const auto deadline = std::chrono::steady_clock::now() + push_deadline;
-        while (!exchange->cancelled && std::chrono::steady_clock::now() < deadline) {
+        while (!exchange->cancelled() && std::chrono::steady_clock::now() < deadline) {
           const auto http = client.call("GET", "/auth/v2/auth_status", {{"txid", txid}}, 15s);
           if (http.timed_out) {
             continue;  // long poll expired without a decision
@@ -550,7 +575,7 @@ namespace plank::auth {
           std::this_thread::sleep_for(1s);
         }
         finish(*exchange, factor_step_t::state_e::denied,
-               exchange->cancelled ? "DUO exchange abandoned" : "DUO push timed out",
+               exchange->cancelled() ? "DUO exchange abandoned" : "DUO push timed out",
                "The DUO push was not approved in time.");
       }
 

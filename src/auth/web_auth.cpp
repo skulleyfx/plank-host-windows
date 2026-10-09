@@ -80,7 +80,7 @@ namespace plank::auth {
     std::lock_guard lock {mutex_};
     expire_locked();
     if (username.empty() || username.size() > 256 || remote_host.empty() ||
-        remote_host.size() > 256 || conversations_.size() + tokens_.size() >= 32) {
+        remote_host.size() > 256 || conversations_.size() + tokens_.size() + in_flight_ >= 32) {
       return {};
     }
     std::shared_ptr<conversation_i> conversation = factory_();
@@ -106,19 +106,44 @@ namespace plank::auth {
   web_auth_step_t web_auth_manager_t::respond(std::string_view conversation_id,
                                               std::string_view remote_host,
                                               std::vector<std::string> responses) {
+    std::string id;
+    entry_t entry;
+    {
+      std::lock_guard lock {mutex_};
+      expire_locked();
+      const auto found = conversations_.find(std::string {conversation_id});
+      if (found == conversations_.end() || found->second.remote_host != remote_host) {
+        erase(responses);
+        return {};
+      }
+      id = found->first;
+      entry = std::move(found->second);
+      conversations_.erase(found);
+      ++in_flight_;
+    }
+
+    // A round may wait on a second factor (a DUO push), so it runs without
+    // the mutex: token checks for other clients must not queue behind it.
+    // The conversation is out of the map, so this call owns it exclusively
+    // and a concurrent or replayed response for the same ID is refused.
+    struct in_flight_guard_t {
+      web_auth_manager_t &manager;
+
+      ~in_flight_guard_t() {
+        std::lock_guard lock {manager.mutex_};
+        --manager.in_flight_;
+      }
+    };
+
+    std::optional<step_t> step;
+    {
+      const in_flight_guard_t guard {*this};
+      step.emplace(entry.conversation->respond(std::move(responses)));
+    }
     std::lock_guard lock {mutex_};
     expire_locked();
-    const auto found = conversations_.find(std::string {conversation_id});
-    if (found == conversations_.end() || found->second.remote_host != remote_host) {
-      erase(responses);
-      return {};
-    }
-    auto id = found->first;
-    auto entry = std::move(found->second);
-    conversations_.erase(found);
-    auto step = entry.conversation->respond(std::move(responses));
     entry.expires = now_() + conversation_lifetime_;
-    return retain(std::move(step), std::move(id), std::move(entry));
+    return retain(std::move(*step), std::move(id), std::move(entry));
   }
 
   bool web_auth_manager_t::authorize(std::string_view token,
