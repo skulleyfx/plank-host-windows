@@ -722,7 +722,7 @@ namespace config {
     30,  // lock_on_disconnect_delay
     {},  // admin_group: BUILTIN\Administrators
     false,  // admin_desktop_override: an admin cannot seize another user's desktop unless enabled
-    3500,  // second_factor_round_wait_ms: 15 waiting rounds of a 16-round client cover DUO's 60 s push
+    3800,  // second_factor_round_wait_ms: 15 waiting rounds x 3.8 s = 57 s of DUO's 60 s push lifetime
   };
 
   video_t video {
