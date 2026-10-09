@@ -99,6 +99,23 @@ namespace plank::display_arrange {
       }
       return true;
     }
+
+    /**
+     * @brief Put the displays back as they were before a failed attempt.
+     *
+     * ChangeDisplaySettingsEx() has no call that discards queued changes: a
+     * call with no device COMMITS them. After a partial queue the only way back
+     * is to queue the old state over it and commit that.
+     */
+    void roll_back(const std::vector<display_mode_t> &before) {
+      if (before.empty()) {
+        return;
+      }
+      BOOST_LOG(warning) << "Putting the displays back after a refused change"sv;
+      if (!restore_layout(before)) {
+        BOOST_LOG(error) << "Couldn't put the displays back after a refused change"sv;
+      }
+    }
   }  // namespace
 
   std::vector<display_mode_t> current_layout() {
@@ -201,21 +218,26 @@ namespace plank::display_arrange {
                     << placed_right.name << ' ' << placed_right.width << 'x' << placed_right.height
                     << " at "sv << placed_right.x << ",0"sv;
 
-    if (!queue_display(placed_left, true) || !queue_display(placed_right, false)) {
-      // Drop anything already queued.
-      ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    const auto before = current_layout();
+    if (!queue_display(placed_left, true) || !queue_display(placed_right, false) ||
+        !apply_queued_changes()) {
+      roll_back(before);
       return false;
     }
-    return apply_queued_changes();
+    return true;
   }
 
   bool apply_mode(const display_mode_t &display) {
+    // Only one display is queued, so a refusal leaves nothing queued.
+    const auto before = current_layout();
     if (!queue_display(display, display.primary)) {
-      // Drop anything already queued.
-      ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
       return false;
     }
-    return apply_queued_changes();
+    if (!apply_queued_changes()) {
+      roll_back(before);
+      return false;
+    }
+    return true;
   }
 
   std::size_t supported_modes(const std::string &name, std::vector<display_mode_t> &sizes) {
@@ -248,14 +270,18 @@ namespace plank::display_arrange {
     if (layout.empty()) {
       return false;
     }
+    const auto before = current_layout();
     for (const auto &display : layout) {
       if (!queue_display(display, display.primary)) {
-        // Drop anything already queued.
-        ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        roll_back(before);
         return false;
       }
     }
-    return apply_queued_changes();
+    if (!apply_queued_changes()) {
+      roll_back(before);
+      return false;
+    }
+    return true;
   }
 
   bool restore_layout(const std::vector<display_mode_t> &layout) {

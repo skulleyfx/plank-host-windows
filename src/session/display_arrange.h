@@ -93,7 +93,8 @@ namespace plank::display_arrange {
    *
    * Used to hand the Windows primary to another display for a session, which
    * moves every display. Unlike restore_layout(), a refusal for any display
-   * drops the lot and leaves the desktop as it was.
+   * puts every display back as it was before the call (Windows can't discard
+   * queued changes, so the earlier arrangement is queued and applied again).
    *
    * @param layout Positions, sizes and primary flag of every display to set.
    * @return True when Windows applied the arrangement.
