@@ -1834,6 +1834,14 @@ namespace nvhttp {
     }
 #endif
 
+    if (!session_stream::viewer_launch_raise(launch_session)) {
+      // Drop every launch credential just issued; the endpoint stops with it.
+      tree.clear();
+      tree.put(result_field, 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Too many viewers are joining; try again");
+      return true;
+    }
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put(result_field, 1);
     tree.put("root.PlankWorkerInstance", worker_instance_id());
@@ -1842,7 +1850,6 @@ namespace nvhttp {
     tree.put("root.PlankEncodingMode", launch_session->encoding_mode);
     tree.put("root.PlankSessionRole", std::string {shared::role_name(shared::role_e::viewer)});
     BOOST_LOG(info) << "Shared screen viewer admitted for native setup"sv;
-    session_stream::viewer_launch_raise(launch_session);
     return true;
   }
 

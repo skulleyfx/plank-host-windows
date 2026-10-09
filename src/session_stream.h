@@ -82,12 +82,14 @@ namespace session_stream {
   /**
    * @brief Queue an admitted viewer launch for native QUIC negotiation.
    *
-   * Viewer setup runs on its own worker and never takes the controller's
-   * launch ownership, so a viewer connecting cannot block a controller.
+   * Each viewer is negotiated on its own thread and never takes the
+   * controller's launch ownership, so a viewer waiting for the owner cannot
+   * block a controller or another viewer.
    *
    * @param launch_session Viewer launch prepared by the launch handler.
+   * @return False when too many viewers are already joining.
    */
-  void viewer_launch_raise(std::shared_ptr<launch_session_t> launch_session);
+  bool viewer_launch_raise(std::shared_ptr<launch_session_t> launch_session);
 
   /**
    * @brief Queue an authorized launch for native QUIC negotiation.
