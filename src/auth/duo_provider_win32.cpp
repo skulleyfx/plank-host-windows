@@ -60,9 +60,14 @@ namespace plank::auth {
     /// Most DUO workers at once. A worker lives for at most push_deadline plus
     /// one poll after its sign-in ends, and needs a valid password to start.
     constexpr std::size_t max_duo_workers = 16;
+    /// Most DUO workers for one account: a user with a valid password cannot
+    /// restart sign-ins to hold every slot, and cannot probe in parallel.
+    constexpr std::size_t max_duo_workers_per_account = 2;
+    /// Most DUO workers for one client address.
+    constexpr std::size_t max_duo_workers_per_peer = 4;
 
     factor_wait::worker_slots_t &duo_workers() {
-      static factor_wait::worker_slots_t slots {max_duo_workers};
+      static factor_wait::worker_slots_t slots {max_duo_workers, max_duo_workers_per_account, max_duo_workers_per_peer};
       return slots;
     }
 
@@ -375,8 +380,11 @@ namespace plank::auth {
      * @brief Return a worker slot when the DUO worker exits by any path.
      */
     struct worker_slot_guard_t {
+      std::string account_key;  ///< limiter_key() of the account the slot was taken for.
+      std::string peer_key;  ///< limiter_key() of the client address.
+
       ~worker_slot_guard_t() {
-        duo_workers().release();
+        duo_workers().release(account_key, peer_key);
       }
     };
 
@@ -393,20 +401,24 @@ namespace plank::auth {
       }
 
       factor_step_t begin(std::string_view username, std::string_view remote_host) override {
-        if (!duo_workers().try_acquire()) {
-          // Fail closed: never degrade to password-only because DUO is busy.
+        account_key_ = factor_wait::limiter_key(duo_username(username));
+        peer_key_ = factor_wait::limiter_key(remote_host);
+        if (!duo_workers().try_acquire(account_key_, peer_key_)) {
+          // Fail closed: never degrade to password-only because DUO is busy
+          // (globally, or for this account or client address).
           return {factor_step_t::state_e::denied, {},
-                  std::format("{} DUO sign-ins already waiting", max_duo_workers),
+                  std::format("DUO sign-in refused: {} waiting overall, {} per account, {} per client address",
+                              max_duo_workers, max_duo_workers_per_account, max_duo_workers_per_peer),
                   "Too many sign-ins are waiting for DUO. Try again in a minute."};
         }
         exchange_ = std::make_shared<duo_exchange_t>("Contacting DUO...");
         try {
           std::thread(run, exchange_, duo_username(username), std::string {remote_host}, failmode_,
                       config::plank_auth.duo_integration_key, config::plank_auth.duo_secret_key,
-                      config::plank_auth.duo_api_host)
+                      config::plank_auth.duo_api_host, account_key_, peer_key_)
             .detach();
         } catch (const std::system_error &e) {
-          duo_workers().release();
+          duo_workers().release(account_key_, peer_key_);
           exchange_.reset();
           return {factor_step_t::state_e::denied, {}, std::string {"DUO worker could not start: "} + e.what(),
                   "DUO could not be reached, so sign-in was refused."};
@@ -462,8 +474,9 @@ namespace plank::auth {
       }
 
       static void run(std::shared_ptr<duo_exchange_t> exchange, std::string username, std::string remote_host,
-                      factor_failmode_e failmode, std::string ikey, std::string skey, std::string host) {
-        const worker_slot_guard_t slot;  // taken by begin()
+                      factor_failmode_e failmode, std::string ikey, std::string skey, std::string host,
+                      std::string account_key, std::string peer_key) {
+        const worker_slot_guard_t slot {std::move(account_key), std::move(peer_key)};  // taken by begin()
         platf::set_thread_name("duo-auth");
         const duo_client_t client {std::move(ikey), std::move(skey), std::move(host)};
         std::map<std::string, std::string> params {{"username", username}};
@@ -581,6 +594,8 @@ namespace plank::auth {
 
       factor_failmode_e failmode_;
       std::shared_ptr<duo_exchange_t> exchange_;
+      std::string account_key_;  ///< Limiter key of the account holding a worker slot.
+      std::string peer_key_;  ///< Limiter key of the client address holding a worker slot.
     };
   }  // namespace
 

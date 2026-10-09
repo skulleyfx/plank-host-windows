@@ -49,6 +49,8 @@ namespace {
       };
     }
 
+    using auth::conversation_i::respond;
+
     auth::step_t respond(std::vector<std::string> responses) override {
       state_->responses = std::move(responses);
       return {
@@ -196,6 +198,8 @@ namespace {
     auth::step_t begin(std::uint64_t, std::string_view, std::string_view) override {
       return {auth::step_t::state_e::challenge, {{4, "Waiting"}}, auth::phase_e::authenticate, 0};
     }
+
+    using auth::conversation_i::respond;
 
     auth::step_t respond(std::vector<std::string>) override {
       std::unique_lock lock {gate_->mutex};

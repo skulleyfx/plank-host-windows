@@ -639,11 +639,13 @@ namespace nvhttp {
    * @param conversation_id Opaque conversation identifier.
    * @param peer Normalized TLS peer address.
    * @param responses Prompt responses; erased by the conversation.
+   * @param arrived When the HTTPS request arrived; a second-factor round waits until arrived + budget.
    * @return JSON reply body.
    */
   nlohmann::json advance_auth_conversation(const std::string &conversation_id, const std::string &peer,
-                                           std::vector<std::string> responses) {
-    const auto step = web_auth->respond(conversation_id, peer, std::move(responses));
+                                           std::vector<std::string> responses,
+                                           std::chrono::steady_clock::time_point arrived) {
+    const auto step = web_auth->respond(conversation_id, peer, std::move(responses), arrived);
     auto result = auth_step_json(step);
 #ifdef _WIN32
     if (step.state == plank::auth::step_t::state_e::authenticated) {
@@ -675,12 +677,15 @@ namespace nvhttp {
   /// Most sign-in rounds advanced at once. Each lasts at most one round wait
   /// plus the password check, and a busy reply makes the client stop cleanly.
   constexpr std::size_t max_auth_round_workers = 16;
+  /// Most rounds advanced at once for one client address, so one client cannot
+  /// take every slot or run more than a few password guesses in parallel.
+  constexpr std::size_t max_auth_round_workers_per_peer = 4;
 
   std::mutex deferred_auth_mutex;  ///< Guards deferred_auth_replies.
   std::set<std::shared_ptr<deferred_auth_reply_t>> deferred_auth_replies;  ///< Replies a worker still owes.
 
   plank::auth::factor_wait::worker_slots_t &auth_round_workers() {
-    static plank::auth::factor_wait::worker_slots_t slots {max_auth_round_workers};
+    static plank::auth::factor_wait::worker_slots_t slots {max_auth_round_workers, plank::auth::factor_wait::unlimited_slots, max_auth_round_workers_per_peer};
     return slots;
   }
 
@@ -707,6 +712,8 @@ namespace nvhttp {
    * @param request HTTPS request carrying prompt responses.
    */
   void auth_respond(const resp_https_t &response, const req_https_t &request) {
+    // Taken first, on the io thread: the client's 5 s timeout started when it sent this request.
+    const auto arrived = std::chrono::steady_clock::now();
     auto body = read_auth_json(request);
     if (!web_auth || !body.is_object() || !body.contains("conversation_id") ||
         !body["conversation_id"].is_string() || !body.contains("responses") ||
@@ -738,11 +745,13 @@ namespace nvhttp {
     // so the round runs on a worker and the reply is sent from there. Other
     // clients' serverinfo polls are answered meanwhile.
     auto &workers = auth_round_workers();
-    if (!workers.try_acquire()) {
+    const auto peer_key = plank::auth::factor_wait::limiter_key(peer);
+    if (!workers.try_acquire({}, peer_key)) {
       for (auto &value : responses) {
         explicit_bzero(value.data(), value.size());
       }
-      BOOST_LOG(warning) << "PLANK sign-in round refused: "sv << max_auth_round_workers << " rounds already in progress"sv;
+      BOOST_LOG(warning) << "PLANK sign-in round refused: "sv << max_auth_round_workers << " rounds already in progress or "sv
+                         << max_auth_round_workers_per_peer << " for client "sv << peer;
       write_auth_json(response, SimpleWeb::StatusCode::success_ok, {{"state", "busy"}});
       return;
     }
@@ -752,7 +761,7 @@ namespace nvhttp {
       std::lock_guard lock {deferred_auth_mutex};
       deferred_auth_replies.insert(reply);
     }
-    auto finish = [reply, &workers](const nlohmann::json &result) {
+    auto finish = [reply, &workers, peer_key](const nlohmann::json &result) {
       {
         std::lock_guard lock {reply->mutex};
         if (reply->response) {
@@ -764,16 +773,16 @@ namespace nvhttp {
         std::lock_guard lock {deferred_auth_mutex};
         deferred_auth_replies.erase(reply);
       }
-      workers.release();
+      workers.release({}, peer_key);
     };
     // Shared so the password can still be erased if the worker fails to start.
     auto owned = std::make_shared<std::vector<std::string>>(std::move(responses));
     try {
-      std::thread([finish, owned, conversation_id = std::move(conversation_id), peer = std::move(peer)]() {
+      std::thread([finish, owned, arrived, conversation_id = std::move(conversation_id), peer = std::move(peer)]() {
         platf::set_thread_name("auth-round");
         nlohmann::json result;
         try {
-          result = advance_auth_conversation(conversation_id, peer, std::move(*owned));
+          result = advance_auth_conversation(conversation_id, peer, std::move(*owned), arrived);
         } catch (const std::exception &e) {
           BOOST_LOG(error) << "PLANK sign-in round failed: "sv << e.what();
           result = auth_step_json({});  // denied
@@ -789,7 +798,7 @@ namespace nvhttp {
     }
 #else
     write_auth_json(response, SimpleWeb::StatusCode::success_ok,
-                    advance_auth_conversation(conversation_id, peer, std::move(responses)));
+                    advance_auth_conversation(conversation_id, peer, std::move(responses), arrived));
 #endif
   }
 

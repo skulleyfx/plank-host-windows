@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -67,9 +68,11 @@ namespace plank::auth {
      * @brief Submit one response per preceding PAM message.
      *
      * @param responses Prompt responses; informational entries must be empty.
+     * @param arrived When the request reached the server; a second-factor wait counts its round budget from here.
      * @return Next PAM challenge or a terminal result.
      */
-    step_t respond(std::vector<std::string> responses);
+    step_t respond(std::vector<std::string> responses,
+                   std::chrono::steady_clock::time_point arrived = std::chrono::steady_clock::now());
 
     /**
      * @brief Close the authenticated PAM session and local socket.

@@ -85,7 +85,7 @@ namespace plank::auth {
     return read_step();
   }
 
-  step_t pam_client_t::respond(std::vector<std::string> responses) {
+  step_t pam_client_t::respond(std::vector<std::string> responses, std::chrono::steady_clock::time_point) {
     if (descriptor_ < 0 || expected_responses_ == 0 ||
         responses.size() != expected_responses_) {
       erase(responses);
