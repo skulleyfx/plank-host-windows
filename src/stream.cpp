@@ -2276,6 +2276,12 @@ namespace stream {
         }
         continue;
       }
+      // Held from the control check through delivery and recording, as on the viewer path, so an
+      // "allow" that hands control over in between cannot leave a key down that nobody releases.
+      std::unique_lock held_lock {session->held_mutex, std::defer_lock};
+      if (config::plank_auth.shared_screen && type != PLANK_TRANSPORT_INPUT_CLIPBOARD_OFFER) {
+        held_lock.lock();
+      }
       if (attached_viewers.load() != 0 && type != PLANK_TRANSPORT_INPUT_CLIPBOARD_OFFER &&
           !owner_input_allowed(session, type, payload.data(), payload_size)) {
         continue;
@@ -2295,10 +2301,9 @@ namespace stream {
         session::stop(*session);
         return;
       }
-      if (config::plank_auth.shared_screen) {
+      if (held_lock.owns_lock()) {
         // Remember what the owner holds down, to release it if control is
         // handed to a viewer mid-press.
-        std::lock_guard held_lock {session->held_mutex};
         session->held_input.record(type, payload.data(), payload_size);
       }
     }
