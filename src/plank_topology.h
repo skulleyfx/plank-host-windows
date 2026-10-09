@@ -5,8 +5,15 @@
 #pragma once
 
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace plank::topology {
   constexpr int maximum_virtual_canvas_width = 8192;
@@ -68,6 +75,44 @@ namespace plank::topology {
     feature_platform_clipboard_sync |
     feature_two_screen_capture |
     feature_adaptive_bitrate;
+
+  /**
+   * @brief How a Windows host decides to publish one screen instead of all.
+   */
+  enum class one_screen_mode {
+    automatic,  ///< One screen only for clients without the two-screen capability.
+    always,  ///< One screen for every client.
+    never,  ///< Never narrow automatically; the manual one-screen file still applies.
+  };
+
+  constexpr one_screen_mode parse_one_screen_mode(std::string_view value) {
+    if (value == "always") return one_screen_mode::always;
+    if (value == "never") return one_screen_mode::never;
+    return one_screen_mode::automatic;
+  }
+
+  /**
+   * @brief Decide whether a client is shown only the primary output.
+   *
+   * @param mode The one_screen host setting.
+   * @param override_file Whether the manual one-screen file exists. It forces
+   *        one screen for everyone, whatever the setting.
+   * @param client_flags The client's feature bits, or nullopt when the host
+   *        does not know the client yet (an unidentified topology request).
+   * @param output_count Outputs that would otherwise be published.
+   * @return True when only the primary output should be published and captured.
+   */
+  constexpr bool publish_single_output(
+    one_screen_mode mode,
+    bool override_file,
+    std::optional<std::uint32_t> client_flags,
+    std::size_t output_count
+  ) {
+    if (output_count < 2) return false;
+    if (override_file || mode == one_screen_mode::always) return true;
+    if (mode == one_screen_mode::never || !client_flags) return false;
+    return (*client_flags & feature_two_screen_capture) == 0;
+  }
 
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {
     return mtu >= 1200 && mtu <= 65527;
@@ -194,4 +239,81 @@ namespace plank::topology {
     }
     return layout_error::none;
   }
+
+  /**
+   * @brief Bounded most-recently-used map from a client key to its feature bits.
+   *
+   * Lets the host remember what each client declared at launch so a later
+   * topology request, which carries no feature bits, can be answered for it.
+   */
+  class client_flag_store {
+  public:
+    static constexpr std::size_t max_entries = 256;
+
+    std::optional<std::uint32_t> lookup(std::string_view key) const {
+      const auto found = std::find_if(entries_.begin(), entries_.end(), [key](const auto &entry) {
+        return entry.first == key;
+      });
+      if (found == entries_.end()) return std::nullopt;
+      return found->second;
+    }
+
+    /**
+     * @return True when the stored contents changed and need saving.
+     */
+    bool record(std::string_view key, std::uint32_t flags) {
+      if (key.empty()) return false;
+      const auto found = std::find_if(entries_.begin(), entries_.end(), [key](const auto &entry) {
+        return entry.first == key;
+      });
+      if (found != entries_.end()) {
+        if (found->second == flags && found == entries_.begin()) return false;
+        const bool same = found->second == flags;
+        std::pair<std::string, std::uint32_t> entry {found->first, flags};
+        entries_.erase(found);
+        entries_.insert(entries_.begin(), std::move(entry));
+        // Recency alone is only saved when it changes which entry is oldest.
+        return !same;
+      }
+      entries_.insert(entries_.begin(), {std::string {key}, flags});
+      if (entries_.size() > max_entries) entries_.resize(max_entries);
+      return true;
+    }
+
+    std::size_t size() const { return entries_.size(); }
+
+    nlohmann::json to_json() const {
+      auto list = nlohmann::json::array();
+      for (const auto &[key, flags] : entries_) {
+        list.push_back({{"key", key}, {"flags", flags}});
+      }
+      return {{"version", 1}, {"clients", list}};
+    }
+
+    /**
+     * @brief Parse a saved store. Anything malformed yields an empty or partial store.
+     */
+    static client_flag_store from_json(std::string_view text) {
+      client_flag_store store;
+      const auto document = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
+      if (!document.is_object() || !document.contains("clients") || !document["clients"].is_array()) {
+        return store;
+      }
+      for (const auto &item : document["clients"]) {
+        if (store.entries_.size() >= max_entries) break;
+        if (!item.is_object() || !item.contains("key") || !item["key"].is_string() ||
+            !item.contains("flags") || !item["flags"].is_number_unsigned()) {
+          continue;
+        }
+        const auto flags = item["flags"].get<std::uint64_t>();
+        const auto key = item["key"].get<std::string>();
+        if (flags > 0xFFFFFFFFULL || key.empty() || store.lookup(key)) continue;
+        store.entries_.emplace_back(key, static_cast<std::uint32_t>(flags));
+      }
+      return store;
+    }
+
+  private:
+    std::vector<std::pair<std::string, std::uint32_t>> entries_;  ///< Most recent first.
+  };
 }  // namespace plank::topology
