@@ -312,7 +312,18 @@ namespace config {
     std::string startup_layout;  ///< PLANK physical or virtual display policy applied before the display manager starts.
   };
 
+  /**
+   * @brief Optional NDI screen output (Windows). Off by default.
+   */
+  struct ndi_t {
+    bool enabled;  ///< Publish the host's screens as NDI sources.
+    bool all_outputs;  ///< Publish every display, not only the primary.
+    std::string source_name;  ///< Custom source name; empty selects "<COMPUTERNAME> - Screen N".
+    int fps;  ///< Send rate, 1 to 60.
+  };
+
   extern plank_auth_t plank_auth;
+  extern ndi_t ndi;
   extern video_t video;
   extern audio_t audio;
   extern stream_t stream;

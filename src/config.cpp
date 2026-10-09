@@ -26,6 +26,7 @@
 #include "logging.h"
 #include "nvhttp.h"
 #include "platform/common.h"
+#include "plank_ndi.h"
 #include "utility.h"
 
 #ifdef _WIN32
@@ -703,6 +704,16 @@ namespace config {
       return output;
     }
   }  // namespace dd
+
+  /**
+   * @brief NDI screen output defaults: off, primary display only, 30 fps.
+   */
+  ndi_t ndi {
+    false,  // enabled
+    false,  // all_outputs
+    {},  // source_name (empty selects "<COMPUTERNAME> - Screen N")
+    plank::ndi::default_fps  // fps
+  };
 
   /**
    * @brief Default video configuration values used before file and CLI overrides.
@@ -1620,6 +1631,31 @@ namespace config {
     }
 
     bool_f(vars, "mdns_discovery", sunshine.mdns_discovery);
+
+    // Optional NDI screen output. A value that does not parse keeps the default.
+    {
+      std::string ndi_text;
+      string_f(vars, "ndi_output", ndi_text);
+      if (auto enabled = plank::ndi::parse_enabled(ndi_text)) {
+        ndi.enabled = *enabled;
+      } else if (!ndi_text.empty()) {
+        BOOST_LOG(warning) << "Ignoring ndi_output = '"sv << ndi_text << "'; use on or off"sv;
+      }
+
+      ndi_text.clear();
+      string_f(vars, "ndi_outputs", ndi_text);
+      if (auto scope = plank::ndi::parse_scope(ndi_text)) {
+        ndi.all_outputs = *scope == plank::ndi::scope_e::all;
+      } else if (!ndi_text.empty()) {
+        BOOST_LOG(warning) << "Ignoring ndi_outputs = '"sv << ndi_text << "'; use primary or all"sv;
+      }
+
+      string_f(vars, "ndi_source_name", ndi.source_name);
+
+      int ndi_fps = ndi.fps;
+      int_f(vars, "ndi_fps", ndi_fps);
+      ndi.fps = plank::ndi::clamp_fps(ndi_fps);
+    }
     string_restricted_f(vars, "startup_layout", sunshine.startup_layout, {"physical"sv, "virtual"sv});
 
     int port = sunshine.port;

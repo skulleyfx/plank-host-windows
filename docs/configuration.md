@@ -40,6 +40,35 @@ manually configured hostname/IP bookmarks continue to work while disabled.
 Milliseconds allowed for initial media-channel pings and established-client
 inactivity before the host cleans up the stream. Default: `10000`.
 
+## NDI screen output (Windows)
+
+Optional. Publishes the host's screens as NDI sources on the LAN so they can be
+picked up in Evercast's desktop app (Stream, then Stream NDI) or any other NDI
+receiver. Sources are published whether or not a PLANK client is connected.
+Requires the free NDI runtime (install NDI Tools from ndi.video); PLANK does not
+ship it. There is no audio in this version. Restart the PLANK service after
+changing these options.
+
+### ndi_output
+
+Publish NDI sources. Accepted values: `on` or `off`. Default: `off`. If the NDI
+runtime is not installed the host logs one line and carries on normally.
+
+### ndi_outputs
+
+Which displays to publish: `primary` or `all`. Default: `primary`.
+
+### ndi_source_name
+
+Name of the NDI source. Default: `<COMPUTERNAME> - Screen N`. A custom name is
+used as is for one display; with `ndi_outputs = all` and several displays a
+number is appended. NDI receivers also show the machine name in front.
+
+### ndi_fps
+
+Frames per second sent to NDI, 1 to 60. Default: `30`. Higher values cost more
+CPU and network bandwidth.
+
 ## Security and state
 
 ### allow_root_login
