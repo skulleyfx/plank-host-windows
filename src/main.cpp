@@ -29,6 +29,7 @@
 #endif
 #include "video.h"
 #ifdef _WIN32
+  #include "platform/windows/ndi_output.h"
   #include "session/display_arrange.h"
 #endif
 
@@ -433,6 +434,12 @@ int main(int argc, char *argv[]) {
       mDNS = platf::publish::start();
     }
   });
+
+#ifdef _WIN32
+  // Optional (ndi_output = on): publish the screens as NDI sources. Independent
+  // of any PLANK session, so it runs whether or not a client is connected.
+  auto ndi_output_guard = platf::ndi_output::start();
+#endif
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
   if (shutdown_event->peek()) {
