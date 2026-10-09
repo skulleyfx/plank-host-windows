@@ -677,12 +677,15 @@ namespace nvhttp {
   /// Most sign-in rounds advanced at once. Each lasts at most one round wait
   /// plus the password check, and a busy reply makes the client stop cleanly.
   constexpr std::size_t max_auth_round_workers = 16;
+  /// Most rounds advanced at once for one client address, so one client cannot
+  /// take every slot or run more than a few password guesses in parallel.
+  constexpr std::size_t max_auth_round_workers_per_peer = 4;
 
   std::mutex deferred_auth_mutex;  ///< Guards deferred_auth_replies.
   std::set<std::shared_ptr<deferred_auth_reply_t>> deferred_auth_replies;  ///< Replies a worker still owes.
 
   plank::auth::factor_wait::worker_slots_t &auth_round_workers() {
-    static plank::auth::factor_wait::worker_slots_t slots {max_auth_round_workers};
+    static plank::auth::factor_wait::worker_slots_t slots {max_auth_round_workers, plank::auth::factor_wait::unlimited_slots, max_auth_round_workers_per_peer};
     return slots;
   }
 
@@ -742,11 +745,13 @@ namespace nvhttp {
     // so the round runs on a worker and the reply is sent from there. Other
     // clients' serverinfo polls are answered meanwhile.
     auto &workers = auth_round_workers();
-    if (!workers.try_acquire()) {
+    const auto peer_key = plank::auth::factor_wait::limiter_key(peer);
+    if (!workers.try_acquire({}, peer_key)) {
       for (auto &value : responses) {
         explicit_bzero(value.data(), value.size());
       }
-      BOOST_LOG(warning) << "PLANK sign-in round refused: "sv << max_auth_round_workers << " rounds already in progress"sv;
+      BOOST_LOG(warning) << "PLANK sign-in round refused: "sv << max_auth_round_workers << " rounds already in progress or "sv
+                         << max_auth_round_workers_per_peer << " for client "sv << peer;
       write_auth_json(response, SimpleWeb::StatusCode::success_ok, {{"state", "busy"}});
       return;
     }
@@ -756,7 +761,7 @@ namespace nvhttp {
       std::lock_guard lock {deferred_auth_mutex};
       deferred_auth_replies.insert(reply);
     }
-    auto finish = [reply, &workers](const nlohmann::json &result) {
+    auto finish = [reply, &workers, peer_key](const nlohmann::json &result) {
       {
         std::lock_guard lock {reply->mutex};
         if (reply->response) {
@@ -768,7 +773,7 @@ namespace nvhttp {
         std::lock_guard lock {deferred_auth_mutex};
         deferred_auth_replies.erase(reply);
       }
-      workers.release();
+      workers.release({}, peer_key);
     };
     // Shared so the password can still be erased if the worker fails to start.
     auto owned = std::make_shared<std::vector<std::string>>(std::move(responses));

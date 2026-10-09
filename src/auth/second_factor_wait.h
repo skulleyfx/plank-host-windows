@@ -21,8 +21,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <limits>
+#include <map>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 namespace plank::auth::factor_wait {
   using clock_t = std::chrono::steady_clock;  ///< Monotonic clock for every deadline.
@@ -199,44 +202,100 @@ namespace plank::auth::factor_wait {
     bool cancelled_flag_ {false};  ///< Set by cancel().
   };
 
+  /// No limit for a key dimension.
+  inline constexpr std::size_t unlimited_slots = std::numeric_limits<std::size_t>::max();
+
+  /**
+   * @brief Normalize an account or address into a limiter key.
+   *
+   * Account names compare case-insensitively on Windows, so "Alice" and
+   * "alice" must share one allowance. An empty value maps to a fixed key so
+   * it is still limited rather than skipped.
+   *
+   * @param value Account name or peer address.
+   * @return Lower-cased key; never empty.
+   */
+  inline std::string limiter_key(std::string_view value) {
+    std::string key {value};
+    for (auto &c : key) {
+      if (c >= 'A' && c <= 'Z') {
+        c = static_cast<char>(c - 'A' + 'a');
+      }
+    }
+    if (key.empty()) {
+      key = "(unknown)";
+    }
+    return key;
+  }
+
   /**
    * @brief Counting limit for concurrent background workers.
    *
    * try_acquire() never blocks: a caller over the limit is refused, so a burst
-   * of sign-ins cannot create unbounded threads.
+   * of sign-ins cannot create unbounded threads. Besides the global limit it
+   * can cap workers per key in two independent dimensions (for example per
+   * account and per client address), so one client cannot take every slot.
+   * A refused call changes nothing.
    */
   class worker_slots_t {
   public:
     /**
      * @param limit Most workers allowed at once.
+     * @param per_key_a Most workers per first key; unlimited_slots for none.
+     * @param per_key_b Most workers per second key; unlimited_slots for none.
      */
-    explicit worker_slots_t(std::size_t limit):
-        limit_ {limit} {
+    explicit worker_slots_t(std::size_t limit, std::size_t per_key_a = unlimited_slots,
+                            std::size_t per_key_b = unlimited_slots):
+        limit_ {limit},
+        per_key_a_ {per_key_a},
+        per_key_b_ {per_key_b} {
     }
 
     /**
      * @brief Take a slot if one is free.
      *
-     * @return True when a slot was taken; the caller must release() it.
+     * An empty key skips that dimension (and its release); pass limiter_key()
+     * output to enforce it.
+     *
+     * @param key_a First key (for example the account), or empty.
+     * @param key_b Second key (for example the client address), or empty.
+     * @return True when a slot was taken; the caller must release() it with the same keys.
      */
-    bool try_acquire() {
+    bool try_acquire(const std::string &key_a = {}, const std::string &key_b = {}) {
       std::lock_guard lock {mutex_};
       if (active_ >= limit_) {
         return false;
       }
+      if (!key_a.empty() && count_of(by_a_, key_a) >= per_key_a_) {
+        return false;
+      }
+      if (!key_b.empty() && count_of(by_b_, key_b) >= per_key_b_) {
+        return false;
+      }
       ++active_;
+      if (!key_a.empty()) {
+        ++by_a_[key_a];
+      }
+      if (!key_b.empty()) {
+        ++by_b_[key_b];
+      }
       return true;
     }
 
     /**
      * @brief Return a slot taken by try_acquire().
+     *
+     * @param key_a Same first key given to try_acquire().
+     * @param key_b Same second key given to try_acquire().
      */
-    void release() {
+    void release(const std::string &key_a = {}, const std::string &key_b = {}) {
       {
         std::lock_guard lock {mutex_};
         if (active_ > 0) {
           --active_;
         }
+        drop(by_a_, key_a);
+        drop(by_b_, key_b);
       }
       idle_.notify_all();
     }
@@ -247,6 +306,24 @@ namespace plank::auth::factor_wait {
     std::size_t active() const {
       std::lock_guard lock {mutex_};
       return active_;
+    }
+
+    /**
+     * @param key_a First key.
+     * @return Slots in use under that key.
+     */
+    std::size_t active_a(const std::string &key_a) const {
+      std::lock_guard lock {mutex_};
+      return count_of(by_a_, key_a);
+    }
+
+    /**
+     * @param key_b Second key.
+     * @return Slots in use under that key.
+     */
+    std::size_t active_b(const std::string &key_b) const {
+      std::lock_guard lock {mutex_};
+      return count_of(by_b_, key_b);
     }
 
     /**
@@ -263,9 +340,31 @@ namespace plank::auth::factor_wait {
     }
 
   private:
+    using counts_t = std::map<std::string, std::size_t>;
+
+    static std::size_t count_of(const counts_t &counts, const std::string &key) {
+      const auto found = counts.find(key);
+      return found == counts.end() ? 0 : found->second;
+    }
+
+    static void drop(counts_t &counts, const std::string &key) {
+      if (key.empty()) {
+        return;
+      }
+      if (const auto found = counts.find(key); found != counts.end()) {
+        if (--found->second == 0) {
+          counts.erase(found);
+        }
+      }
+    }
+
     mutable std::mutex mutex_;
     std::condition_variable idle_;
     std::size_t limit_;
+    std::size_t per_key_a_;
+    std::size_t per_key_b_;
     std::size_t active_ {0};
+    counts_t by_a_;
+    counts_t by_b_;
   };
 }  // namespace plank::auth::factor_wait

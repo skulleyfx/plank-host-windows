@@ -128,3 +128,71 @@ TEST(SecondFactorWait, RoundClockStartsAtRequestArrival) {
   EXPECT_EQ(fw::round_remaining(arrived, arrived + 700ms, 3500ms), 2800ms);
   EXPECT_EQ(fw::round_remaining(arrived, arrived + 3600ms, 3500ms), 0ms);
 }
+
+TEST(SecondFactorWait, LimiterKeysAreCaseInsensitiveAndNeverEmpty) {
+  EXPECT_EQ(fw::limiter_key("Alice"), fw::limiter_key("aLICE"));
+  EXPECT_NE(fw::limiter_key("alice"), fw::limiter_key("bob"));
+  EXPECT_FALSE(fw::limiter_key("").empty());
+}
+
+TEST(SecondFactorWait, OneAccountCannotTakeEverySlot) {
+  fw::worker_slots_t slots {16, 2, 4};
+  const auto alice = fw::limiter_key("Alice");
+  const auto bob = fw::limiter_key("bob");
+  const auto ip1 = fw::limiter_key("10.0.0.1");
+  const auto ip2 = fw::limiter_key("10.0.0.2");
+
+  EXPECT_TRUE(slots.try_acquire(alice, ip1));
+  EXPECT_TRUE(slots.try_acquire(alice, ip1));
+  EXPECT_FALSE(slots.try_acquire(alice, ip2));  // third for the account, from another address
+  EXPECT_EQ(slots.active(), 2u);  // a refusal changes nothing
+  EXPECT_EQ(slots.active_a(alice), 2u);
+  EXPECT_EQ(slots.active_b(ip2), 0u);
+
+  EXPECT_TRUE(slots.try_acquire(bob, ip2));  // others are unaffected
+  slots.release(alice, ip1);
+  EXPECT_TRUE(slots.try_acquire(alice, ip2));  // a release frees an account slot
+  EXPECT_EQ(slots.active_a(alice), 2u);
+}
+
+TEST(SecondFactorWait, OneAddressCannotRunManyParallelGuesses) {
+  fw::worker_slots_t slots {16, 2, 4};
+  const auto ip = fw::limiter_key("10.0.0.1");
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_TRUE(slots.try_acquire(fw::limiter_key("user" + std::to_string(i)), ip));
+  }
+  EXPECT_FALSE(slots.try_acquire(fw::limiter_key("user9"), ip));
+  EXPECT_TRUE(slots.try_acquire(fw::limiter_key("user9"), fw::limiter_key("10.0.0.2")));
+  EXPECT_EQ(slots.active_b(ip), 4u);
+  for (int i = 0; i < 4; ++i) {
+    slots.release(fw::limiter_key("user" + std::to_string(i)), ip);
+  }
+  EXPECT_EQ(slots.active_b(ip), 0u);
+}
+
+TEST(SecondFactorWait, GlobalCapStillAppliesAndPerKeyIsOptional) {
+  fw::worker_slots_t slots {3, 2, 4};
+  EXPECT_TRUE(slots.try_acquire("a", "1"));
+  EXPECT_TRUE(slots.try_acquire("b", "2"));
+  EXPECT_TRUE(slots.try_acquire("c", "3"));
+  EXPECT_FALSE(slots.try_acquire("d", "4"));
+
+  // Auth-round style: only the address dimension is limited.
+  fw::worker_slots_t rounds {16, fw::unlimited_slots, 4};
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_TRUE(rounds.try_acquire({}, "10.0.0.1"));
+  }
+  EXPECT_FALSE(rounds.try_acquire({}, "10.0.0.1"));
+  EXPECT_TRUE(rounds.try_acquire({}, "10.0.0.2"));
+  for (int i = 0; i < 4; ++i) {
+    rounds.release({}, "10.0.0.1");
+  }
+  rounds.release({}, "10.0.0.2");
+  EXPECT_EQ(rounds.active(), 0u);
+  EXPECT_TRUE(rounds.wait_idle(10ms));
+
+  // Plain use without keys keeps working.
+  fw::worker_slots_t plain {1};
+  EXPECT_TRUE(plain.try_acquire());
+  EXPECT_FALSE(plain.try_acquire());
+}
