@@ -114,6 +114,30 @@ namespace plank::topology {
     return (*client_flags & feature_two_screen_capture) == 0;
   }
 
+  /**
+   * @brief Decide whether a launch must be refused so the client re-reads the topology.
+   *
+   * The client laid out the topology the host published for the flags it had
+   * remembered for that client (nullopt when the client was unknown). If the
+   * launch's own flags would have produced a different publication, picture and
+   * mouse mapping would disagree, so the client refreshes and retries. The host
+   * records the new flags first, so the retry sees equal publications and passes.
+   *
+   * @param previous_flags Flags remembered before this launch, or nullopt.
+   * @param launch_flags Flags this launch declares.
+   * @return True when the launch should answer 409 refresh-and-retry.
+   */
+  constexpr bool launch_needs_topology_refresh(
+    one_screen_mode mode,
+    bool override_file,
+    std::optional<std::uint32_t> previous_flags,
+    std::uint32_t launch_flags,
+    std::size_t output_count
+  ) {
+    return publish_single_output(mode, override_file, previous_flags, output_count) !=
+           publish_single_output(mode, override_file, launch_flags, output_count);
+  }
+
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {
     return mtu >= 1200 && mtu <= 65527;
   }

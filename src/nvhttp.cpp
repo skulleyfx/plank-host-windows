@@ -1476,16 +1476,17 @@ namespace nvhttp {
         (session.plank_feature_flags & plank_topology_two_screen_capture) != 0;
       const auto leased = leased_outputs(outputs, live_display_layout(outputs));
       const auto mode = plank::topology::parse_one_screen_mode(config::video.plank_one_screen);
-      const bool forced = one_screen_file_present() || mode == plank::topology::one_screen_mode::always;
+      if (plank::topology::launch_needs_topology_refresh(
+            mode, one_screen_file_present(), previous_flags, session.plank_feature_flags, leased.size())) {
+        // The client laid out the topology published for its remembered flags
+        // (or both screens, if unknown), which differs from what this launch
+        // captures. The new flags are already stored; have it read again.
+        tree.put("root.<xmlattr>.status_code", 409);
+        tree.put("root.<xmlattr>.status_message", "Host output topology changed; refresh and retry");
+        return false;
+      }
       if (plank::topology::publish_single_output(
             mode, one_screen_file_present(), session.plank_feature_flags, leased.size())) {
-        if (!forced && !previous_flags) {
-          // This address was unknown when it read the topology, so it laid
-          // out both screens. It is known now; have it read the topology again.
-          tree.put("root.<xmlattr>.status_code", 409);
-          tree.put("root.<xmlattr>.status_message", "Host output topology changed; refresh and retry");
-          return false;
-        }
         session.span_desktop = false;
         session.output_name = primary_output(leased).capture_name;
         BOOST_LOG(info) << "One-screen mode: capturing only "sv

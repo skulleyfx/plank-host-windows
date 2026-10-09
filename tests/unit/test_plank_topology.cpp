@@ -211,3 +211,31 @@ TEST(PlankTopology, ClientFlagStoreRoundTripsAndToleratesCorruption) {
   EXPECT_EQ(partial.size(), 1U);
   EXPECT_EQ(partial.lookup("c"), 7U);
 }
+
+TEST(PlankTopology, LaunchRefreshDecision) {
+  using topology::one_screen_mode;
+  const std::uint32_t legacy = topology::feature_flags & ~topology::feature_two_screen_capture;
+  const std::uint32_t modern = topology::feature_flags;
+  const auto refresh = [](one_screen_mode mode, bool file, std::optional<std::uint32_t> previous,
+                          std::uint32_t launch, std::size_t outputs) {
+    return topology::launch_needs_topology_refresh(mode, file, previous, launch, outputs);
+  };
+  // Unknown client that will be narrowed laid out both screens: refresh.
+  EXPECT_TRUE(refresh(one_screen_mode::automatic, false, std::nullopt, legacy, 2));
+  // Unknown client that keeps the full list already saw it: proceed.
+  EXPECT_FALSE(refresh(one_screen_mode::automatic, false, std::nullopt, modern, 2));
+  // Same flags twice always passes, so the retry cannot loop.
+  EXPECT_FALSE(refresh(one_screen_mode::automatic, false, legacy, legacy, 2));
+  EXPECT_FALSE(refresh(one_screen_mode::automatic, false, modern, modern, 2));
+  // Flags differ but the publication is the same (forced one screen, never, 1 output).
+  EXPECT_FALSE(refresh(one_screen_mode::automatic, true, modern, legacy, 2));
+  EXPECT_FALSE(refresh(one_screen_mode::always, false, modern, legacy, 2));
+  EXPECT_FALSE(refresh(one_screen_mode::never, false, modern, legacy, 2));
+  // Flags differ and so does the publication, in both directions.
+  EXPECT_TRUE(refresh(one_screen_mode::automatic, false, modern, legacy, 2));
+  EXPECT_TRUE(refresh(one_screen_mode::automatic, false, legacy, modern, 2));
+  // A single-output host never refreshes.
+  EXPECT_FALSE(refresh(one_screen_mode::automatic, false, std::nullopt, legacy, 1));
+  EXPECT_FALSE(refresh(one_screen_mode::automatic, false, modern, legacy, 1));
+  EXPECT_FALSE(refresh(one_screen_mode::automatic, false, legacy, modern, 1));
+}
