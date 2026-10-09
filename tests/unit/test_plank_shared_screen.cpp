@@ -469,6 +469,36 @@ TEST(PlankSharedScreen, HeldInputReleasesEverythingStillDown) {
   EXPECT_TRUE(input.take_releases().empty());
 }
 
+TEST(PlankSharedScreen, HeldInputLiftsAPenLeftOnTheSurface) {
+  using held = plank::shared_screen::held_input_t;
+  held input;
+  std::uint8_t pen[held::pen_size] {};
+  pen[0] = held::pen_down;
+  pen[2] = 0x03;
+  pen[8] = 0x11;
+  pen[16] = 0x22;
+  input.record(held::pen_type, pen, sizeof(pen));
+  pen[0] = held::pen_move;
+  input.record(held::pen_type, pen, sizeof(pen));
+  EXPECT_FALSE(input.empty());
+  auto releases = input.take_releases();
+  ASSERT_EQ(releases.size(), 1u);
+  EXPECT_EQ(releases[0].type, held::pen_type);
+  ASSERT_EQ(releases[0].payload.size(), held::pen_size);
+  EXPECT_EQ(releases[0].payload[0], held::pen_up);
+  EXPECT_EQ(releases[0].payload[2], 0);
+  EXPECT_EQ(releases[0].payload[8], 0x11);
+  EXPECT_EQ(releases[0].payload[16], 0);
+  EXPECT_TRUE(input.empty());
+
+  // A pen that was lifted needs no release.
+  pen[0] = held::pen_down;
+  input.record(held::pen_type, pen, sizeof(pen));
+  pen[0] = held::pen_up;
+  input.record(held::pen_type, pen, sizeof(pen));
+  EXPECT_TRUE(input.empty());
+}
+
 TEST(PlankSharedScreen, HeldInputIgnoresOtherTypesAndShortPayloads) {
   using held = plank::shared_screen::held_input_t;
   held input;

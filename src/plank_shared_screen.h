@@ -235,6 +235,11 @@ namespace plank::shared_screen {
     static constexpr std::uint8_t keyboard_type = 5;  ///< KyProto keyboard.
     static constexpr std::uint8_t press = 1;  ///< KyProto press action.
     static constexpr std::uint8_t release = 0;  ///< KyProto release action.
+    static constexpr std::uint8_t pen_type = 7;  ///< KyProto normalized pen.
+    static constexpr std::size_t pen_size = 32;  ///< Pen payload size.
+    static constexpr std::uint8_t pen_down = 1;  ///< Pen event: touching the surface.
+    static constexpr std::uint8_t pen_up = 2;  ///< Pen event: lifted.
+    static constexpr std::uint8_t pen_move = 3;  ///< Pen event: moving while touching.
 
     /**
      * @brief One synthetic release to inject.
@@ -265,6 +270,13 @@ namespace plank::shared_screen {
         } else if (payload[2] == release) {
           keys_.erase(code);
         }
+      } else if (type == pen_type && size == pen_size) {
+        // Only a pen that is touching the surface can be left stuck down.
+        if (payload[0] == pen_down || payload[0] == pen_move) {
+          pen_.assign(payload, payload + size);
+        } else {
+          pen_.clear();
+        }
       }
     }
 
@@ -281,8 +293,17 @@ namespace plank::shared_screen {
       for (const auto button : buttons_) {
         releases.push_back({mouse_button_type, {button, release}});
       }
+      if (!pen_.empty()) {
+        // Lift the pen where it was: pen up, no pressure (bytes 16-19), no barrel buttons.
+        auto lift = pen_;
+        lift[0] = pen_up;
+        lift[2] = 0;
+        lift[16] = lift[17] = lift[18] = lift[19] = 0;
+        releases.push_back({pen_type, std::move(lift)});
+      }
       keys_.clear();
       buttons_.clear();
+      pen_.clear();
       return releases;
     }
 
@@ -291,12 +312,13 @@ namespace plank::shared_screen {
      * @return True when no key or button is down.
      */
     bool empty() const {
-      return keys_.empty() && buttons_.empty();
+      return keys_.empty() && buttons_.empty() && pen_.empty();
     }
 
   private:
     std::map<std::uint16_t, std::uint8_t> keys_;  ///< Held key code to its flags byte.
     std::set<std::uint8_t> buttons_;  ///< Held mouse buttons.
+    std::vector<std::uint8_t> pen_;  ///< Last pen report while touching the surface; empty otherwise.
   };
 
   /**

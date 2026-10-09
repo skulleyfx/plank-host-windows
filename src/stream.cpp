@@ -99,6 +99,8 @@ namespace stream {
   static_assert(plank::shared_screen::held_input_t::keyboard_type == PLANK_TRANSPORT_INPUT_KEYBOARD);
   static_assert(plank::shared_screen::held_input_t::press == PLANK_TRANSPORT_INPUT_ACTION_PRESS);
   static_assert(plank::shared_screen::held_input_t::release == PLANK_TRANSPORT_INPUT_ACTION_RELEASE);
+  static_assert(plank::shared_screen::held_input_t::pen_type == PLANK_TRANSPORT_INPUT_PEN);
+  static_assert(plank::shared_screen::held_input_t::pen_size == PLANK_TRANSPORT_INPUT_PEN_SIZE);
 #endif
 
   /// Admin observers among the attached viewers; never shown to anyone.
