@@ -180,11 +180,14 @@ selection.
 
 ### one_screen
 
-Multi-monitor display behavior for single-screen clients. `auto` uses one screen
-for clients lacking native two-screen capture support (recommended); `always`
-forces single-screen encoding regardless of client capability; `never` always
-encodes all connected displays. Accepted values: `auto`, `always`, or `never`.
-Default: `auto`.
+How a host with two or more monitors serves clients that cannot show our two-screen
+mode (Alan's Mac and Linux clients, and Windows clients older than 1.0.103.41).
+`auto` (recommended) gives those clients just the primary monitor, so the picture
+and the mouse line up; current Windows clients still get both screens. `always`
+gives every client just the primary monitor. `never` turns the automatic choice
+off, so those clients get the old stretched two-monitor picture. In every mode the
+file `C:\ProgramData\PLANK\one-screen`, if it exists, forces one screen for
+everyone. Accepted values: `auto`, `always`, or `never`. Default: `auto`.
 
 ### minimum_fps_target
 
