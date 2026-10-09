@@ -289,6 +289,8 @@ namespace config {
     int lock_on_disconnect_delay;  ///< Seconds to wait for a reconnect before locking.
     std::string admin_group;  ///< Windows: group whose members see host details such as the signed-in user. Empty means BUILTIN\\Administrators.
     bool admin_desktop_override;  ///< Windows: let an admin-group member stream the active desktop even when another account owns it. Default false.
+    bool shared_screen;  ///< Let extra clients watch the running stream view-only (encode once, fan out). Default false.
+    int shared_screen_max_viewers;  ///< Most view-only clients attached to one stream at a time.
   };
 
   struct sunshine_t {
