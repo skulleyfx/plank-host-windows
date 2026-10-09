@@ -1344,9 +1344,11 @@ namespace nvhttp {
     }
     if (live_layout.virtual_layout) {
       // A substituted mode is what the display is actually in.
-      const auto mode_1 = plank::topology::virtual_mode_size(
-        live_layout.applied_mode_1.empty() ? actual_mode_1 : live_layout.applied_mode_1
-      );
+      // The substitute is any size the display supports, not only one of the
+      // sizes a client can name, so it is parsed rather than looked up.
+      const auto mode_1 = live_layout.applied_mode_1.empty() ?
+                            plank::topology::virtual_mode_size(actual_mode_1) :
+                            plank::topology::parse_mode_size(live_layout.applied_mode_1);
       const bool first_matches = ordered_outputs[0].get().width == mode_1.width &&
                                  ordered_outputs[0].get().height == mode_1.height;
       bool second_matches = true;
@@ -1422,17 +1424,17 @@ namespace nvhttp {
     return true;
   }
 
-  bool resolve_selected_output(session_stream::launch_session_t &session,
-                               uid_t authenticated_uid,
-                               const std::string &client_key,
-                               pt::ptree &tree) {
+  bool resolve_selected_output_impl(session_stream::launch_session_t &session,
+                                    uid_t authenticated_uid,
+                                    const std::string &client_key,
+                                    pt::ptree &tree,
+                                    bool &transitioned) {
     auto outputs = video::output_topology();
     const auto previous_flags = known_client_flags(client_key);
     remember_client_flags(client_key, session.plank_feature_flags);
 #ifndef _WIN32
     (void) previous_flags;
 #endif
-    bool transitioned = false;
     if (!bind_host_layout(session, outputs, authenticated_uid, tree, false, &transitioned)) {
       return false;
     }
@@ -1529,6 +1531,32 @@ namespace nvhttp {
     BOOST_LOG(info) << "PLANK selected output "sv << logging::bracket(session.output_id)
                     << " using capture name "sv << logging::bracket(session.output_name);
     return true;
+  }
+
+  bool resolve_selected_output(session_stream::launch_session_t &session,
+                               uid_t authenticated_uid,
+                               const std::string &client_key,
+                               pt::ptree &tree) {
+    bool transitioned = false;
+    if (resolve_selected_output_impl(session, authenticated_uid, client_key, tree, transitioned)) {
+      return true;
+    }
+#ifdef _WIN32
+    // This request changed the host's displays and then failed for good. The
+    // lease is only released when a stream ends, and none will start, so put
+    // the monitors back now. A 425 or a topology refresh means the client
+    // retries against the changed displays, so those keep them.
+    if (transitioned) {
+      const auto code = tree.get<int>("root.<xmlattr>.status_code", 0);
+      const auto message = tree.get<std::string>("root.<xmlattr>.status_message", "");
+      const bool retry = code == 425 || message.find("topology changed") != std::string::npos;
+      if (!retry) {
+        BOOST_LOG(warning) << "Launch failed after a display transition; restoring the host displays"sv;
+        plank::session::release_display_lease(authenticated_uid);
+      }
+    }
+#endif
+    return false;
   }
 
   bool validate_capture_source(session_stream::launch_session_t &session,

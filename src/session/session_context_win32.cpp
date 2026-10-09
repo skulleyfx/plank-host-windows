@@ -482,7 +482,15 @@ namespace plank::session {
       } else {
         BOOST_LOG(info) << "Making "sv << target.name << " the primary display at "sv
                         << choice.mode.width << 'x' << choice.mode.height << " for a PLANK session"sv;
-        const auto layout = plank::display_arrange::current_layout();
+        // Other remote-desktop products' virtual displays are not ours to
+        // move or resize, and one that refuses would fail the whole set.
+        auto layout = plank::display_arrange::current_layout();
+        layout.erase(std::remove_if(layout.begin(), layout.end(), [&displays](const auto &display) {
+                       return std::none_of(displays.begin(), displays.end(), [&display](const auto &streamable) {
+                         return streamable.name == display.name;
+                       });
+                     }),
+                     layout.end());
         const auto at = std::find_if(layout.begin(), layout.end(),
                                      [&target](const auto &display) { return display.name == target.name; });
         if (at != layout.end()) {
@@ -502,6 +510,9 @@ namespace plank::session {
                            << choice.mode.height << " ("sv
                            << plank::display_arrange::fallback_reason_name(choice.reason)
                            << "); trying the next option"sv;
+        // apply_mode() and apply_arrangement() put the displays back
+        // themselves on a refusal, and the next candidate reads the layout
+        // afresh, so it starts from what this request found.
         continue;
       }
 
