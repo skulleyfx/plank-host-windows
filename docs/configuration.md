@@ -95,7 +95,7 @@ how long a single sign-in session remains valid.
 
 Longest milliseconds one authentication round waits for a second-factor push
 decision from a provider. Allows clients to time out and retry if a push is slow.
-Valid range: `500` through `4500`. Default: `3500`. For a 16-round client
+Valid range: `500` through `4500`. Default: `3800`. For a 16-round client
 authentication, this timing covers a Duo Security 60-second push timeout.
 
 ### admin_desktop_override

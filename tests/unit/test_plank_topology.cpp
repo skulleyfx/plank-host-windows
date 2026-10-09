@@ -258,3 +258,28 @@ TEST(PlankTopology, RejectsMalformedModeText) {
     EXPECT_EQ(size.height, 0) << text;
   }
 }
+
+TEST(PlankTopology, FailedLaunchReleasesDisplayLeaseUnlessClientRetries) {
+  // Success keeps the lease for the stream.
+  EXPECT_FALSE(topology::should_release_display_lease_on_launch_exit(true, 200, false));
+  // A retry against the changed displays (425, topology-refresh 409) keeps it.
+  EXPECT_FALSE(topology::should_release_display_lease_on_launch_exit(true, 425, true));
+  EXPECT_FALSE(topology::should_release_display_lease_on_launch_exit(true, 409, true));
+  // Any other failure after a transition gives the displays back.
+  EXPECT_TRUE(topology::should_release_display_lease_on_launch_exit(true, 503, false));
+  EXPECT_TRUE(topology::should_release_display_lease_on_launch_exit(true, 401, false));
+  EXPECT_TRUE(topology::should_release_display_lease_on_launch_exit(true, 409, false));
+  EXPECT_TRUE(topology::should_release_display_lease_on_launch_exit(true, 0, false));
+  // Nothing to release when the launch never held a lease.
+  EXPECT_FALSE(topology::should_release_display_lease_on_launch_exit(false, 503, false));
+}
+
+TEST(PlankTopology, LeaseTimerReleasesOnlyAnUnstartedCurrentLease) {
+  EXPECT_TRUE(topology::lease_timer_should_release(true, false, 4, 4));
+  // A stream started: the lease is released when it ends instead.
+  EXPECT_FALSE(topology::lease_timer_should_release(true, true, 4, 4));
+  // Already released.
+  EXPECT_FALSE(topology::lease_timer_should_release(false, false, 4, 4));
+  // The lease was released and acquired again since the timer was armed.
+  EXPECT_FALSE(topology::lease_timer_should_release(true, false, 4, 5));
+}

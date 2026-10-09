@@ -1444,11 +1444,19 @@ namespace nvhttp {
     return true;
   }
 
+  /// What resolving the output did to the host, beyond success or failure.
+  struct select_output_outcome_t {
+    bool transitioned {};  ///< This request applied a display transition.
+    bool lease_held {};  ///< The account's display lease is held once the output is resolved, from this or an earlier request.
+    bool client_retries {};  ///< A failure means the client retries against the changed displays (425, topology refresh).
+  };
+
   bool resolve_selected_output_impl(session_stream::launch_session_t &session,
                                     uid_t authenticated_uid,
                                     const std::string &client_key,
                                     pt::ptree &tree,
-                                    bool &transitioned) {
+                                    select_output_outcome_t &outcome) {
+    bool &transitioned = outcome.transitioned;
     auto outputs = video::output_topology();
     const auto previous_flags = known_client_flags(client_key);
     remember_client_flags(client_key, session.plank_feature_flags);
@@ -1469,6 +1477,9 @@ namespace nvhttp {
         tree.put("root.<xmlattr>.status_code", 425);
         tree.put("root.<xmlattr>.status_message", "PLANK host display transition started");
       }
+      // The client re-reads the topology and retries, or retries after the
+      // transition settled; either way it expects the displays as they are now.
+      outcome.client_retries = true;
       return false;
     };
     if (session.display_mode == "scaled-span" || session.display_mode == "separate-displays") {
@@ -1505,6 +1516,7 @@ namespace nvhttp {
         // captures. The new flags are already stored; have it read again.
         tree.put("root.<xmlattr>.status_code", 409);
         tree.put("root.<xmlattr>.status_message", "Host output topology changed; refresh and retry");
+        outcome.client_retries = true;
         return false;
       }
       if (plank::topology::publish_single_output(
@@ -1553,30 +1565,60 @@ namespace nvhttp {
     return true;
   }
 
+  /**
+   * @brief Resolve the output a launch captures and report what that did to the displays.
+   *
+   * @param session Launch being resolved.
+   * @param authenticated_uid Account that owns the desktop session.
+   * @param client_key Key the client's feature flags are remembered under.
+   * @param tree Response tree filled on failure.
+   * @param outcome Filled with whether this request applied a display transition and whether
+   *                a failure means the client retries against the changed displays.
+   * @return True when the output was resolved.
+   */
   bool resolve_selected_output(session_stream::launch_session_t &session,
                                uid_t authenticated_uid,
                                const std::string &client_key,
-                               pt::ptree &tree) {
-    bool transitioned = false;
-    if (resolve_selected_output_impl(session, authenticated_uid, client_key, tree, transitioned)) {
+                               pt::ptree &tree,
+                               select_output_outcome_t &outcome) {
+    const bool resolved = resolve_selected_output_impl(session, authenticated_uid, client_key, tree, outcome);
+    outcome.lease_held = outcome.transitioned || session.plank_display_lease;
+    if (resolved) {
       return true;
     }
-#ifdef _WIN32
-    // This request changed the host's displays and then failed for good. The
-    // lease is only released when a stream ends, and none will start, so put
-    // the monitors back now. A 425 or a topology refresh means the client
-    // retries against the changed displays, so those keep them.
-    if (transitioned) {
-      const auto code = tree.get<int>("root.<xmlattr>.status_code", 0);
-      const auto message = tree.get<std::string>("root.<xmlattr>.status_message", "");
-      const bool retry = code == 425 || message.find("topology changed") != std::string::npos;
-      if (!retry) {
-        BOOST_LOG(warning) << "Launch failed after a display transition; restoring the host displays"sv;
-        plank::session::release_display_lease(authenticated_uid);
-      }
+    // A 425 is only ever answered for a transition the client is meant to retry.
+    if (tree.get<int>("root.<xmlattr>.status_code", 0) == 425) {
+      outcome.client_retries = true;
     }
-#endif
     return false;
+  }
+
+  /**
+   * @brief Give the host displays back when a launch exits without starting a stream.
+   *
+   * The lease is otherwise released only when a stream ends. Call this on every exit of
+   * launch() and resume() once the output resolution ran; it does nothing for a success,
+   * or for an outcome where the client retries against the changed displays (a timer
+   * releases the lease if no stream ever starts).
+   *
+   * @param authenticated_uid Account that owns the lease.
+   * @param outcome Result of resolve_selected_output().
+   * @param status_code Status the launch is answering with.
+   */
+  void release_display_lease_after_failed_launch(uid_t authenticated_uid,
+                                                 const select_output_outcome_t &outcome,
+                                                 int status_code) {
+#ifdef _WIN32
+    if (plank::topology::should_release_display_lease_on_launch_exit(
+          outcome.lease_held, status_code, outcome.client_retries)) {
+      BOOST_LOG(warning) << "Launch failed after a display transition; restoring the host displays"sv;
+      plank::session::release_display_lease(authenticated_uid);
+    }
+#else
+    (void) authenticated_uid;
+    (void) outcome;
+    (void) status_code;
+#endif
   }
 
   bool validate_capture_source(session_stream::launch_session_t &session,
@@ -1960,6 +2002,17 @@ namespace nvhttp {
 
     auto local_endpoint = request->local_endpoint();
 
+#ifdef _WIN32
+    // A host that settled on the software encoder advertises no PLANK modes. Look
+    // for the hardware encoder again in the background (rate limited, never waits)
+    // so it is usually back by the time someone clicks connect.
+    if (!video::encoder_probe_in_flight() &&
+        video::reprobe_precedes_mode_validation(session_stream::session_count() > 0 ||
+                                                session_stream::launch_session_pending())) {
+      video::kick_encoder_reprobe_async();
+    }
+#endif
+
     pt::ptree tree;
 
     tree.put("root.<xmlattr>.status_code", 200);
@@ -2187,6 +2240,34 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Re-check the video encoders before the requested mode is validated.
+   *
+   * Only Windows hosts re-probe: they can start on the software encoder while another
+   * remote-desktop product holds the console. The probe runs on its own thread and this
+   * waits about a second at most; if it is still running the launch is refused with a
+   * retryable 503 rather than proceeding while the encoder state is being rewritten.
+   *
+   * @param active_session Whether a stream is active or a launch is pending.
+   * @param tree Response tree to fill when the launch must be refused.
+   * @return False when the launch must be refused.
+   */
+  bool reprobe_encoders_if_idle(bool active_session, pt::ptree &tree) {
+#ifdef _WIN32
+    if (video::reprobe_precedes_mode_validation(active_session) &&
+        video::reprobe_encoders_before_session() == video::reprobe_result_e::busy) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message",
+               "Host is re-checking its video encoder; retry in a few seconds");
+      return false;
+    }
+#else
+    (void) active_session;
+    (void) tree;
+#endif
+    return true;
+  }
+
+  /**
    * @brief Launch the requested application for a GameStream session.
    *
    * @param host_audio Host audio.
@@ -2200,6 +2281,9 @@ namespace nvhttp {
 
     pt::ptree tree;
     bool revert_display_configuration {false};
+    bool output_resolution_ran {false};
+    uid_t lease_uid {};
+    select_output_outcome_t output_outcome;
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -2213,6 +2297,12 @@ namespace nvhttp {
 
       if (revert_display_configuration) {
         display_device::revert_configuration();
+      }
+      // Any exit after the displays may have changed that is not a success or a
+      // retry-against-the-changed-displays answer hands the displays back.
+      if (output_resolution_ran) {
+        release_display_lease_after_failed_launch(
+          lease_uid, output_outcome, tree.get<int>("root.<xmlattr>.status_code", 0));
       }
     });
 
@@ -2273,6 +2363,10 @@ namespace nvhttp {
       tree.put("root.gamesession", 0);
       return;
     }
+    if (!reprobe_encoders_if_idle(active_session, tree)) {
+      tree.put("root.gamesession", 0);
+      return;
+    }
     if (!validate_encoder_backend(*launch_session, tree)) {
       tree.put("root.gamesession", 0);
       return;
@@ -2311,7 +2405,9 @@ namespace nvhttp {
       return;
     }
 
-    if (!resolve_selected_output(*launch_session, *authenticated_uid, client_flags_key(request), tree)) {
+    output_resolution_ran = true;
+    lease_uid = *authenticated_uid;
+    if (!resolve_selected_output(*launch_session, *authenticated_uid, client_flags_key(request), tree, output_outcome)) {
       tree.put("root.gamesession", 0);
       return;
     }
@@ -2414,6 +2510,9 @@ namespace nvhttp {
     std::scoped_lock session_start_lock {session_start_mutex};
 
     pt::ptree tree;
+    bool output_resolution_ran {false};
+    uid_t lease_uid {};
+    select_output_outcome_t output_outcome;
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -2424,6 +2523,12 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+
+      // See launch(): a non-success exit that is not a retry hands the displays back.
+      if (output_resolution_ran) {
+        release_display_lease_after_failed_launch(
+          lease_uid, output_outcome, tree.get<int>("root.<xmlattr>.status_code", 0));
+      }
     });
 
     if (handle_viewer_join(request->parse_query_string(), request, tree, "root.resume")) {
@@ -2483,6 +2588,10 @@ namespace nvhttp {
       tree.put("root.resume", 0);
       return;
     }
+    if (!reprobe_encoders_if_idle(active_session, tree)) {
+      tree.put("root.resume", 0);
+      return;
+    }
     if (!validate_encoder_backend(*launch_session, tree)) {
       tree.put("root.resume", 0);
       return;
@@ -2502,7 +2611,9 @@ namespace nvhttp {
         launch_session->host_audio = host_audio;
       }
     }
-    if (!resolve_selected_output(*launch_session, *authenticated_uid, client_flags_key(request), tree)) {
+    output_resolution_ran = true;
+    lease_uid = *authenticated_uid;
+    if (!resolve_selected_output(*launch_session, *authenticated_uid, client_flags_key(request), tree, output_outcome)) {
       tree.put("root.resume", 0);
       return;
     }
