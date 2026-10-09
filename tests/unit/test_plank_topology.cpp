@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
 namespace topology = plank::topology;
 
 TEST(PlankTopology, PublishesVersionThirteenFeatureContract) {
@@ -166,4 +168,46 @@ TEST(PlankTopology, OneScreenOverrides) {
   EXPECT_TRUE(topology::publish_single_output(one_screen_mode::always, false, std::nullopt, 2));
   // never turns the automatic behaviour off.
   EXPECT_FALSE(topology::publish_single_output(one_screen_mode::never, false, 0U, 2));
+}
+
+TEST(PlankTopology, ClientFlagStoreRemembersAndReportsChanges) {
+  topology::client_flag_store store;
+  EXPECT_FALSE(store.lookup("a").has_value());
+  EXPECT_TRUE(store.record("a", 5));
+  EXPECT_EQ(store.lookup("a"), 5U);
+  EXPECT_FALSE(store.record("a", 5));
+  EXPECT_TRUE(store.record("a", 6));
+  EXPECT_EQ(store.lookup("a"), 6U);
+  EXPECT_FALSE(store.record("", 1));
+  EXPECT_EQ(store.size(), 1U);
+}
+
+TEST(PlankTopology, ClientFlagStoreEvictsOldest) {
+  topology::client_flag_store store;
+  for (std::size_t i = 0; i < topology::client_flag_store::max_entries; ++i) {
+    store.record("k" + std::to_string(i), 1);
+  }
+  store.record("k0", 1);  // k0 becomes most recent; k1 is now oldest
+  store.record("new", 2);
+  EXPECT_EQ(store.size(), topology::client_flag_store::max_entries);
+  EXPECT_TRUE(store.lookup("k0").has_value());
+  EXPECT_FALSE(store.lookup("k1").has_value());
+  EXPECT_EQ(store.lookup("new"), 2U);
+}
+
+TEST(PlankTopology, ClientFlagStoreRoundTripsAndToleratesCorruption) {
+  topology::client_flag_store store;
+  store.record("id:DOM\\amy|10.0.0.5", 0x7FFFFU);
+  store.record("ip:10.0.0.9", 0U);
+  const auto loaded = topology::client_flag_store::from_json(store.to_json().dump());
+  EXPECT_EQ(loaded.size(), 2U);
+  EXPECT_EQ(loaded.lookup("id:DOM\\amy|10.0.0.5"), 0x7FFFFU);
+  EXPECT_EQ(loaded.lookup("ip:10.0.0.9"), 0U);
+  EXPECT_EQ(topology::client_flag_store::from_json("").size(), 0U);
+  EXPECT_EQ(topology::client_flag_store::from_json("{not json").size(), 0U);
+  EXPECT_EQ(topology::client_flag_store::from_json("[1,2]").size(), 0U);
+  const auto partial = topology::client_flag_store::from_json(
+    R"({"clients":[{"key":"a","flags":-1},{"key":"b","flags":4294967296},{"key":"c","flags":7},{"flags":1},3]})");
+  EXPECT_EQ(partial.size(), 1U);
+  EXPECT_EQ(partial.lookup("c"), 7U);
 }

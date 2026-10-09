@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <format>
 #include <functional>
 #include <map>
@@ -886,27 +887,81 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Last PLANK feature bits each peer sent at launch or resume.
+   * @brief Feature bits each client declared at its last launch or resume.
    *
-   * The topology request carries no client identity, so the host remembers
-   * what the same address declared at its last launch and narrows the list it
-   * publishes to match.
+   * The topology request carries no feature bits, so the host remembers what
+   * the same client declared and narrows the list it publishes to match. The
+   * store is kept across restarts in plank-client-flags.json beside the state
+   * file, so a client is refused for a retry at most once ever.
    */
-  std::mutex peer_flags_mutex;
-  std::map<std::string, std::uint32_t> peer_feature_flags;
+  std::mutex client_flags_mutex;
+  plank::topology::client_flag_store client_flag_cache;
+  bool client_flags_loaded = false;
 
-  std::optional<std::uint32_t> known_peer_flags(const std::string &peer) {
-    std::scoped_lock lock {peer_flags_mutex};
-    const auto found = peer_feature_flags.find(peer);
-    if (found == peer_feature_flags.end()) {
-      return std::nullopt;
-    }
-    return found->second;
+  fs::path client_flags_path() {
+    return fs::path(config::nvhttp.file_state).parent_path() / "plank-client-flags.json";
   }
 
-  void remember_peer_flags(const std::string &peer, std::uint32_t flags) {
-    std::scoped_lock lock {peer_flags_mutex};
-    peer_feature_flags[peer] = flags;
+  /// Caller holds client_flags_mutex.
+  void load_client_flags_locked() {
+    if (client_flags_loaded) {
+      return;
+    }
+    client_flags_loaded = true;
+    std::ifstream in(client_flags_path(), std::ios::binary);
+    if (!in) {
+      return;
+    }
+    std::stringstream text;
+    text << in.rdbuf();
+    client_flag_cache = plank::topology::client_flag_store::from_json(text.str());
+  }
+
+  /// Caller holds client_flags_mutex. Writes a temporary file and renames it.
+  void save_client_flags_locked() {
+    const auto path = client_flags_path();
+    auto temporary = path;
+    temporary += ".tmp";
+    std::error_code ec;
+    {
+      std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+      if (!out) {
+        BOOST_LOG(warning) << "Couldn't write "sv << temporary.string();
+        return;
+      }
+      out << client_flag_cache.to_json().dump();
+    }
+    fs::rename(temporary, path, ec);
+    if (ec) {
+      BOOST_LOG(warning) << "Couldn't replace "sv << path.string() << ": "sv << ec.message();
+      fs::remove(temporary, ec);
+    }
+  }
+
+  /**
+   * @brief Key a client by its authenticated account and address.
+   *
+   * Two accounts behind one NAT address stay separate. When the request has no
+   * authenticated account the address alone is used.
+   */
+  std::string client_flags_key(const req_https_t &request) {
+    const auto peer = authentication_peer(request);
+    const auto identity = authenticated_identity(request);
+    return identity.empty() ? "ip:" + peer : "id:" + identity + "|" + peer;
+  }
+
+  std::optional<std::uint32_t> known_client_flags(const std::string &key) {
+    std::scoped_lock lock {client_flags_mutex};
+    load_client_flags_locked();
+    return client_flag_cache.lookup(key);
+  }
+
+  void remember_client_flags(const std::string &key, std::uint32_t flags) {
+    std::scoped_lock lock {client_flags_mutex};
+    load_client_flags_locked();
+    if (client_flag_cache.record(key, flags)) {
+      save_client_flags_locked();
+    }
   }
 
   /**
@@ -1186,7 +1241,7 @@ namespace nvhttp {
     if (const auto declared = query.find("plankFeatureFlags"); declared != query.end()) {
       client_flags = static_cast<std::uint32_t>(util::from_view(declared->second));
     } else {
-      client_flags = known_peer_flags(authentication_peer(request));
+      client_flags = known_client_flags(client_flags_key(request));
     }
     write_auth_json(response, SimpleWeb::StatusCode::success_ok, output_topology_json(client_flags));
   }
@@ -1218,11 +1273,11 @@ namespace nvhttp {
 
   bool resolve_selected_output(session_stream::launch_session_t &session,
                                uid_t authenticated_uid,
-                               const std::string &peer,
+                               const std::string &client_key,
                                pt::ptree &tree) {
     const auto outputs = video::output_topology();
-    const auto previous_flags = known_peer_flags(peer);
-    remember_peer_flags(peer, session.plank_feature_flags);
+    const auto previous_flags = known_client_flags(client_key);
+    remember_client_flags(client_key, session.plank_feature_flags);
 #ifndef _WIN32
     (void) previous_flags;
 #endif
@@ -1906,7 +1961,7 @@ namespace nvhttp {
       return;
     }
 
-    if (!resolve_selected_output(*launch_session, *authenticated_uid, authentication_peer(request), tree)) {
+    if (!resolve_selected_output(*launch_session, *authenticated_uid, client_flags_key(request), tree)) {
       tree.put("root.gamesession", 0);
       return;
     }
@@ -2077,7 +2132,7 @@ namespace nvhttp {
         launch_session->host_audio = host_audio;
       }
     }
-    if (!resolve_selected_output(*launch_session, *authenticated_uid, authentication_peer(request), tree)) {
+    if (!resolve_selected_output(*launch_session, *authenticated_uid, client_flags_key(request), tree)) {
       tree.put("root.resume", 0);
       return;
     }
