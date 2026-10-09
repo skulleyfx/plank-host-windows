@@ -76,6 +76,47 @@ CPU and network bandwidth.
 Allow PAM authentication as root. Default: `false`. Enabling this does not
 bypass PAM/SSSD/HBAC policy or active-desktop ownership checks.
 
+### second_factor_resume_minutes
+
+Minutes a reconnect ticket stays valid after the last streaming activity. A
+client that closes and reconnects within this window does not require
+second-factor authentication again. Valid range: `0` through `1440`. Default:
+`10`. Set to `0` to disable ticket-based reconnection and always require
+second-factor authentication.
+
+### second_factor_resume_max_hours
+
+Hours after the original sign-in at which reconnect tickets stop working and
+the second-factor authentication is always required, regardless of recent
+activity. Valid range: `1` through `720`. Default: `12`. This setting limits
+how long a single sign-in session remains valid.
+
+### second_factor_round_wait_ms
+
+Longest milliseconds one authentication round waits for a second-factor push
+decision from a provider. Allows clients to time out and retry if a push is slow.
+Valid range: `500` through `4500`. Default: `3500`. For a 16-round client
+authentication, this timing covers a Duo Security 60-second push timeout.
+
+### admin_desktop_override
+
+Allow members of the host administrator group to stream the active desktop even
+when another account owns it. Set to `true` to let admins take control of any
+running desktop; `false` restricts streaming to the desktop owner. Accepted
+values: `true` or `false`. Default: `false`.
+
+### shared_screen
+
+Allow multiple client connections to view a single running stream simultaneously
+(view-only mode). When enabled, extra clients watch the primary client's view
+without interfering. Accepted values: `true` or `false`. Default: `false`.
+
+### shared_screen_max_viewers
+
+Maximum number of view-only clients that can attach to a single active stream.
+Valid range: `1` through `8`. Default: `4`. Only applies when `shared_screen` is
+enabled.
+
 ### pkey
 
 Path to the host TLS private key. The packaged profile uses
@@ -136,6 +177,14 @@ Optional GPU/display adapter selector for multi-GPU hosts. Empty uses automatic
 selection.
 
 ## Common video behavior
+
+### one_screen
+
+Multi-monitor display behavior for single-screen clients. `auto` uses one screen
+for clients lacking native two-screen capture support (recommended); `always`
+forces single-screen encoding regardless of client capability; `never` always
+encodes all connected displays. Accepted values: `auto`, `always`, or `never`.
+Default: `auto`.
 
 ### minimum_fps_target
 

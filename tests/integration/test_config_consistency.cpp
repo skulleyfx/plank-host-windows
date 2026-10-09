@@ -114,6 +114,7 @@ TEST(ConfigConsistencyTest, RuntimeAndDocumentedOptionsMatch) {
 TEST(ConfigConsistencyTest, RuntimeOptionsMatchPlankProductPolicy) {
   const std::set<std::string, std::less<>> expected {
     "adapter_name",
+    "admin_desktop_override",
     "allow_root_login",
     "audio_sink",
     "cert",
@@ -135,9 +136,15 @@ TEST(ConfigConsistencyTest, RuntimeOptionsMatchPlankProductPolicy) {
     "nvenc_split_encode",
     "nvenc_twopass",
     "nvenc_vbv_increase",
+    "one_screen",
     "ping_timeout",
     "pkey",
     "port",
+    "second_factor_resume_max_hours",
+    "second_factor_resume_minutes",
+    "second_factor_round_wait_ms",
+    "shared_screen",
+    "shared_screen_max_viewers",
     "startup_layout",
     "mdns_discovery",
     "host_name",
