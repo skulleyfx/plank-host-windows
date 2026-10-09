@@ -25,6 +25,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -55,6 +56,10 @@ namespace platf::ndi_output {
     constexpr auto runtime_missing_retry = 10min;
     /// Exit code the helper uses for "NDI runtime not installed".
     constexpr DWORD exit_runtime_missing = 2;
+    /// Exit code the helper uses for "bad command line arguments". A restart cannot cure that.
+    constexpr DWORD exit_bad_arguments = 64;
+    /// How long to let the log pump finish by itself after the helper is gone before cancelling its read.
+    constexpr auto pump_grace = 2s;
 
     std::filesystem::path helper_path() {
       wchar_t buffer[MAX_PATH * 4] {};
@@ -83,8 +88,17 @@ namespace platf::ndi_output {
       }
     };
 
-    /// Forward each line the helper writes to our log.
-    void pump_log(HANDLE read_end) {
+    /// Shared between the supervisor and the log pump thread.
+    struct pump_state_t {
+      std::atomic<bool> cancel {false};
+      std::atomic<bool> done {false};
+      std::atomic<HANDLE> thread {nullptr};  ///< real Win32 handle of the pump thread, for CancelSynchronousIo
+    };
+
+    /// Forward each line the helper writes to our log. Sets done when it returns.
+    void pump_log(HANDLE read_end, pump_state_t &state) {
+      // std::thread::native_handle() is not a Win32 handle with winpthreads, so open our own.
+      state.thread = OpenThread(THREAD_TERMINATE, FALSE, GetCurrentThreadId());
       std::string pending;
       char buffer[1024];
       DWORD got = 0;
@@ -101,7 +115,7 @@ namespace platf::ndi_output {
           }
         }
       };
-      while (ReadFile(read_end, buffer, sizeof(buffer), &got, nullptr) && got > 0) {
+      while (!state.cancel.load() && ReadFile(read_end, buffer, sizeof(buffer), &got, nullptr) && got > 0) {
         pending.append(buffer, got);
         if (pending.size() > 16384) {
           pending.resize(16384);
@@ -111,6 +125,7 @@ namespace platf::ndi_output {
       }
       pending += '\n';
       flush_lines();
+      state.done = true;
     }
 
     class ndi_output_t: public platf::deinit_t {
@@ -165,6 +180,11 @@ namespace platf::ndi_output {
           if (stop_) {
             return;
           }
+          if (exit_code == exit_bad_arguments) {
+            // Restarting with the same command line would fail the same way, forever.
+            BOOST_LOG(error) << "NDI helper rejected its command line (exit code 64); check ndi_source_name and ndi_groups. NDI output is disabled until the host restarts"sv;
+            return;
+          }
           if (exit_code == exit_runtime_missing) {
             // The helper already said why through the log pump.
             if (wait(runtime_missing_retry)) {
@@ -188,25 +208,24 @@ namespace platf::ndi_output {
        * @return False if it could not be started.
        */
       bool run_once(DWORD &exit_code) {
-        SECURITY_ATTRIBUTES inheritable {sizeof(inheritable), nullptr, TRUE};
-
+        // Every pipe end starts non-inheritable so no other child process launched by the host
+        // (apps, commands) can pick them up. Only the helper's two ends are made inheritable,
+        // for the instant of CreateProcessW, and only those two are in its handle list.
         // stdout/stderr pipe: helper writes, we read.
         HANDLE out_read = nullptr, out_write = nullptr;
-        if (!CreatePipe(&out_read, &out_write, &inheritable, 0)) {
+        if (!CreatePipe(&out_read, &out_write, nullptr, 0)) {
           BOOST_LOG(error) << "NDI: CreatePipe failed ["sv << GetLastError() << ']';
           return false;
         }
         handle_t out_read_h {out_read}, out_write_h {out_write};
-        SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
 
         // stdin pipe: closing our end tells the helper to stop.
         HANDLE in_read = nullptr, in_write = nullptr;
-        if (!CreatePipe(&in_read, &in_write, &inheritable, 0)) {
+        if (!CreatePipe(&in_read, &in_write, nullptr, 0)) {
           BOOST_LOG(error) << "NDI: CreatePipe failed ["sv << GetLastError() << ']';
           return false;
         }
         handle_t in_read_h {in_read}, in_write_h {in_write};
-        SetHandleInformation(in_write, HANDLE_FLAG_INHERIT, 0);
 
         // Only the two pipe ends the helper needs may be inherited, not every inheritable handle we hold.
         HANDLE inherit_list[] {in_read, out_write};
@@ -214,9 +233,13 @@ namespace platf::ndi_output {
         InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
         std::vector<char> attr_buffer(attr_size);
         auto attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buffer.data());
-        if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) ||
-            !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit_list, sizeof(inherit_list), nullptr, nullptr)) {
+        if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size)) {
           BOOST_LOG(error) << "NDI: could not prepare the helper's handle list ["sv << GetLastError() << ']';
+          return false;
+        }
+        if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit_list, sizeof(inherit_list), nullptr, nullptr)) {
+          BOOST_LOG(error) << "NDI: could not prepare the helper's handle list ["sv << GetLastError() << ']';
+          DeleteProcThreadAttributeList(attrs);
           return false;
         }
 
@@ -233,6 +256,14 @@ namespace platf::ndi_output {
         std::vector<wchar_t> command_buffer(command.begin(), command.end());
         command_buffer.push_back(L'\0');
 
+        // The handle list only accepts inheritable handles: flip the flag on just the helper's ends.
+        if (!SetHandleInformation(in_read, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) ||
+            !SetHandleInformation(out_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+          BOOST_LOG(error) << "NDI: could not mark the helper's pipe ends inheritable ["sv << GetLastError() << ']';
+          DeleteProcThreadAttributeList(attrs);
+          return false;
+        }
+
         // Suspended so it can be put in the job before it runs a single instruction.
         PROCESS_INFORMATION process_info {};
         const BOOL created = CreateProcessW(
@@ -248,6 +279,8 @@ namespace platf::ndi_output {
           &process_info
         );
         DeleteProcThreadAttributeList(attrs);
+        SetHandleInformation(in_read, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(out_write, HANDLE_FLAG_INHERIT, 0);
         if (!created) {
           BOOST_LOG(error) << "NDI: could not start "sv << utf_utils::to_utf8(exe_.wstring()) << " ["sv << GetLastError() << ']';
           return false;
@@ -271,7 +304,8 @@ namespace platf::ndi_output {
         out_write_h.close();
 
         BOOST_LOG(info) << "NDI helper started (pid "sv << process_info.dwProcessId << ')';
-        std::thread pump {pump_log, out_read};
+        pump_state_t pump_state;
+        std::thread pump {pump_log, out_read, std::ref(pump_state)};
 
         // Wait for exit or for a stop request (polled; the wait is short).
         bool exited = false;
@@ -280,7 +314,6 @@ namespace platf::ndi_output {
             exited = true;
             break;
           }
-          std::lock_guard lock {mutex_};
           if (stop_) {
             break;
           }
@@ -300,7 +333,26 @@ namespace platf::ndi_output {
         process.close();
         job.close();  // also kills anything the helper may have left behind
         if (pump.joinable()) {
-          pump.join();  // ends at EOF once the helper is gone
+          // Normally ends at EOF once the helper is gone. If some other process still holds a copy
+          // of the write end there is no EOF, so after a grace period cancel the blocked read
+          // (repeatedly: the thread may not have entered ReadFile yet) instead of hanging shutdown.
+          const auto deadline = std::chrono::steady_clock::now() + pump_grace;
+          while (!pump_state.done && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(20ms);
+          }
+          if (!pump_state.done) {
+            pump_state.cancel = true;
+            for (int attempt = 0; attempt < 50 && !pump_state.done; ++attempt) {
+              if (HANDLE pump_thread = pump_state.thread.load()) {
+                CancelSynchronousIo(pump_thread);
+              }
+              std::this_thread::sleep_for(20ms);
+            }
+          }
+          pump.join();
+          if (HANDLE pump_thread = pump_state.thread.load()) {
+            CloseHandle(pump_thread);
+          }
         }
         return true;
       }
@@ -309,7 +361,7 @@ namespace platf::ndi_output {
       plank::ndi::helper_options options_;
       std::mutex mutex_;
       std::condition_variable cv_;
-      bool stop_ {false};
+      std::atomic<bool> stop_ {false};
       std::thread thread_;
     };
   }  // namespace
