@@ -57,18 +57,14 @@ namespace plank::auth {
 
     /// DUO expires a push after about a minute.
     constexpr auto push_deadline = 70s;
-    /// Most DUO workers at once. A worker lives for at most push_deadline plus
-    /// one poll after its sign-in ends, and needs a valid password to start.
-    constexpr std::size_t max_duo_workers = 16;
-    /// Most DUO workers for one account: a user with a valid password cannot
-    /// restart sign-ins to hold every slot, and cannot probe in parallel.
-    constexpr std::size_t max_duo_workers_per_account = 2;
-    /// Most DUO workers for one client address.
-    constexpr std::size_t max_duo_workers_per_peer = 4;
-
-    factor_wait::worker_slots_t &duo_workers() {
-      static factor_wait::worker_slots_t slots {max_duo_workers, max_duo_workers_per_account, max_duo_workers_per_peer};
-      return slots;
+    /// Admission for DUO pushes (limits in push_limits_t: 16 workers overall, 2
+    /// per account, 4 per client address, and a per-account push cooldown). A
+    /// worker lives for at most push_deadline plus one poll after its sign-in
+    /// ends, and needs a valid password to start. A retry from the same account
+    /// and address supersedes the older push instead of waiting for it to expire.
+    factor_wait::push_governor_t &duo_pushes() {
+      static factor_wait::push_governor_t governor;
+      return governor;
     }
 
     std::wstring widen(std::string_view text) {
@@ -377,14 +373,13 @@ namespace plank::auth {
     using approval_e = factor_wait::pending_approval_t::state_e;
 
     /**
-     * @brief Return a worker slot when the DUO worker exits by any path.
+     * @brief Return the worker's slots when the DUO worker exits by any path.
      */
     struct worker_slot_guard_t {
-      std::string account_key;  ///< limiter_key() of the account the slot was taken for.
-      std::string peer_key;  ///< limiter_key() of the client address.
+      std::uint64_t id;  ///< Admission id from push_governor_t::admit().
 
       ~worker_slot_guard_t() {
-        duo_workers().release(account_key, peer_key);
+        duo_pushes().finish(id);
       }
     };
 
@@ -401,24 +396,37 @@ namespace plank::auth {
       }
 
       factor_step_t begin(std::string_view username, std::string_view remote_host) override {
-        account_key_ = factor_wait::limiter_key(duo_username(username));
-        peer_key_ = factor_wait::limiter_key(remote_host);
-        if (!duo_workers().try_acquire(account_key_, peer_key_)) {
-          // Fail closed: never degrade to password-only because DUO is busy
-          // (globally, or for this account or client address).
+        // A new push for the same account and address supersedes that pair's
+        // older pushes (their approvals settle as denied).
+        const auto admission = duo_pushes().admit(duo_username(username), remote_host, factor_wait::clock_t::now(),
+                                                  "Contacting DUO...");
+        if (admission.refusal != factor_wait::refusal_e::none) {
+          // Fail closed: never degrade to password-only because DUO is busy or
+          // the account is asking for pushes too fast. The log names the limit,
+          // never a secret.
+          const auto &limits = duo_pushes().limits();
+          BOOST_LOG(warning) << "DUO sign-in refused: " << factor_wait::refusal_name(admission.refusal)
+                             << " limit (" << limits.global << " waiting overall, " << limits.per_account
+                             << " per account, " << limits.per_address << " per client address, at most "
+                             << limits.max_in_window << " pushes per " << limits.window.count() / 1000
+                             << " s and one per " << limits.min_spacing.count() / 1000 << " s per account)";
           return {factor_step_t::state_e::denied, {},
-                  std::format("DUO sign-in refused: {} waiting overall, {} per account, {} per client address",
-                              max_duo_workers, max_duo_workers_per_account, max_duo_workers_per_peer),
-                  "Too many sign-ins are waiting for DUO. Try again in a minute."};
+                  std::string {"DUO sign-in refused: "} + factor_wait::refusal_name(admission.refusal) + " limit",
+                  factor_wait::refusal_user_message(admission.refusal)};
         }
-        exchange_ = std::make_shared<duo_exchange_t>("Contacting DUO...");
+        if (admission.superseded > 0) {
+          BOOST_LOG(info) << "DUO push restarted from the same account and address; " << admission.superseded
+                          << " older push(es) cancelled";
+        }
+        exchange_ = admission.approval;
         try {
           std::thread(run, exchange_, duo_username(username), std::string {remote_host}, failmode_,
                       config::plank_auth.duo_integration_key, config::plank_auth.duo_secret_key,
-                      config::plank_auth.duo_api_host, account_key_, peer_key_)
+                      config::plank_auth.duo_api_host, admission.id)
             .detach();
         } catch (const std::system_error &e) {
-          duo_workers().release(account_key_, peer_key_);
+          exchange_->cancel();
+          duo_pushes().finish(admission.id);
           exchange_.reset();
           return {factor_step_t::state_e::denied, {}, std::string {"DUO worker could not start: "} + e.what(),
                   "DUO could not be reached, so sign-in was refused."};
@@ -475,8 +483,8 @@ namespace plank::auth {
 
       static void run(std::shared_ptr<duo_exchange_t> exchange, std::string username, std::string remote_host,
                       factor_failmode_e failmode, std::string ikey, std::string skey, std::string host,
-                      std::string account_key, std::string peer_key) {
-        const worker_slot_guard_t slot {std::move(account_key), std::move(peer_key)};  // taken by begin()
+                      std::uint64_t admission_id) {
+        const worker_slot_guard_t slot {admission_id};  // admitted by begin()
         platf::set_thread_name("duo-auth");
         const duo_client_t client {std::move(ikey), std::move(skey), std::move(host)};
         std::map<std::string, std::string> params {{"username", username}};
@@ -537,6 +545,12 @@ namespace plank::auth {
           return;
         }
 
+        if (exchange->cancelled()) {
+          // Superseded or abandoned before the push went out: send nothing.
+          finish(*exchange, factor_step_t::state_e::denied, "DUO exchange abandoned",
+                 "The DUO push was not approved in time.");
+          return;
+        }
         params.emplace("factor", "push");
         params.emplace("device", device);
         params.emplace("async", "1");
@@ -594,8 +608,6 @@ namespace plank::auth {
 
       factor_failmode_e failmode_;
       std::shared_ptr<duo_exchange_t> exchange_;
-      std::string account_key_;  ///< Limiter key of the account holding a worker slot.
-      std::string peer_key_;  ///< Limiter key of the client address holding a worker slot.
     };
   }  // namespace
 
