@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <set>
@@ -291,6 +292,7 @@ namespace plank::auth {
   }
 
   step_t pam_client_t::respond(std::vector<std::string> responses) {
+    const auto round_started = std::chrono::steady_clock::now();
     auto &state = state_for(this);
 
     if (state.awaiting_password) {
@@ -324,6 +326,7 @@ namespace plank::auth {
         return denied(phase_e::authenticate, -1, error_message);
       }
 
+      state.factor->start_round(round_started);
       const auto step = translate(state, state.factor->begin(state.account, state.remote_host));
       authenticated_ = step.state == step_t::state_e::authenticated;
       expected_responses_ = step.prompts.size();
@@ -339,6 +342,7 @@ namespace plank::auth {
     if (!state.factor) {
       return denied(phase_e::protocol, -1, "no second-factor exchange in progress");
     }
+    state.factor->start_round(round_started);
     const auto step = translate(state, state.factor->respond(std::move(responses)));
     authenticated_ = step.state == step_t::state_e::authenticated;
     expected_responses_ = step.prompts.size();

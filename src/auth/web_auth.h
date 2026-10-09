@@ -185,6 +185,7 @@ namespace plank::auth {
     std::mutex mutex_;  ///< Protects all maps and counters.
     std::unordered_map<std::string, entry_t> conversations_;  ///< Pending PAM exchanges.
     std::unordered_map<std::string, entry_t> tokens_;  ///< Authenticated PAM sessions.
+    std::size_t in_flight_ = 0;  ///< Conversations being advanced outside the mutex.
   };
 
   /**

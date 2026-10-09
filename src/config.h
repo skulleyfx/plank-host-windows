@@ -291,6 +291,7 @@ namespace config {
     int lock_on_disconnect_delay;  ///< Seconds to wait for a reconnect before locking.
     std::string admin_group;  ///< Windows: group whose members see host details such as the signed-in user. Empty means BUILTIN\\Administrators.
     bool admin_desktop_override;  ///< Windows: let an admin-group member stream the active desktop even when another account owns it. Default false.
+    int second_factor_round_wait_ms;  ///< Windows: longest one sign-in round waits for a push decision, 500-4500 ms. Default 4000.
   };
 
   struct sunshine_t {
