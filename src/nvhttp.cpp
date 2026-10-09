@@ -639,11 +639,13 @@ namespace nvhttp {
    * @param conversation_id Opaque conversation identifier.
    * @param peer Normalized TLS peer address.
    * @param responses Prompt responses; erased by the conversation.
+   * @param arrived When the HTTPS request arrived; a second-factor round waits until arrived + budget.
    * @return JSON reply body.
    */
   nlohmann::json advance_auth_conversation(const std::string &conversation_id, const std::string &peer,
-                                           std::vector<std::string> responses) {
-    const auto step = web_auth->respond(conversation_id, peer, std::move(responses));
+                                           std::vector<std::string> responses,
+                                           std::chrono::steady_clock::time_point arrived) {
+    const auto step = web_auth->respond(conversation_id, peer, std::move(responses), arrived);
     auto result = auth_step_json(step);
 #ifdef _WIN32
     if (step.state == plank::auth::step_t::state_e::authenticated) {
@@ -707,6 +709,8 @@ namespace nvhttp {
    * @param request HTTPS request carrying prompt responses.
    */
   void auth_respond(const resp_https_t &response, const req_https_t &request) {
+    // Taken first, on the io thread: the client's 5 s timeout started when it sent this request.
+    const auto arrived = std::chrono::steady_clock::now();
     auto body = read_auth_json(request);
     if (!web_auth || !body.is_object() || !body.contains("conversation_id") ||
         !body["conversation_id"].is_string() || !body.contains("responses") ||
@@ -769,11 +773,11 @@ namespace nvhttp {
     // Shared so the password can still be erased if the worker fails to start.
     auto owned = std::make_shared<std::vector<std::string>>(std::move(responses));
     try {
-      std::thread([finish, owned, conversation_id = std::move(conversation_id), peer = std::move(peer)]() {
+      std::thread([finish, owned, arrived, conversation_id = std::move(conversation_id), peer = std::move(peer)]() {
         platf::set_thread_name("auth-round");
         nlohmann::json result;
         try {
-          result = advance_auth_conversation(conversation_id, peer, std::move(*owned));
+          result = advance_auth_conversation(conversation_id, peer, std::move(*owned), arrived);
         } catch (const std::exception &e) {
           BOOST_LOG(error) << "PLANK sign-in round failed: "sv << e.what();
           result = auth_step_json({});  // denied
@@ -789,7 +793,7 @@ namespace nvhttp {
     }
 #else
     write_auth_json(response, SimpleWeb::StatusCode::success_ok,
-                    advance_auth_conversation(conversation_id, peer, std::move(responses)));
+                    advance_auth_conversation(conversation_id, peer, std::move(responses), arrived));
 #endif
   }
 

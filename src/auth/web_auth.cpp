@@ -43,6 +43,10 @@ namespace plank::auth {
         return client_.respond(std::move(responses));
       }
 
+      step_t respond(std::vector<std::string> responses, std::chrono::steady_clock::time_point arrived) override {
+        return client_.respond(std::move(responses), arrived);
+      }
+
     private:
       pam_client_t client_;  ///< Local broker connection.
     };
@@ -105,7 +109,8 @@ namespace plank::auth {
 
   web_auth_step_t web_auth_manager_t::respond(std::string_view conversation_id,
                                               std::string_view remote_host,
-                                              std::vector<std::string> responses) {
+                                              std::vector<std::string> responses,
+                                              std::chrono::steady_clock::time_point arrived) {
     std::string id;
     entry_t entry;
     {
@@ -138,7 +143,7 @@ namespace plank::auth {
     std::optional<step_t> step;
     {
       const in_flight_guard_t guard {*this};
-      step.emplace(entry.conversation->respond(std::move(responses)));
+      step.emplace(entry.conversation->respond(std::move(responses), arrived));
     }
     std::lock_guard lock {mutex_};
     expire_locked();

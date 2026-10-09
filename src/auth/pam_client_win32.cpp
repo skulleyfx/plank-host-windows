@@ -291,8 +291,10 @@ namespace plank::auth {
             phase_e::authenticate, 0};
   }
 
-  step_t pam_client_t::respond(std::vector<std::string> responses) {
-    const auto round_started = std::chrono::steady_clock::now();
+  step_t pam_client_t::respond(std::vector<std::string> responses, std::chrono::steady_clock::time_point arrived) {
+    // The round clock runs from the request's arrival on the io thread, so
+    // queueing and the password check are charged to the client's 5 s timeout.
+    const auto round_started = arrived;
     auto &state = state_for(this);
 
     if (state.awaiting_password) {

@@ -48,6 +48,21 @@ namespace plank::auth {
      * @return Next challenge or terminal result.
      */
     virtual step_t respond(std::vector<std::string> responses) = 0;
+
+    /**
+     * @brief Submit responses, telling the conversation when the request arrived.
+     *
+     * A conversation that waits on an out-of-band decision charges its
+     * per-round budget from the arrival time. The default ignores it.
+     *
+     * @param responses One response per PAM message.
+     * @param arrived When the HTTPS request reached the server.
+     * @return Next challenge or terminal result.
+     */
+    virtual step_t respond(std::vector<std::string> responses, std::chrono::steady_clock::time_point arrived) {
+      static_cast<void>(arrived);
+      return respond(std::move(responses));
+    }
   };
 
   /**
@@ -101,11 +116,13 @@ namespace plank::auth {
      * @param conversation_id Opaque conversation identifier.
      * @param remote_host Normalized TLS peer address; must match the creator.
      * @param responses One response per PAM message.
+     * @param arrived When the HTTPS request reached the server; round budgets count from here.
      * @return Next challenge or terminal result.
      */
     web_auth_step_t respond(std::string_view conversation_id,
                             std::string_view remote_host,
-                            std::vector<std::string> responses);
+                            std::vector<std::string> responses,
+                            std::chrono::steady_clock::time_point arrived = std::chrono::steady_clock::now());
 
     /**
      * @brief Validate a session token for its originating peer.

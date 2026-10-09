@@ -6,8 +6,11 @@
  * "is it done yet?" one sign-in round at a time. Each round may wait on the
  * worker for a bounded budget. Every client abandons a request after 5 s, and
  * Alan's client allows only 16 rounds in total, so the budget sets how long a
- * user has to approve: 15 waiting rounds x 4 s covers DUO's own 60 s push
- * lifetime. The rounds run off the HTTPS thread (see nvhttp.cpp), so a long
+ * user has to approve: 15 waiting rounds x 3.5 s covers DUO's own 60 s push
+ * lifetime. The round clock starts when the HTTPS request arrives (not when
+ * the worker picks it up), and the budget stays well under 5 s so a fresh TCP +
+ * TLS handshake, the transfer and io-thread queueing still fit before the
+ * client gives up. The rounds run off the HTTPS thread (see nvhttp.cpp), so a long
  * budget never stalls serverinfo polling from other clients.
  *
  * Kept free of Windows APIs so the timing and state rules are unit tested.
@@ -24,7 +27,7 @@
 namespace plank::auth::factor_wait {
   using clock_t = std::chrono::steady_clock;  ///< Monotonic clock for every deadline.
 
-  inline constexpr int round_wait_default_ms = 4000;  ///< Default per-round wait.
+  inline constexpr int round_wait_default_ms = 3500;  ///< Default per-round wait.
   inline constexpr int round_wait_min_ms = 500;  ///< Shortest accepted per-round wait.
   /// Longest accepted per-round wait: clients abandon a request after 5 s,
   /// which also covers a fresh TCP + TLS handshake on every round.
@@ -43,10 +46,11 @@ namespace plank::auth::factor_wait {
   /**
    * @brief Time left in a round, never negative.
    *
-   * The round starts when the HTTPS request is taken up, so work done before
-   * the wait (for example the password check) is charged to the same budget.
+   * The round starts when the HTTPS request arrives on the io thread, so
+   * queueing and work done before the wait (for example the password check)
+   * are charged to the same budget.
    *
-   * @param started When the round began.
+   * @param started When the request arrived.
    * @param now Current time.
    * @param budget Per-round budget.
    * @return Remaining wait.
