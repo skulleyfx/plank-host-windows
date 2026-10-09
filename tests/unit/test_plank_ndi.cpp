@@ -6,6 +6,7 @@
 #include "src/plank_ndi.h"
 
 #include <map>
+#include <vector>
 
 #include "../tests_common.h"
 
@@ -112,11 +113,13 @@ TEST(PlankNdi, RuntimeLookupOrder) {
     return it == env.end() ? std::string {} : it->second;
   });
 
-  ASSERT_GE(paths.size(), 7u);
+  ASSERT_EQ(paths.size(), 6u);
   EXPECT_EQ(paths[0], "C:\\NDI\\v6\\Processing.NDI.Lib.x64.dll");
   EXPECT_EQ(paths[1], "D:\\NDI5\\Processing.NDI.Lib.x64.dll");
   EXPECT_EQ(paths[2], "E:\\PF\\NDI\\NDI 6 Runtime\\v6\\Processing.NDI.Lib.x64.dll");
-  EXPECT_EQ(paths.back(), "Processing.NDI.Lib.x64.dll");
+  for (const auto &path : paths) {
+    EXPECT_TRUE(ndi::is_absolute_windows_path(path));  // never a bare DLL name
+  }
 }
 
 TEST(PlankNdi, RuntimeLookupWithoutEnvironment) {
@@ -125,4 +128,79 @@ TEST(PlankNdi, RuntimeLookupWithoutEnvironment) {
   });
   ASSERT_FALSE(paths.empty());
   EXPECT_EQ(paths.front(), "C:\\Program Files\\NDI\\NDI 6 Runtime\\v6\\Processing.NDI.Lib.x64.dll");
+}
+
+TEST(PlankNdi, RuntimeLookupRejectsRelativeEnvironmentPaths) {
+  std::map<std::string, std::string> env {
+    {"NDI_RUNTIME_DIR_V6", "..\\evil"},
+    {"NDI_RUNTIME_DIR_V5", "relative\\dir"},
+    {"ProgramFiles", "not absolute"},
+  };
+  const auto paths = ndi::runtime_candidates([&](const char *name) {
+    auto it = env.find(name);
+    return it == env.end() ? std::string {} : it->second;
+  });
+  ASSERT_FALSE(paths.empty());
+  for (const auto &path : paths) {
+    EXPECT_TRUE(path.rfind("C:\\Program Files\\NDI\\", 0) == 0);
+  }
+  EXPECT_TRUE(ndi::is_absolute_windows_path("\\\\server\\share"));
+  EXPECT_FALSE(ndi::is_absolute_windows_path("C:relative"));
+  EXPECT_FALSE(ndi::is_absolute_windows_path(""));
+}
+
+TEST(PlankNdi, BackoffDoublesToCap) {
+  EXPECT_EQ(ndi::backoff_delay(0), 1000ms);
+  EXPECT_EQ(ndi::backoff_delay(1), 2000ms);
+  EXPECT_EQ(ndi::backoff_delay(4), 16000ms);
+  EXPECT_EQ(ndi::backoff_delay(5), 30000ms);
+  EXPECT_EQ(ndi::backoff_delay(100), 30000ms);
+  EXPECT_EQ(ndi::backoff_delay(3, 5s), 5000ms);
+}
+
+TEST(PlankNdi, QuotesWindowsArguments) {
+  EXPECT_EQ(ndi::quote_windows_arg("abc"), "abc");
+  EXPECT_EQ(ndi::quote_windows_arg(""), "\"\"");
+  EXPECT_EQ(ndi::quote_windows_arg("a b"), "\"a b\"");
+  EXPECT_EQ(ndi::quote_windows_arg("a\"b"), "\"a\\\"b\"");
+  EXPECT_EQ(ndi::quote_windows_arg("C:\\dir with space\\"), "\"C:\\dir with space\\\\\"");
+}
+
+TEST(PlankNdi, HelperArgsRoundTrip) {
+  ndi::helper_options options;
+  options.fps = 24;
+  options.scope = ndi::scope_e::all;
+  options.name = "Colour \"Review\"";
+  options.groups = "review,edit";
+
+  const auto args = ndi::build_helper_args(options);
+  const auto parsed = ndi::parse_helper_args(args);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(parsed->fps, 24);
+  EXPECT_EQ(parsed->scope, ndi::scope_e::all);
+  EXPECT_EQ(parsed->name, options.name);
+  EXPECT_EQ(parsed->groups, "review,edit");
+}
+
+TEST(PlankNdi, HelperArgsDefaultsAndErrors) {
+  const auto defaults = ndi::parse_helper_args({});
+  ASSERT_TRUE(defaults.has_value());
+  EXPECT_EQ(defaults->fps, 30);
+  EXPECT_EQ(defaults->scope, ndi::scope_e::primary);
+
+  EXPECT_FALSE(ndi::parse_helper_args({"--fps"}).has_value());
+  EXPECT_FALSE(ndi::parse_helper_args({"--fps", "abc"}).has_value());
+  EXPECT_FALSE(ndi::parse_helper_args({"--outputs", "some"}).has_value());
+  EXPECT_FALSE(ndi::parse_helper_args({"--bogus", "1"}).has_value());
+  EXPECT_EQ(ndi::parse_helper_args({"--fps", "500"})->fps, 60);
+
+  // Empty name and groups are not passed at all.
+  EXPECT_EQ(ndi::build_helper_args(ndi::helper_options {}).size(), 4u);
+}
+
+TEST(PlankNdi, HelperCommandLineIsQuoted) {
+  ndi::helper_options options;
+  options.name = "My Screen";
+  EXPECT_EQ(ndi::build_helper_command_line("C:\\Program Files\\PLANK\\tools\\plank-ndi.exe", options),
+            "\"C:\\Program Files\\PLANK\\tools\\plank-ndi.exe\" --fps 30 --outputs primary --name \"My Screen\"");
 }

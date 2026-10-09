@@ -1,33 +1,35 @@
 /**
  * @file src/platform/windows/ndi_output.cpp
- * @brief Publishes the host's screens as NDI sources on the LAN.
+ * @brief Supervises the plank-ndi helper that publishes the screens over NDI.
  *
- * Design notes
+ * The NDI work itself (screen capture and sending) lives in tools/plank-ndi.cpp,
+ * a separate process, for two reasons:
+ * - DXGI Desktop Duplication does not allow a second duplication of an output
+ *   from the same process, and this process already duplicates it for the PLANK
+ *   stream. A helper process may duplicate it alongside.
+ * - The NDI runtime is proprietary and this host is GPL-3. It is only ever
+ *   loaded inside the helper, never into this process.
  *
- * - The NDI runtime is loaded with LoadLibrary at run time and only five C
- *   entry points are resolved (see ndi_runtime.h for why: the host is GPL-3 and
- *   the NDI SDK is not).
- * - Capture reuses the host's own Desktop Duplication RAM backend
- *   (platf::display with mem_type_e::system), driven by this file's own
- *   capture loop. That backend already copies the GPU frame into a CPU staging
- *   texture and hands back a BGRA buffer, handles display mode changes and
- *   desktop switches by returning capture_e::reinit/error, and paces itself to
- *   the configured frame rate.
- * - NDI uses its OWN display instance and thread, separate from any PLANK
- *   streaming session. A PLANK session starts and stops its capture with the
- *   client; NDI has to run with nobody connected. Separate Desktop Duplication
- *   sessions of the same output are allowed, so the PLANK stream is never
- *   touched, blocked or slowed by this code: no shared locks, no shared D3D
- *   device, no shared frame pool.
+ * This file only starts the helper, forwards its log lines, restarts it with
+ * backoff if it dies, and stops it on shutdown. Everything runs on its own
+ * threads; start() returns immediately and nothing here can block the host.
+ *
+ * Process model: Sunshine.exe already runs as SYSTEM inside the console session
+ * (launched by sunshinesvc.exe). The helper is created with CreateProcessW from
+ * here, so it inherits that token and session; it is placed on winsta0\default
+ * and follows the input desktop itself. A kill-on-close job object ties its
+ * lifetime to ours, and its stdin pipe doubles as the stop signal.
  */
 // standard includes
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#include <memory>
 
 // platform includes
 // clang-format off
@@ -36,389 +38,279 @@
 
 // local includes
 #include "ndi_output.h"
-#include "ndi_runtime.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/plank_ndi.h"
-#include "src/video.h"
 #include "utf_utils.h"
 
 using namespace std::literals;
 
 namespace platf::ndi_output {
   namespace {
-    namespace nabi = platf::ndi_abi;
+    /// How long the helper gets to exit after its stdin closes before it is terminated.
+    constexpr auto graceful_stop_wait = 5s;
+    /// A run at least this long counts as healthy and resets the restart backoff.
+    constexpr auto healthy_run = 60s;
+    /// The NDI runtime was missing. Look again now and then (NDI Tools may be installed later).
+    constexpr auto runtime_missing_retry = 10min;
+    /// Exit code the helper uses for "NDI runtime not installed".
+    constexpr DWORD exit_runtime_missing = 2;
 
-    /// How often the supervisor looks for added or removed displays.
-    constexpr auto rescan_interval = 30s;
-    /// Rescan sooner when no display could be enumerated (lock screen, mode change).
-    constexpr auto rescan_interval_empty = 3s;
-
-    std::string env_utf8(const char *name) {
-      const auto wide_name = utf_utils::from_utf8(name);
-      std::wstring buffer(512, L'\0');
-      DWORD length = GetEnvironmentVariableW(wide_name.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
-      if (length > buffer.size()) {
-        buffer.resize(length);
-        length = GetEnvironmentVariableW(wide_name.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
-      }
-      if (length == 0 || length >= buffer.size()) {
+    std::filesystem::path helper_path() {
+      wchar_t buffer[MAX_PATH * 4] {};
+      const DWORD length = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
+      if (length == 0 || length >= std::size(buffer)) {
         return {};
       }
-      buffer.resize(length);
-      return utf_utils::to_utf8(buffer);
+      return std::filesystem::path {buffer}.parent_path() / L"tools" / L"plank-ndi.exe";
     }
 
-    std::string computer_name() {
-      wchar_t buffer[MAX_COMPUTERNAME_LENGTH + 1] {};
-      DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
-      if (GetComputerNameW(buffer, &size) && size > 0) {
-        return utf_utils::to_utf8(std::wstring {buffer, size});
+    struct handle_t {
+      HANDLE h {};
+      handle_t() = default;
+      explicit handle_t(HANDLE value):
+          h {value} {}
+      handle_t(const handle_t &) = delete;
+      handle_t &operator=(const handle_t &) = delete;
+      ~handle_t() {
+        close();
       }
-      return env_utf8("COMPUTERNAME");
+      void close() {
+        if (h && h != INVALID_HANDLE_VALUE) {
+          CloseHandle(h);
+        }
+        h = nullptr;
+      }
+    };
+
+    /// Forward each line the helper writes to our log.
+    void pump_log(HANDLE read_end) {
+      std::string pending;
+      char buffer[1024];
+      DWORD got = 0;
+      auto flush_lines = [&] {
+        std::size_t pos;
+        while ((pos = pending.find('\n')) != std::string::npos) {
+          std::string line = pending.substr(0, pos);
+          pending.erase(0, pos + 1);
+          while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+          }
+          if (!line.empty()) {
+            BOOST_LOG(info) << "[plank-ndi] "sv << line;
+          }
+        }
+      };
+      while (ReadFile(read_end, buffer, sizeof(buffer), &got, nullptr) && got > 0) {
+        pending.append(buffer, got);
+        if (pending.size() > 16384) {
+          pending.resize(16384);
+          pending += '\n';
+        }
+        flush_lines();
+      }
+      pending += '\n';
+      flush_lines();
     }
 
-    /**
-     * @brief The loaded NDI runtime and the few entry points we use.
-     */
-    struct runtime_t {
-      HMODULE module {};
-      nabi::initialize_fn initialize {};
-      nabi::destroy_fn destroy {};
-      nabi::send_create_fn send_create {};
-      nabi::send_destroy_fn send_destroy {};
-      nabi::send_video_v2_fn send_video_v2 {};
-      bool initialized {};
-
-      runtime_t() = default;
-      runtime_t(const runtime_t &) = delete;
-      runtime_t &operator=(const runtime_t &) = delete;
-
-      ~runtime_t() {
-        if (initialized && destroy) {
-          destroy();
-        }
-        if (module) {
-          FreeLibrary(module);
-        }
-      }
-
-      /**
-       * @brief Find and load the runtime. Returns false when it is not installed
-       * or is too old / broken to use.
-       */
-      bool load() {
-        for (const auto &path : plank::ndi::runtime_candidates(env_utf8)) {
-          const auto wide = utf_utils::from_utf8(path);
-          const bool absolute = path.find('\\') != std::string::npos;
-          // Absolute paths load from their own directory; the bare name is only
-          // searched in the application and system directories, never in the
-          // current directory or PATH.
-          module = LoadLibraryExW(wide.c_str(), nullptr, absolute ? LOAD_WITH_ALTERED_SEARCH_PATH : LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-          if (!module) {
-            continue;
-          }
-          initialize = reinterpret_cast<nabi::initialize_fn>(GetProcAddress(module, "NDIlib_initialize"));
-          destroy = reinterpret_cast<nabi::destroy_fn>(GetProcAddress(module, "NDIlib_destroy"));
-          send_create = reinterpret_cast<nabi::send_create_fn>(GetProcAddress(module, "NDIlib_send_create"));
-          send_destroy = reinterpret_cast<nabi::send_destroy_fn>(GetProcAddress(module, "NDIlib_send_destroy"));
-          send_video_v2 = reinterpret_cast<nabi::send_video_v2_fn>(GetProcAddress(module, "NDIlib_send_send_video_v2"));
-          if (initialize && destroy && send_create && send_destroy && send_video_v2) {
-            BOOST_LOG(info) << "NDI runtime loaded from "sv << path;
-            // NDIlib_initialize returns false on CPUs the runtime does not support.
-            if (!initialize()) {
-              BOOST_LOG(warning) << "NDI output is on but the NDI runtime refused to initialize (unsupported CPU?)"sv;
-              return false;
-            }
-            initialized = true;
-            return true;
-          }
-          BOOST_LOG(warning) << "Found "sv << path << " but it does not export the expected NDI functions; ignoring it"sv;
-          FreeLibrary(module);
-          module = nullptr;
-        }
-        return false;
-      }
-    };
-
-    /**
-     * @brief State shared by the supervisor and capture threads.
-     */
-    struct shared_t {
-      std::mutex mutex;
-      std::condition_variable cv;
-      std::atomic<bool> stop {false};
-
-      /// Sleep up to `period`; returns true if `stop` or `worker_stop` was raised.
-      bool wait(std::chrono::milliseconds period, const std::atomic<bool> &worker_stop) {
-        std::unique_lock lock {mutex};
-        cv.wait_for(lock, period, [&] {
-          return stop.load() || worker_stop.load();
-        });
-        return stop.load() || worker_stop.load();
-      }
-    };
-
-    /**
-     * @brief Captures one screen and sends it as one NDI source.
-     */
-    class worker_t {
-    public:
-      worker_t(runtime_t &runtime, shared_t &shared, std::string capture_name, std::string source_name, int fps):
-          runtime_ {runtime},
-          shared_ {shared},
-          capture_name_ {std::move(capture_name)},
-          source_name_ {std::move(source_name)},
-          fps_ {fps} {
-        thread_ = std::thread([this] {
-          try {
-            run();
-          } catch (const std::exception &e) {
-            BOOST_LOG(error) << "NDI output for "sv << capture_name_ << " stopped: "sv << e.what();
-          } catch (...) {
-            BOOST_LOG(error) << "NDI output for "sv << capture_name_ << " stopped on an unknown error"sv;
-          }
-        });
-      }
-
-      worker_t(const worker_t &) = delete;
-      worker_t &operator=(const worker_t &) = delete;
-
-      ~worker_t() {
-        request_stop();
-        if (thread_.joinable()) {
-          thread_.join();
-        }
-      }
-
-      void request_stop() {
-        {
-          std::lock_guard lock {shared_.mutex};
-          stop_ = true;
-        }
-        shared_.cv.notify_all();
-      }
-
-      const std::string &capture_name() const {
-        return capture_name_;
-      }
-
-    private:
-      bool should_stop() const {
-        return stop_.load() || shared_.stop.load();
-      }
-
-      void run() {
-        platf::set_thread_name("ndi::capture");
-
-        // The source is published as soon as the sender exists, even while the
-        // desktop cannot be captured (lock screen, display change), so it does
-        // not vanish from receivers' source lists.
-        nabi::send_create_t create {};
-        create.p_ndi_name = source_name_.c_str();
-        create.p_groups = nullptr;
-        create.clock_video = false;  // we pace ourselves from the capture loop
-        create.clock_audio = false;
-        auto sender = runtime_.send_create(&create);
-        if (!sender) {
-          BOOST_LOG(error) << "NDI could not create the source '"sv << source_name_ << '\'';
-          return;
-        }
-        BOOST_LOG(info) << "NDI source '"sv << source_name_ << "' published for "sv << capture_name_
-                        << " at up to "sv << fps_ << " fps"sv;
-
-        bool reported_unavailable = false;
-        while (!should_stop()) {
-          video::config_t config {};
-          config.framerate = fps_;
-          config.framerateX100 = 0;
-          config.capture_source = video::capture_source_e::ddup;  // no capture border, predictable
-
-          auto display = platf::display(platf::mem_type_e::system, capture_name_, config);
-          if (!display) {
-            if (!reported_unavailable) {
-              BOOST_LOG(info) << "NDI output: "sv << capture_name_ << " cannot be captured right now (locked or changing mode?); retrying"sv;
-              reported_unavailable = true;
-            }
-            if (wait(2s)) {
-              break;
-            }
-            continue;
-          }
-          reported_unavailable = false;
-
-          const auto status = capture_loop(sender, display);
-          display.reset();
-
-          if (should_stop()) {
-            break;
-          }
-          BOOST_LOG(info) << "NDI output: capture of "sv << capture_name_ << " paused (status "sv
-                          << static_cast<int>(status) << "); restarting"sv;
-          if (wait(1s)) {
-            break;
-          }
-        }
-
-        runtime_.send_destroy(sender);
-        BOOST_LOG(info) << "NDI source '"sv << source_name_ << "' stopped"sv;
-      }
-
-      bool wait(std::chrono::milliseconds period) {
-        return shared_.wait(period, stop_);
-      }
-
-      platf::capture_e capture_loop(nabi::send_instance_t sender, const std::shared_ptr<platf::display_t> &display) {
-        // One buffer is enough: sends are synchronous, so by the time the
-        // capture backend asks for a free image the previous one is done with.
-        std::shared_ptr<platf::img_t> buffer;
-        bool have_frame = false;
-        bool dirty = false;
-        auto last_send = std::chrono::steady_clock::now() - 1h;
-
-        auto pull = [&](std::shared_ptr<platf::img_t> &out) -> bool {
-          if (should_stop()) {
-            out.reset();
-            return false;
-          }
-          if (!buffer) {
-            buffer = display->alloc_img();
-          }
-          out = buffer;
-          return static_cast<bool>(out);
-        };
-
-        auto push = [&](std::shared_ptr<platf::img_t> &&img, bool captured) -> bool {
-          if (should_stop()) {
-            return false;
-          }
-          if (captured && img) {
-            have_frame = true;
-          }
-          if (!have_frame || !buffer) {
-            return true;
-          }
-
-          const auto now = std::chrono::steady_clock::now();
-          if (plank::ndi::should_send(captured, dirty, now - last_send, fps_)) {
-            send(sender, *buffer);
-            last_send = now;
-            dirty = false;
-          } else if (captured) {
-            dirty = true;
-          }
-          return true;
-        };
-
-        bool cursor = true;
-        return display->capture(push, pull, &cursor);
-      }
-
-      void send(nabi::send_instance_t sender, const platf::img_t &img) {
-        if (!img.data || img.width <= 0 || img.height <= 0 || img.pixel_pitch != 4 || img.row_pitch < img.width * 4) {
-          return;
-        }
-        nabi::video_frame_v2_t frame {};
-        frame.xres = img.width;
-        frame.yres = img.height;
-        frame.FourCC = nabi::fourcc_bgrx;
-        frame.frame_rate_N = fps_;
-        frame.frame_rate_D = 1;
-        frame.picture_aspect_ratio = static_cast<float>(img.width) / static_cast<float>(img.height);
-        frame.frame_format_type = nabi::frame_format_progressive;
-        frame.timecode = nabi::timecode_synthesize;
-        frame.p_data = img.data;
-        frame.line_stride_in_bytes = img.row_pitch;
-        frame.p_metadata = nullptr;
-        // Synchronous: returns once the runtime has taken its copy, so the
-        // buffer can be reused immediately.
-        runtime_.send_video_v2(sender, &frame);
-      }
-
-      runtime_t &runtime_;
-      shared_t &shared_;
-      std::string capture_name_;
-      std::string source_name_;
-      int fps_;
-      std::atomic<bool> stop_ {false};
-      std::thread thread_;
-    };
-
-    /**
-     * @brief Owns the runtime, the supervisor thread and the per-screen workers.
-     */
     class ndi_output_t: public platf::deinit_t {
     public:
-      explicit ndi_output_t(std::unique_ptr<runtime_t> runtime):
-          runtime_ {std::move(runtime)} {
-        supervisor_ = std::thread([this] {
+      ndi_output_t(std::filesystem::path exe, plank::ndi::helper_options options):
+          exe_ {std::move(exe)},
+          options_ {std::move(options)} {
+        thread_ = std::thread([this] {
           try {
             supervise();
           } catch (const std::exception &e) {
-            BOOST_LOG(error) << "NDI output supervisor stopped: "sv << e.what();
+            BOOST_LOG(error) << "NDI supervisor stopped: "sv << e.what();
           } catch (...) {
-            BOOST_LOG(error) << "NDI output supervisor stopped on an unknown error"sv;
+            BOOST_LOG(error) << "NDI supervisor stopped on an unknown error"sv;
           }
         });
       }
 
       ~ndi_output_t() override {
         {
-          std::lock_guard lock {shared_.mutex};
-          shared_.stop = true;
+          std::lock_guard lock {mutex_};
+          stop_ = true;
         }
-        shared_.cv.notify_all();
-        if (supervisor_.joinable()) {
-          supervisor_.join();
+        cv_.notify_all();
+        if (thread_.joinable()) {
+          thread_.join();  // bounded: see run_once()
         }
-        workers_.clear();  // joins the capture threads before the runtime is unloaded
       }
 
     private:
+      bool wait(std::chrono::milliseconds period) {
+        std::unique_lock lock {mutex_};
+        cv_.wait_for(lock, period, [this] {
+          return stop_;
+        });
+        return stop_;
+      }
+
       void supervise() {
         platf::set_thread_name("ndi::supervisor");
-        const auto computer = computer_name();
-        const int fps = plank::ndi::clamp_fps(config::ndi.fps);
-        const auto scope = config::ndi.all_outputs ? plank::ndi::scope_e::all : plank::ndi::scope_e::primary;
-        const std::atomic<bool> never {false};
-
-        std::vector<std::string> current;
-        while (!shared_.stop.load()) {
-          std::vector<plank::ndi::output_ref> refs;
-          for (const auto &info : platf::display_infos(platf::mem_type_e::system)) {
-            refs.push_back({info.capture_name, info.x, info.y, info.primary});
-          }
-          const auto selected = plank::ndi::select_outputs(std::move(refs), scope);
-
-          std::vector<std::string> names;
-          for (const auto &ref : selected) {
-            names.push_back(ref.capture_name);
-          }
-
-          if (!selected.empty() && names != current) {
-            workers_.clear();  // stops and joins the old set
-            current = names;
-            const int count = static_cast<int>(selected.size());
-            for (int i = 0; i < count; ++i) {
-              workers_.push_back(std::make_unique<worker_t>(
-                *runtime_,
-                shared_,
-                selected[i].capture_name,
-                plank::ndi::source_name(config::ndi.source_name, computer, i + 1, count),
-                fps
-              ));
+        int failures = 0;
+        while (!stop_) {
+          const auto started = std::chrono::steady_clock::now();
+          DWORD exit_code = 0;
+          if (!run_once(exit_code)) {
+            // Could not even start it.
+            if (wait(plank::ndi::backoff_delay(failures++))) {
+              return;
             }
+            continue;
           }
-
-          const std::chrono::milliseconds pause = selected.empty() ? rescan_interval_empty : rescan_interval;
-          shared_.wait(pause, never);
+          if (stop_) {
+            return;
+          }
+          if (exit_code == exit_runtime_missing) {
+            // The helper already said why through the log pump.
+            if (wait(runtime_missing_retry)) {
+              return;
+            }
+            continue;
+          }
+          if (std::chrono::steady_clock::now() - started >= healthy_run) {
+            failures = 0;
+          }
+          const auto delay = plank::ndi::backoff_delay(failures++);
+          BOOST_LOG(warning) << "NDI helper exited with code "sv << exit_code << "; restarting in "sv << delay.count() / 1000 << " s"sv;
+          if (wait(delay)) {
+            return;
+          }
         }
       }
 
-      std::unique_ptr<runtime_t> runtime_;
-      shared_t shared_;
-      std::vector<std::unique_ptr<worker_t>> workers_;
-      std::thread supervisor_;
+      /**
+       * @brief Start the helper and wait for it to exit or for us to be stopped.
+       * @return False if it could not be started.
+       */
+      bool run_once(DWORD &exit_code) {
+        SECURITY_ATTRIBUTES inheritable {sizeof(inheritable), nullptr, TRUE};
+
+        // stdout/stderr pipe: helper writes, we read.
+        HANDLE out_read = nullptr, out_write = nullptr;
+        if (!CreatePipe(&out_read, &out_write, &inheritable, 0)) {
+          BOOST_LOG(error) << "NDI: CreatePipe failed ["sv << GetLastError() << ']';
+          return false;
+        }
+        handle_t out_read_h {out_read}, out_write_h {out_write};
+        SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
+
+        // stdin pipe: closing our end tells the helper to stop.
+        HANDLE in_read = nullptr, in_write = nullptr;
+        if (!CreatePipe(&in_read, &in_write, &inheritable, 0)) {
+          BOOST_LOG(error) << "NDI: CreatePipe failed ["sv << GetLastError() << ']';
+          return false;
+        }
+        handle_t in_read_h {in_read}, in_write_h {in_write};
+        SetHandleInformation(in_write, HANDLE_FLAG_INHERIT, 0);
+
+        // Only the two pipe ends the helper needs may be inherited, not every inheritable handle we hold.
+        HANDLE inherit_list[] {in_read, out_write};
+        SIZE_T attr_size = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+        std::vector<char> attr_buffer(attr_size);
+        auto attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buffer.data());
+        if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) ||
+            !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit_list, sizeof(inherit_list), nullptr, nullptr)) {
+          BOOST_LOG(error) << "NDI: could not prepare the helper's handle list ["sv << GetLastError() << ']';
+          return false;
+        }
+
+        STARTUPINFOEXW startup {};
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.StartupInfo.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = in_read;
+        startup.StartupInfo.hStdOutput = out_write;
+        startup.StartupInfo.hStdError = out_write;
+        startup.lpAttributeList = attrs;
+
+        auto command = utf_utils::from_utf8(plank::ndi::build_helper_command_line(utf_utils::to_utf8(exe_.wstring()), options_));
+        std::vector<wchar_t> command_buffer(command.begin(), command.end());
+        command_buffer.push_back(L'\0');
+
+        // Suspended so it can be put in the job before it runs a single instruction.
+        PROCESS_INFORMATION info {};
+        const BOOL created = CreateProcessW(
+          exe_.c_str(),
+          command_buffer.data(),
+          nullptr,
+          nullptr,
+          TRUE,
+          CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+          nullptr,
+          exe_.parent_path().c_str(),
+          &startup.StartupInfo,
+          &info
+        );
+        DeleteProcThreadAttributeList(attrs);
+        if (!created) {
+          BOOST_LOG(error) << "NDI: could not start "sv << utf_utils::to_utf8(exe_.wstring()) << " ["sv << GetLastError() << ']';
+          return false;
+        }
+        handle_t process {info.hProcess}, thread {info.hThread};
+
+        // Kill the helper if this process goes away, however it goes away.
+        handle_t job {CreateJobObjectW(nullptr, nullptr)};
+        if (job.h) {
+          JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+          limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+          if (!SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+              !AssignProcessToJobObject(job.h, process.h)) {
+            BOOST_LOG(warning) << "NDI: could not attach the helper to a job object ["sv << GetLastError() << ']';
+          }
+        }
+        ResumeThread(thread.h);
+
+        // The helper owns its copies of the pipe ends now.
+        in_read_h.close();
+        out_write_h.close();
+
+        BOOST_LOG(info) << "NDI helper started (pid "sv << info.dwProcessId << ')';
+        std::thread pump {pump_log, out_read};
+
+        // Wait for exit or for a stop request (polled; the wait is short).
+        bool exited = false;
+        while (!exited) {
+          if (WaitForSingleObject(process.h, 250) == WAIT_OBJECT_0) {
+            exited = true;
+            break;
+          }
+          std::lock_guard lock {mutex_};
+          if (stop_) {
+            break;
+          }
+        }
+
+        if (!exited) {
+          // Graceful: closing stdin makes the helper unwind and exit.
+          in_write_h.close();
+          if (WaitForSingleObject(process.h, static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(graceful_stop_wait).count())) != WAIT_OBJECT_0) {
+            BOOST_LOG(warning) << "NDI helper did not stop in time; terminating it"sv;
+            TerminateProcess(process.h, 1);
+            WaitForSingleObject(process.h, 2000);
+          }
+        }
+        exit_code = 0;
+        GetExitCodeProcess(process.h, &exit_code);
+        process.close();
+        job.close();  // also kills anything the helper may have left behind
+        if (pump.joinable()) {
+          pump.join();  // ends at EOF once the helper is gone
+        }
+        return true;
+      }
+
+      std::filesystem::path exe_;
+      plank::ndi::helper_options options_;
+      std::mutex mutex_;
+      std::condition_variable cv_;
+      bool stop_ {false};
+      std::thread thread_;
     };
   }  // namespace
 
@@ -427,15 +319,22 @@ namespace platf::ndi_output {
       return nullptr;
     }
 
-    auto runtime = std::make_unique<runtime_t>();
-    if (!runtime->load()) {
-      BOOST_LOG(warning) << "NDI output is on but the NDI runtime is not installed; install NDI Tools"sv;
+    const auto exe = helper_path();
+    std::error_code ec;
+    if (exe.empty() || !std::filesystem::exists(exe, ec)) {
+      BOOST_LOG(warning) << "NDI output is on but tools\\plank-ndi.exe was not found next to the host; NDI output is disabled"sv;
       return nullptr;
     }
 
-    BOOST_LOG(info) << "NDI output is on: publishing "sv
+    plank::ndi::helper_options options;
+    options.fps = plank::ndi::clamp_fps(config::ndi.fps);
+    options.scope = config::ndi.all_outputs ? plank::ndi::scope_e::all : plank::ndi::scope_e::primary;
+    options.name = config::ndi.source_name;
+    options.groups = config::ndi.groups;
+
+    BOOST_LOG(info) << "NDI output is on: starting the plank-ndi helper for "sv
                     << (config::ndi.all_outputs ? "all screens"sv : "the primary screen"sv)
-                    << " at up to "sv << plank::ndi::clamp_fps(config::ndi.fps) << " fps (no audio)"sv;
-    return std::make_unique<ndi_output_t>(std::move(runtime));
+                    << " at up to "sv << options.fps << " fps (no audio)"sv;
+    return std::make_unique<ndi_output_t>(exe, std::move(options));
   }
 }  // namespace platf::ndi_output

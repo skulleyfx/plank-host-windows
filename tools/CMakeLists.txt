@@ -47,3 +47,15 @@ target_link_libraries(sunshinesvc
         wtsapi32
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshinesvc PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+# Publishes the screens over NDI. Runs as its own process so its Desktop
+# Duplication does not collide with the host's, and so the proprietary NDI
+# runtime (loaded at run time, never linked) stays out of the GPL host process.
+add_executable(plank-ndi plank-ndi.cpp)
+target_link_libraries(plank-ndi
+        ${CMAKE_THREAD_LIBS_INIT}
+        d3d11
+        dxgi
+        user32
+        ${PLATFORM_LIBRARIES})
+target_compile_options(plank-ndi PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
