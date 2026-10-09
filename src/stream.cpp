@@ -1180,7 +1180,9 @@ namespace stream {
     auto next_cursor_sample = std::chrono::steady_clock::now();
 
     while (!stop_token.stop_requested()) {
-      if (std::chrono::steady_clock::now() >= next_ownership_check) {
+      // A viewer may be another account the owner allowed to watch; the
+      // controller's own recheck ends it (and its viewers) on a desktop change.
+      if (!is_viewer(session) && std::chrono::steady_clock::now() >= next_ownership_check) {
         next_ownership_check = std::chrono::steady_clock::now() + ownership_check_period;
         if (plank::session::desktop_owner_relation(session->authenticated_account) ==
             plank::session::desktop_owner_e::different) {
