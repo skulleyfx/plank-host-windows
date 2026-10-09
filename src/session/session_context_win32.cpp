@@ -34,7 +34,9 @@
 #include "src/auth/second_factor.h"
 #include "src/config.h"
 #include "src/display_device.h"
+#include "src/globals.h"
 #include "src/logging.h"
+#include "src/plank_topology.h"
 
 using namespace std::literals;
 
@@ -325,6 +327,72 @@ namespace plank::session {
       return lease;
     }
 
+    /// How long a lease may be held before any stream starts. Covers a client that gives
+    /// up after repeated 425 answers; the displays are then handed back.
+    constexpr auto lease_start_timeout = 90s;
+
+    /// Bumped whenever a lease is acquired or released, so a late timer can tell it is stale.
+    std::uint64_t &lease_generation() {
+      static std::uint64_t generation = 0;
+      return generation;
+    }
+
+    /// Whether a stream has activated the current lease. Guarded by lease_mutex().
+    bool &lease_stream_started() {
+      static bool started = false;
+      return started;
+    }
+
+    task_pool_util::TaskPool::task_id_t &lease_timer_id() {
+      static task_pool_util::TaskPool::task_id_t id = nullptr;
+      return id;
+    }
+
+    void restore_displays_and_clear_lease_locked() {
+      // Both layouts now change modes through display_arrange, which saved the
+      // arrangement before touching anything, so both are restored from it.
+      // revert_configuration() remains the fallback for a lease taken by an
+      // older host that used the display library.
+      if (!plank::display_arrange::saved_layout().empty()) {
+        plank::display_arrange::restore_saved_layout_if_any();
+      } else {
+        ::display_device::revert_configuration();
+      }
+      display_lease().reset();
+      lease_stream_started() = false;
+      ++lease_generation();
+    }
+
+    void cancel_lease_timer_locked() {
+      if (lease_timer_id() != nullptr) {
+        task_pool.cancel(lease_timer_id());
+        lease_timer_id() = nullptr;
+      }
+    }
+
+    /// Arm the start timer for a lease that was just applied. The timer runs on the
+    /// shared task pool, which is stopped and joined before shutdown completes, so no
+    /// callback outlives the host. A callback that is already running is made harmless
+    /// by the generation check.
+    void arm_lease_timer_locked() {
+      cancel_lease_timer_locked();
+      if (lease_stream_started()) {
+        return;  // A stream is already running on this lease.
+      }
+      const auto armed = lease_generation();
+      lease_timer_id() = task_pool.pushDelayed([armed]() {
+        std::lock_guard lock {lease_mutex()};
+        if (!plank::topology::lease_timer_should_release(display_lease().has_value(), lease_stream_started(),
+                                                         armed, lease_generation())) {
+          return;
+        }
+        BOOST_LOG(warning) << "No PLANK stream started within "sv << lease_start_timeout.count()
+                           << " s of a display transition; restoring the host displays"sv;
+        lease_timer_id() = nullptr;
+        restore_displays_and_clear_lease_locked();
+      }, lease_start_timeout).task_id;
+    }
+
     bool parse_mode(std::string_view mode, unsigned &width, unsigned &height) {
       const auto separator = mode.find('x');
       if (separator == std::string_view::npos) {
@@ -403,6 +471,8 @@ namespace plank::session {
       }
 
       display_lease() = runtime_display_state_t {request.layout, request.mode_1, request.mode_2, request.account_uid};
+      ++lease_generation();
+      arm_lease_timer_locked();
       return display_request_status::submitted;
     }
 
@@ -531,6 +601,8 @@ namespace plank::session {
       }
       display_lease() = runtime_display_state_t {request.layout, request.mode_1, {}, request.account_uid,
                                                  std::move(applied_mode)};
+      ++lease_generation();
+      arm_lease_timer_locked();
       return display_request_status::submitted;
     }
 
@@ -542,9 +614,13 @@ namespace plank::session {
 
   display_request_status activate_display_lease(uid_t account_uid) {
     std::lock_guard lock {lease_mutex()};
-    return display_lease() && display_lease()->lease_uid == account_uid ?
-             display_request_status::submitted :
-             display_request_status::unavailable;
+    if (!display_lease() || display_lease()->lease_uid != account_uid) {
+      return display_request_status::unavailable;
+    }
+    // A stream now owns the lease; it is released when that stream ends.
+    lease_stream_started() = true;
+    cancel_lease_timer_locked();
+    return display_request_status::submitted;
   }
 
   display_request_status release_display_lease(uid_t account_uid) {
@@ -553,16 +629,8 @@ namespace plank::session {
       return display_request_status::unavailable;
     }
     BOOST_LOG(info) << "Restoring the host display after the PLANK session";
-    // Both layouts now change modes through display_arrange, which saved the
-    // arrangement before touching anything, so both are restored from it.
-    // revert_configuration() remains the fallback for a lease taken by an
-    // older host that used the display library.
-    if (!plank::display_arrange::saved_layout().empty()) {
-      plank::display_arrange::restore_saved_layout_if_any();
-    } else {
-      ::display_device::revert_configuration();
-    }
-    display_lease().reset();
+    cancel_lease_timer_locked();
+    restore_displays_and_clear_lease_locked();
     return display_request_status::submitted;
   }
 

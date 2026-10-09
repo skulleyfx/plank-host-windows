@@ -138,6 +138,45 @@ namespace plank::topology {
            publish_single_output(mode, override_file, launch_flags, output_count);
   }
 
+  /**
+   * @brief Decide whether a launch that did not succeed must give the host displays back.
+   *
+   * The display lease is otherwise released only when a stream ends, and a failed launch
+   * starts none, so every account would get 423 until the host restarted. A 425 or a
+   * topology refresh means the client retries against the changed displays, so those
+   * keep the lease (a timer returns it if the client gives up).
+   *
+   * @param lease_held_by_launch Whether this launch applied a display transition or holds the account's lease.
+   * @param status_code The HTTP-style status the launch is about to answer with.
+   * @param client_retries Whether the outcome tells the client to retry against the changed displays.
+   * @return True when the lease must be released now.
+   */
+  constexpr bool should_release_display_lease_on_launch_exit(
+    bool lease_held_by_launch,
+    int status_code,
+    bool client_retries
+  ) {
+    return lease_held_by_launch && status_code != 200 && !client_retries;
+  }
+
+  /**
+   * @brief Decide whether the lease timer should restore the displays when it fires.
+   *
+   * @param lease_held Whether a lease is still held.
+   * @param stream_started Whether a stream activated the lease since it was acquired.
+   * @param armed_generation Generation of the lease the timer was armed for.
+   * @param current_generation Generation of the lease held now.
+   * @return True when the displays must be restored.
+   */
+  constexpr bool lease_timer_should_release(
+    bool lease_held,
+    bool stream_started,
+    std::uint64_t armed_generation,
+    std::uint64_t current_generation
+  ) {
+    return lease_held && !stream_started && armed_generation == current_generation;
+  }
+
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {
     return mtu >= 1200 && mtu <= 65527;
   }
