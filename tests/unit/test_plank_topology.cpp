@@ -132,3 +132,38 @@ TEST(PlankTopology, RejectsInvalidAndUnhealthyLayouts) {
               "single", "1920x1080", "", 1),
             topology::layout_error::invalid_request);
 }
+
+TEST(PlankTopology, ParsesOneScreenMode) {
+  EXPECT_EQ(topology::parse_one_screen_mode("auto"), topology::one_screen_mode::automatic);
+  EXPECT_EQ(topology::parse_one_screen_mode(""), topology::one_screen_mode::automatic);
+  EXPECT_EQ(topology::parse_one_screen_mode("bogus"), topology::one_screen_mode::automatic);
+  EXPECT_EQ(topology::parse_one_screen_mode("always"), topology::one_screen_mode::always);
+  EXPECT_EQ(topology::parse_one_screen_mode("never"), topology::one_screen_mode::never);
+}
+
+TEST(PlankTopology, AutoNarrowsOnlyClientsLackingTwoScreenCapture) {
+  using topology::one_screen_mode;
+  const std::uint32_t legacy = topology::feature_flags & ~topology::feature_two_screen_capture;
+  const std::uint32_t modern = topology::feature_flags;
+  EXPECT_TRUE(topology::publish_single_output(one_screen_mode::automatic, false, legacy, 2));
+  EXPECT_FALSE(topology::publish_single_output(one_screen_mode::automatic, false, modern, 2));
+  // An unidentified client keeps the full list.
+  EXPECT_FALSE(topology::publish_single_output(one_screen_mode::automatic, false, std::nullopt, 2));
+  // A client that sent no feature bits at all is a legacy client.
+  EXPECT_TRUE(topology::publish_single_output(one_screen_mode::automatic, false, 0U, 2));
+  // One output never needs narrowing.
+  EXPECT_FALSE(topology::publish_single_output(one_screen_mode::automatic, false, legacy, 1));
+  EXPECT_FALSE(topology::publish_single_output(one_screen_mode::always, true, legacy, 1));
+}
+
+TEST(PlankTopology, OneScreenOverrides) {
+  using topology::one_screen_mode;
+  const std::uint32_t modern = topology::feature_flags;
+  // The manual file forces one screen for everyone in every mode.
+  EXPECT_TRUE(topology::publish_single_output(one_screen_mode::automatic, true, modern, 2));
+  EXPECT_TRUE(topology::publish_single_output(one_screen_mode::never, true, modern, 2));
+  EXPECT_TRUE(topology::publish_single_output(one_screen_mode::always, false, modern, 2));
+  EXPECT_TRUE(topology::publish_single_output(one_screen_mode::always, false, std::nullopt, 2));
+  // never turns the automatic behaviour off.
+  EXPECT_FALSE(topology::publish_single_output(one_screen_mode::never, false, 0U, 2));
+}

@@ -800,7 +800,8 @@ namespace config {
     },  // display_device
 
     0,  // minimum_fps_target (0 = framerate)
-    false  // plank_adaptive_bitrate
+    false,  // plank_adaptive_bitrate
+    "auto"s  // plank_one_screen
   };
 
   /**
@@ -1565,6 +1566,7 @@ namespace config {
     string_f(vars, "adapter_name", video.adapter_name);
     double_between_f(vars, "minimum_fps_target", video.minimum_fps_target, {0.0, 1000.0});
     bool_f(vars, "plank_adaptive_bitrate", video.plank_adaptive_bitrate);
+    string_restricted_f(vars, "one_screen", video.plank_one_screen, {"auto"sv, "always"sv, "never"sv});
 
     path_f(vars, "pkey", nvhttp.pkey);
     path_f(vars, "cert", nvhttp.cert);

@@ -198,6 +198,7 @@ namespace config {
 
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
     bool plank_adaptive_bitrate;  ///< Reduce the encoder target under packet loss and recover when the link clears. Off by default.
+    std::string plank_one_screen;  ///< Windows multi-monitor hosts: auto (one screen for clients lacking two-screen capture), always, or never.
   };
 
   /**

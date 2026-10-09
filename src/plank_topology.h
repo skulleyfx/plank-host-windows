@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace plank::topology {
@@ -68,6 +69,44 @@ namespace plank::topology {
     feature_platform_clipboard_sync |
     feature_two_screen_capture |
     feature_adaptive_bitrate;
+
+  /**
+   * @brief How a Windows host decides to publish one screen instead of all.
+   */
+  enum class one_screen_mode {
+    automatic,  ///< One screen only for clients without the two-screen capability.
+    always,  ///< One screen for every client.
+    never,  ///< Never narrow automatically; the manual one-screen file still applies.
+  };
+
+  constexpr one_screen_mode parse_one_screen_mode(std::string_view value) {
+    if (value == "always") return one_screen_mode::always;
+    if (value == "never") return one_screen_mode::never;
+    return one_screen_mode::automatic;
+  }
+
+  /**
+   * @brief Decide whether a client is shown only the primary output.
+   *
+   * @param mode The one_screen host setting.
+   * @param override_file Whether the manual one-screen file exists. It forces
+   *        one screen for everyone, whatever the setting.
+   * @param client_flags The client's feature bits, or nullopt when the host
+   *        does not know the client yet (an unidentified topology request).
+   * @param output_count Outputs that would otherwise be published.
+   * @return True when only the primary output should be published and captured.
+   */
+  constexpr bool publish_single_output(
+    one_screen_mode mode,
+    bool override_file,
+    std::optional<std::uint32_t> client_flags,
+    std::size_t output_count
+  ) {
+    if (output_count < 2) return false;
+    if (override_file || mode == one_screen_mode::always) return true;
+    if (mode == one_screen_mode::never || !client_flags) return false;
+    return (*client_flags & feature_two_screen_capture) == 0;
+  }
 
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {
     return mtu >= 1200 && mtu <= 65527;

@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -885,39 +886,85 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Publish only the primary output while one-screen mode is on.
+   * @brief Last PLANK feature bits each peer sent at launch or resume.
+   *
+   * The topology request carries no client identity, so the host remembers
+   * what the same address declared at its last launch and narrows the list it
+   * publishes to match.
+   */
+  std::mutex peer_flags_mutex;
+  std::map<std::string, std::uint32_t> peer_feature_flags;
+
+  std::optional<std::uint32_t> known_peer_flags(const std::string &peer) {
+    std::scoped_lock lock {peer_flags_mutex};
+    const auto found = peer_feature_flags.find(peer);
+    if (found == peer_feature_flags.end()) {
+      return std::nullopt;
+    }
+    return found->second;
+  }
+
+  void remember_peer_flags(const std::string &peer, std::uint32_t flags) {
+    std::scoped_lock lock {peer_flags_mutex};
+    peer_feature_flags[peer] = flags;
+  }
+
+  /**
+   * @brief Whether the manual one-screen file exists on this host.
+   */
+  bool one_screen_file_present() {
+#ifdef _WIN32
+    std::error_code ec;
+    return fs::exists(R"(C:\ProgramData\PLANK\one-screen)", ec);
+#else
+    return false;
+#endif
+  }
+
+  /**
+   * @brief Pick the output a one-screen session shows: the primary, else the first.
+   */
+  const platf::display_info_t &primary_output(const std::vector<platf::display_info_t> &outputs) {
+    const auto primary = std::find_if(outputs.begin(), outputs.end(), [](const auto &output) {
+      return output.primary;
+    });
+    return primary == outputs.end() ? outputs.front() : *primary;
+  }
+
+  /**
+   * @brief Publish only the primary output when the client cannot use two screens.
    *
    * Clients without the Windows two-screen capability (Alan's Mac and Linux
    * clients) lay out every published output, but a Windows host captures only
-   * its first output for them, so with two monitors they size the stream for
-   * both and get one shrunk into it. Creating C:\ProgramData\PLANK\one-screen
-   * makes the host publish just the primary output, so those clients size the
-   * stream for the monitor they actually receive. Every client sees one output
-   * while the file exists; removing it restores the full list. No restart.
+   * one output for them, so with two monitors they size the stream and map the
+   * mouse for both and get one shrunk into it. In the default auto mode a
+   * client whose feature bits lack the two-screen bit is shown just the
+   * primary output. C:\ProgramData\PLANK\one-screen, or one_screen = always,
+   * does the same for every client. Removing the file restores the full list.
+   * No restart.
    *
    * @param outputs Outputs about to be published.
-   * @return The primary output alone in one-screen mode, otherwise @p outputs.
+   * @param client_flags The client's feature bits when known.
+   * @return The primary output alone when narrowing applies, otherwise @p outputs.
    */
-  std::vector<platf::display_info_t> one_screen_outputs(std::vector<platf::display_info_t> outputs) {
+  std::vector<platf::display_info_t> one_screen_outputs(std::vector<platf::display_info_t> outputs,
+                                                        std::optional<std::uint32_t> client_flags) {
 #ifdef _WIN32
-    std::error_code ec;
-    if (outputs.size() < 2 || !fs::exists(R"(C:\ProgramData\PLANK\one-screen)", ec)) {
+    if (!plank::topology::publish_single_output(
+          plank::topology::parse_one_screen_mode(config::video.plank_one_screen),
+          one_screen_file_present(), client_flags, outputs.size())) {
       return outputs;
     }
-    auto primary = std::find_if(outputs.begin(), outputs.end(), [](const auto &output) {
-      return output.primary;
-    });
-    if (primary == outputs.end()) {
-      primary = outputs.begin();
-    }
-    BOOST_LOG(info) << "One-screen mode: publishing only "sv << primary->name;
-    return {*primary};
+    const auto primary = primary_output(outputs);
+    BOOST_LOG(info) << "One-screen mode: publishing only "sv << primary.name;
+    return {primary};
 #else
+    (void) client_flags;
     return outputs;
 #endif
   }
 
-  nlohmann::json output_topology_json() {
+  nlohmann::json output_topology_json(std::optional<std::uint32_t> client_flags) {
     auto outputs = video::output_topology();
     std::sort(outputs.begin(), outputs.end(), [](const auto &left, const auto &right) {
       return std::tie(left.x, left.y, left.id) < std::tie(right.x, right.y, right.id);
@@ -933,7 +980,7 @@ namespace nvhttp {
     // A leased layout describes the screens being streamed, and both the
     // published topology and the binding check below must agree about which
     // those are.
-    outputs = one_screen_outputs(leased_outputs(std::move(outputs), leased_layout));
+    outputs = one_screen_outputs(leased_outputs(std::move(outputs), leased_layout), client_flags);
 
     int min_x = 0;
     int min_y = 0;
@@ -1131,8 +1178,17 @@ namespace nvhttp {
     return true;
   }
 
-  void output_topology(const resp_https_t &response, const req_https_t &) {
-    write_auth_json(response, SimpleWeb::StatusCode::success_ok, output_topology_json());
+  void output_topology(const resp_https_t &response, const req_https_t &request) {
+    // A client may declare itself with plankFeatureFlags; otherwise fall back
+    // to what this address declared at its last launch.
+    std::optional<std::uint32_t> client_flags;
+    const auto query = request->parse_query_string();
+    if (const auto declared = query.find("plankFeatureFlags"); declared != query.end()) {
+      client_flags = static_cast<std::uint32_t>(util::from_view(declared->second));
+    } else {
+      client_flags = known_peer_flags(authentication_peer(request));
+    }
+    write_auth_json(response, SimpleWeb::StatusCode::success_ok, output_topology_json(client_flags));
   }
 
   bool bind_topology_generation(session_stream::launch_session_t &session,
@@ -1162,8 +1218,14 @@ namespace nvhttp {
 
   bool resolve_selected_output(session_stream::launch_session_t &session,
                                uid_t authenticated_uid,
+                               const std::string &peer,
                                pt::ptree &tree) {
     const auto outputs = video::output_topology();
+    const auto previous_flags = known_peer_flags(peer);
+    remember_peer_flags(peer, session.plank_feature_flags);
+#ifndef _WIN32
+    (void) previous_flags;
+#endif
     if (!bind_host_layout(session, outputs, authenticated_uid, tree)) {
       return false;
     }
@@ -1188,9 +1250,29 @@ namespace nvhttp {
       session.output_name.clear();
 #ifdef _WIN32
       // Windows joins two outputs into one canvas, which older clients cannot
-      // lay out. They keep the previous behaviour: the first output only.
-      session.span_desktop =
+      // lay out. They get the primary output alone, which is also what the
+      // topology publishes to them, so the picture and the mouse agree.
+      const bool two_screen_client =
         (session.plank_feature_flags & plank_topology_two_screen_capture) != 0;
+      const auto leased = leased_outputs(outputs, live_display_layout(outputs));
+      const auto mode = plank::topology::parse_one_screen_mode(config::video.plank_one_screen);
+      const bool forced = one_screen_file_present() || mode == plank::topology::one_screen_mode::always;
+      if (plank::topology::publish_single_output(
+            mode, one_screen_file_present(), session.plank_feature_flags, leased.size())) {
+        if (!forced && !previous_flags) {
+          // This address was unknown when it read the topology, so it laid
+          // out both screens. It is known now; have it read the topology again.
+          tree.put("root.<xmlattr>.status_code", 409);
+          tree.put("root.<xmlattr>.status_message", "Host output topology changed; refresh and retry");
+          return false;
+        }
+        session.span_desktop = false;
+        session.output_name = primary_output(leased).capture_name;
+        BOOST_LOG(info) << "One-screen mode: capturing only "sv
+                        << logging::bracket(session.output_name) << " for "sv << session.display_mode;
+        return true;
+      }
+      session.span_desktop = two_screen_client;
 #else
       session.span_desktop = true;
 #endif
@@ -1824,7 +1906,7 @@ namespace nvhttp {
       return;
     }
 
-    if (!resolve_selected_output(*launch_session, *authenticated_uid, tree)) {
+    if (!resolve_selected_output(*launch_session, *authenticated_uid, authentication_peer(request), tree)) {
       tree.put("root.gamesession", 0);
       return;
     }
@@ -1995,7 +2077,7 @@ namespace nvhttp {
         launch_session->host_audio = host_audio;
       }
     }
-    if (!resolve_selected_output(*launch_session, *authenticated_uid, tree)) {
+    if (!resolve_selected_output(*launch_session, *authenticated_uid, authentication_peer(request), tree)) {
       tree.put("root.resume", 0);
       return;
     }
