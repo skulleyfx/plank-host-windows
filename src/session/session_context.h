@@ -62,6 +62,9 @@ namespace plank::session {
     std::string mode_1;
     std::string mode_2;
     uid_t lease_uid {};
+    /// Mode actually set when the host had to substitute one for mode_1, as
+    /// WxH. Empty when mode_1 was applied as asked.
+    std::string applied_mode_1;
   };
 
   enum class display_request_status {

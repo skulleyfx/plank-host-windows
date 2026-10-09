@@ -218,6 +218,46 @@ namespace plank::display_arrange {
     return apply_queued_changes();
   }
 
+  std::size_t supported_modes(const std::string &name, std::vector<display_mode_t> &sizes) {
+    sizes.clear();
+    const std::wstring wide_name = widen(name);
+    DEVMODEW mode {};
+    mode.dmSize = sizeof(mode);
+    for (DWORD index = 0; EnumDisplaySettingsExW(wide_name.c_str(), index, &mode, 0); ++index) {
+      mode.dmSize = sizeof(mode);
+      if (mode.dmPelsWidth == 0 || mode.dmPelsHeight == 0) {
+        continue;
+      }
+      const bool known = std::any_of(sizes.begin(), sizes.end(), [&mode](const auto &entry) {
+        return entry.width == mode.dmPelsWidth && entry.height == mode.dmPelsHeight &&
+               entry.refresh_hz == mode.dmDisplayFrequency;
+      });
+      if (!known) {
+        display_mode_t entry;
+        entry.name = name;
+        entry.width = mode.dmPelsWidth;
+        entry.height = mode.dmPelsHeight;
+        entry.refresh_hz = mode.dmDisplayFrequency;
+        sizes.push_back(std::move(entry));
+      }
+    }
+    return sizes.size();
+  }
+
+  bool apply_arrangement(const std::vector<display_mode_t> &layout) {
+    if (layout.empty()) {
+      return false;
+    }
+    for (const auto &display : layout) {
+      if (!queue_display(display, display.primary)) {
+        // Drop anything already queued.
+        ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        return false;
+      }
+    }
+    return apply_queued_changes();
+  }
+
   bool restore_layout(const std::vector<display_mode_t> &layout) {
     if (layout.empty()) {
       return false;

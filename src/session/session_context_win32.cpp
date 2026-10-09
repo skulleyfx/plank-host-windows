@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "display_arrange.h"
+#include "display_fallback.h"
 #include "src/auth/second_factor.h"
 #include "src/config.h"
 #include "src/display_device.h"
@@ -338,18 +339,6 @@ namespace plank::session {
     // startup, when nothing has requested a layout yet.
     using plank::display_arrange::streamable_displays;
 
-    /// The streamable display a one-screen session uses: the Windows primary
-    /// when it is streamable, otherwise the leftmost one.
-    std::optional<plank::display_arrange::display_mode_t> primary_streamable_display() {
-      auto displays = streamable_displays();
-      if (displays.empty()) {
-        return std::nullopt;
-      }
-      const auto primary = std::find_if(std::begin(displays), std::end(displays),
-                                        [](const auto &display) { return display.primary; });
-      return primary != std::end(displays) ? *primary : displays.front();
-    }
-
   }  // namespace
 
   std::optional<runtime_display_state_t> read_runtime_display_state(std::string_view) {
@@ -428,33 +417,116 @@ namespace plank::session {
       return display_request_status::unavailable;
     }
 
-    auto target = primary_streamable_display();
-    if (!target) {
+    const auto displays = streamable_displays();
+    if (displays.empty()) {
       BOOST_LOG(warning) << "One-screen layout needs a workstation display; the only displays "
                             "attached belong to other remote-desktop software"sv;
       return display_request_status::unavailable;
     }
+    const auto primary = std::find_if(std::begin(displays), std::end(displays),
+                                      [](const auto &display) { return display.primary; });
+    const std::size_t preferred = primary != std::end(displays) ?
+                                    static_cast<std::size_t>(primary - std::begin(displays)) : 0;
 
-    if (target->width != width || target->height != height) {
-      // Remember the arrangement before changing it, so it survives a crash.
-      if (!display_lease()) {
-        plank::display_arrange::save_saved_layout(plank::display_arrange::current_layout());
+    // Ask each display what it can do, so a refusal is met with the nearest
+    // thing it supports rather than a failed session.
+    std::vector<plank::display_arrange::display_modes_t> inventory;
+    for (const auto &display : displays) {
+      plank::display_arrange::display_modes_t entry;
+      entry.name = display.name;
+      entry.current = {display.width, display.height, display.refresh_hz};
+      std::vector<plank::display_arrange::display_mode_t> reported;
+      plank::display_arrange::supported_modes(display.name, reported);
+      for (const auto &mode : reported) {
+        entry.modes.push_back({mode.width, mode.height, mode.refresh_hz});
       }
-      BOOST_LOG(info) << "Switching "sv << target->name << " to "sv << width << 'x' << height
-                      << " for a PLANK session"sv;
-      auto requested = *target;
-      requested.width = width;
-      requested.height = height;
-      if (!plank::display_arrange::apply_mode(requested)) {
-        BOOST_LOG(warning) << target->name << " does not support "sv << width << 'x' << height
-                           << "; keeping its current mode"sv;
-        plank::display_arrange::restore_saved_layout_if_any();
-        return display_request_status::unavailable;
+      // The mode in use always works.
+      if (std::find(entry.modes.begin(), entry.modes.end(), entry.current) == entry.modes.end()) {
+        entry.modes.push_back(entry.current);
       }
+      inventory.push_back(std::move(entry));
     }
 
-    display_lease() = runtime_display_state_t {request.layout, request.mode_1, {}, request.account_uid};
-    return display_request_status::submitted;
+    // The request names a size only, so each display keeps its own refresh rate.
+    const auto candidates = plank::display_arrange::rank_mode_candidates(inventory, preferred, width, height, 0);
+    if (candidates.empty()) {
+      BOOST_LOG(warning) << "No streamable display offers "sv << width << 'x' << height
+                         << " or any substitute; the request can't be served"sv;
+      return display_request_status::unavailable;
+    }
+
+    // Remember the arrangement before changing it, so it survives a crash.
+    if (!display_lease()) {
+      plank::display_arrange::save_saved_layout(plank::display_arrange::current_layout());
+    }
+
+    constexpr std::size_t max_attempts = 8;
+    std::size_t attempts = 0;
+    for (const auto &choice : candidates) {
+      if (attempts++ >= max_attempts) {
+        break;
+      }
+      const auto &target = displays[choice.display_index];
+      const bool is_preferred = choice.display_index == preferred;
+      bool applied = false;
+      if (is_preferred && target.width == choice.mode.width && target.height == choice.mode.height) {
+        applied = true;  // Already in that mode; leave the display alone.
+      } else if (is_preferred) {
+        BOOST_LOG(info) << "Switching "sv << target.name << " to "sv << choice.mode.width << 'x'
+                        << choice.mode.height << " for a PLANK session"sv;
+        auto requested = target;
+        requested.width = choice.mode.width;
+        requested.height = choice.mode.height;
+        requested.refresh_hz = choice.mode.refresh_hz;
+        applied = plank::display_arrange::apply_mode(requested);
+      } else {
+        BOOST_LOG(info) << "Making "sv << target.name << " the primary display at "sv
+                        << choice.mode.width << 'x' << choice.mode.height << " for a PLANK session"sv;
+        const auto layout = plank::display_arrange::current_layout();
+        const auto at = std::find_if(layout.begin(), layout.end(),
+                                     [&target](const auto &display) { return display.name == target.name; });
+        if (at != layout.end()) {
+          auto arrangement = plank::display_arrange::primary_switch_layout(
+            layout, static_cast<std::size_t>(at - layout.begin()), choice.mode.width, choice.mode.height);
+          for (auto &display : arrangement) {
+            if (display.name == target.name) {
+              display.refresh_hz = choice.mode.refresh_hz;
+            }
+          }
+          applied = plank::display_arrange::apply_arrangement(arrangement);
+        }
+      }
+
+      if (!applied) {
+        BOOST_LOG(warning) << target.name << " refused "sv << choice.mode.width << 'x'
+                           << choice.mode.height << " ("sv
+                           << plank::display_arrange::fallback_reason_name(choice.reason)
+                           << "); trying the next option"sv;
+        continue;
+      }
+
+      std::string applied_mode;
+      if (choice.reason == plank::display_arrange::fallback_reason_t::requested_mode ||
+          choice.reason == plank::display_arrange::fallback_reason_t::other_display) {
+        BOOST_LOG(info) << "Display fallback: served "sv << request.mode_1 << " as asked ("sv
+                        << plank::display_arrange::fallback_reason_name(choice.reason) << ", "sv
+                        << target.name << ')';
+      } else {
+        applied_mode = std::to_string(choice.mode.width) + 'x' + std::to_string(choice.mode.height);
+        BOOST_LOG(warning) << "Display fallback: "sv << displays[preferred].name << " can't do "sv
+                           << request.mode_1 << "; serving "sv << applied_mode << " on "sv
+                           << target.name << " instead ("sv
+                           << plank::display_arrange::fallback_reason_name(choice.reason) << ')';
+      }
+      display_lease() = runtime_display_state_t {request.layout, request.mode_1, {}, request.account_uid,
+                                                 std::move(applied_mode)};
+      return display_request_status::submitted;
+    }
+
+    BOOST_LOG(warning) << "No display accepted "sv << request.mode_1
+                       << " or any substitute; keeping the current modes"sv;
+    plank::display_arrange::restore_saved_layout_if_any();
+    return display_request_status::unavailable;
   }
 
   display_request_status activate_display_lease(uid_t account_uid) {
