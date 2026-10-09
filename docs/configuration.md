@@ -44,15 +44,29 @@ inactivity before the host cleans up the stream. Default: `10000`.
 
 Optional. Publishes the host's screens as NDI sources on the LAN so they can be
 picked up in Evercast's desktop app (Stream, then Stream NDI) or any other NDI
-receiver. Sources are published whether or not a PLANK client is connected.
-Requires the free NDI runtime (install NDI Tools from ndi.video); PLANK does not
-ship it. There is no audio in this version. Restart the PLANK service after
-changing these options.
+receiver. Sources are published whether or not a PLANK client is connected, and
+alongside an active PLANK stream.
+
+How it works: with `ndi_output = on` the host starts a small helper program,
+`tools\plank-ndi.exe`, and restarts it if it dies. The helper does its own
+screen capture in a separate process (so it never interferes with PLANK's
+capture) and loads the free NDI runtime itself. The NDI runtime is not part of
+PLANK; install NDI Tools from <https://ndi.video>. If it is missing the helper
+logs "NDI output is on but the NDI runtime is not installed; install NDI Tools"
+and the host carries on normally. There is no audio in this version. Restart
+the PLANK service after changing these options.
+
+**NDI has no authentication.** Anyone on the same network who runs an NDI
+receiver can see the published screens. Only turn this on for networks you
+trust, and use `ndi_groups` to narrow who sees the source. While the Windows
+secure desktop is up (lock screen, UAC prompt, sign-in) the helper sends a
+black picture instead of the screen.
+
+NDI(R) is a registered trademark of Vizrt NDI AB. See <https://ndi.video>.
 
 ### ndi_output
 
-Publish NDI sources. Accepted values: `on` or `off`. Default: `off`. If the NDI
-runtime is not installed the host logs one line and carries on normally.
+Publish NDI sources. Accepted values: `on` or `off`. Default: `off`.
 
 ### ndi_outputs
 
@@ -63,6 +77,12 @@ Which displays to publish: `primary` or `all`. Default: `primary`.
 Name of the NDI source. Default: `<COMPUTERNAME> - Screen N`. A custom name is
 used as is for one display; with `ndi_outputs = all` and several displays a
 number is appended. NDI receivers also show the machine name in front.
+
+### ndi_groups
+
+Comma separated NDI groups the sources are published into. Default: empty (the
+default NDI group, visible to all receivers). Receivers must be set to the same
+group to see the source. This narrows visibility; it is not access control.
 
 ### ndi_fps
 

@@ -324,6 +324,7 @@ namespace config {
     bool enabled;  ///< Publish the host's screens as NDI sources.
     bool all_outputs;  ///< Publish every display, not only the primary.
     std::string source_name;  ///< Custom source name; empty selects "<COMPUTERNAME> - Screen N".
+    std::string groups;  ///< NDI groups the sources join; empty means the default group.
     int fps;  ///< Send rate, 1 to 60.
   };
 

@@ -197,18 +197,35 @@ namespace plank::ndi {
   }
 
   /**
-   * @brief Directories (and finally the bare DLL name) to try, in the order the
-   * NDI documentation gives: the NDI_RUNTIME_DIR_V* environment variables,
-   * newest first, then the standard install locations.
+   * @brief True for a fully qualified Windows path (`C:\...` or `\\server\...`).
+   * Relative NDI_RUNTIME_DIR values are refused: they would resolve against the
+   * current directory, which a process running as SYSTEM must never trust.
+   */
+  inline bool is_absolute_windows_path(std::string_view path) {
+    if (path.size() >= 3 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':' && (path[2] == '\\' || path[2] == '/')) {
+      return true;
+    }
+    return path.size() >= 3 && path[0] == '\\' && path[1] == '\\';
+  }
+
+  /**
+   * @brief DLL paths to try, in the order the NDI documentation gives: the
+   * NDI_RUNTIME_DIR_V6 / V5 environment variables, then the standard install
+   * locations. Environment values that are not absolute paths are skipped.
+   *
+   * The result holds full paths only. The caller must load them with
+   * LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS and must
+   * not fall back to a bare DLL name: that would search directories (the
+   * application directory, for one) that an unprivileged user may be able to
+   * write to.
    *
    * @param getenv Environment lookup; returns an empty string when unset.
-   * @return Full DLL paths, each tried with LoadLibrary until one loads.
    */
   inline std::vector<std::string> runtime_candidates(const std::function<std::string(const char *)> &getenv) {
     constexpr std::string_view dll = "Processing.NDI.Lib.x64.dll";
     std::vector<std::string> paths;
     auto add_dir = [&](std::string dir) {
-      if (dir.empty()) {
+      if (!is_absolute_windows_path(dir)) {
         return;
       }
       if (dir.back() != '\\' && dir.back() != '/') {
@@ -222,16 +239,120 @@ namespace plank::ndi {
     }
 
     std::string program_files = getenv("ProgramFiles");
-    if (program_files.empty()) {
+    if (!is_absolute_windows_path(program_files)) {
       program_files = "C:\\Program Files";
     }
     add_dir(program_files + "\\NDI\\NDI 6 Runtime\\v6");
     add_dir(program_files + "\\NDI\\NDI 6 Tools\\Runtime");
     add_dir(program_files + "\\NDI\\NDI 5 Runtime\\v5");
     add_dir(program_files + "\\NDI\\NDI 5 Tools\\Runtime");
-
-    // Last resort: let Windows search PATH and the application directory.
-    paths.emplace_back(dll);
     return paths;
+  }
+
+  /**
+   * @brief Exponential backoff: 1 s, 2 s, 4 s ... capped at `cap`.
+   * @param attempt Number of consecutive failures so far (0 gives the first delay).
+   */
+  inline std::chrono::milliseconds backoff_delay(int attempt, std::chrono::milliseconds cap = std::chrono::seconds {30}) {
+    using namespace std::chrono_literals;
+    auto delay = 1000ms;
+    for (int i = 0; i < attempt && delay < cap; ++i) {
+      delay *= 2;
+    }
+    return std::min<std::chrono::milliseconds>(delay, cap);
+  }
+
+  /**
+   * @brief Quote one argument for a Windows command line (CommandLineToArgvW rules).
+   */
+  inline std::string quote_windows_arg(std::string_view arg) {
+    if (!arg.empty() && arg.find_first_of(" \t\n\v\"") == std::string_view::npos) {
+      return std::string {arg};
+    }
+    std::string out {'"'};
+    std::size_t backslashes = 0;
+    for (char c : arg) {
+      if (c == '\\') {
+        ++backslashes;
+        continue;
+      }
+      if (c == '"') {
+        out.append(backslashes * 2 + 1, '\\');
+      } else {
+        out.append(backslashes, '\\');
+      }
+      backslashes = 0;
+      out += c;
+    }
+    out.append(backslashes * 2, '\\');
+    out += '"';
+    return out;
+  }
+
+  /// What the host passes to the plank-ndi helper on its command line.
+  struct helper_options {
+    int fps {default_fps};
+    scope_e scope {scope_e::primary};
+    std::string name;  ///< `ndi_source_name`; empty selects the default.
+    std::string groups;  ///< `ndi_groups`; empty means the default NDI group.
+  };
+
+  /// Helper arguments (without argv[0]). Empty name/groups are left out.
+  inline std::vector<std::string> build_helper_args(const helper_options &options) {
+    std::vector<std::string> args {"--fps", std::to_string(clamp_fps(options.fps)), "--outputs", options.scope == scope_e::all ? "all" : "primary"};
+    if (!options.name.empty()) {
+      args.insert(args.end(), {"--name", options.name});
+    }
+    if (!options.groups.empty()) {
+      args.insert(args.end(), {"--groups", options.groups});
+    }
+    return args;
+  }
+
+  /// Full command line: quoted executable path followed by the quoted arguments.
+  inline std::string build_helper_command_line(std::string_view exe, const helper_options &options) {
+    std::string line = quote_windows_arg(exe);
+    for (const auto &arg : build_helper_args(options)) {
+      line += ' ';
+      line += quote_windows_arg(arg);
+    }
+    return line;
+  }
+
+  /// Parse the helper's arguments (without argv[0]); nullopt on anything unknown.
+  inline std::optional<helper_options> parse_helper_args(const std::vector<std::string> &args) {
+    helper_options options;
+    for (std::size_t i = 0; i < args.size(); i += 2) {
+      if (i + 1 >= args.size()) {
+        return std::nullopt;
+      }
+      const auto &key = args[i];
+      const auto &value = args[i + 1];
+      if (key == "--fps") {
+        try {
+          std::size_t used = 0;
+          const int fps = std::stoi(value, &used);
+          if (used != value.size()) {
+            return std::nullopt;
+          }
+          options.fps = clamp_fps(fps);
+        } catch (...) {
+          return std::nullopt;
+        }
+      } else if (key == "--outputs") {
+        const auto scope = parse_scope(value);
+        if (!scope) {
+          return std::nullopt;
+        }
+        options.scope = *scope;
+      } else if (key == "--name") {
+        options.name = value;
+      } else if (key == "--groups") {
+        options.groups = value;
+      } else {
+        return std::nullopt;
+      }
+    }
+    return options;
   }
 }  // namespace plank::ndi

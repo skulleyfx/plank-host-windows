@@ -712,6 +712,7 @@ namespace config {
     false,  // enabled
     false,  // all_outputs
     {},  // source_name (empty selects "<COMPUTERNAME> - Screen N")
+    {},  // groups
     plank::ndi::default_fps  // fps
   };
 
@@ -1662,6 +1663,7 @@ namespace config {
       }
 
       string_f(vars, "ndi_source_name", ndi.source_name);
+      string_f(vars, "ndi_groups", ndi.groups);
 
       int ndi_fps = ndi.fps;
       int_f(vars, "ndi_fps", ndi_fps);
