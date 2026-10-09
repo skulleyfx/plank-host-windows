@@ -6,6 +6,8 @@
 
 // standard includes
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <utility>
 
 // lib includes
@@ -97,6 +99,35 @@ namespace stream {
      * @return Attached viewer count.
      */
     unsigned viewer_count();
+
+    /**
+     * @brief Whether a session's client understands shared screen messages.
+     *
+     * @param session Streaming session.
+     * @return True when shared_screen is on and the client negotiated the bit.
+     */
+    bool accepts_shared_messages(const session_t &session);
+
+    /**
+     * @brief The owner's answer to a watch request.
+     */
+    enum class owner_answer_e {
+      allowed,  ///< The owner allowed it.
+      declined,  ///< The owner declined it.
+      timed_out,  ///< The owner did not answer in time.
+      gone,  ///< The controller stopped or cannot answer.
+    };
+
+    /**
+     * @brief Ask the controller's client whether an account may watch, and wait for the answer.
+     *
+     * Blocks the caller for at most the shared screen answer timeout.
+     *
+     * @param controller Running controller.
+     * @param account Account asking to watch.
+     * @return The owner's answer.
+     */
+    owner_answer_e ask_owner_to_admit(const std::shared_ptr<session_t> &controller, const std::string &account);
     /**
      * @brief Start a streaming session for the supplied peer address.
      *

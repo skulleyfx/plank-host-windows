@@ -1733,10 +1733,11 @@ namespace nvhttp {
   /**
    * @brief Admit a client that asked to watch the running stream view-only.
    *
-   * Runs after the desktop auth gate, so only the desktop's own account or a
-   * PLANK admin using the desktop override can get here; other accounts need
-   * the owner's approval, which is a later slice. A viewer never terminates,
-   * reconfigures or takes over the controller's stream.
+   * Runs instead of the desktop auth gate: any authenticated account may ask
+   * to watch. The desktop's own account joins directly, a PLANK admin using
+   * the desktop override joins silently, and anyone else is held at native
+   * setup until the owner allows it on the controller's client. A viewer
+   * never terminates, reconfigures or takes over the controller's stream.
    *
    * @param args Launch query arguments.
    * @param request Authorized HTTPS request.
@@ -1759,20 +1760,26 @@ namespace nvhttp {
     }
 
     const auto identity = authenticated_identity(request);
-    bool same_account = true;
+    if (identity.empty()) {
+      tree.put(result_field, 0);
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "Operating-system authentication required.");
+      return true;
+    }
+    bool same_account = false;
     bool admin_override = false;
 #ifdef _WIN32
-    same_account = plank::session::desktop_owner_relation(identity) !=
-                   plank::session::desktop_owner_e::different;
+    same_account = plank::session::desktop_owner_relation(identity) ==
+                   plank::session::desktop_owner_e::same;
     admin_override = config::plank_auth.admin_desktop_override &&
                      plank::auth::account_is_plank_admin(identity);
 #endif
-    const auto consent = shared::decide_consent(
-      config::plank_auth.shared_screen, same_account, admin_override, false
-    );
-
     auto launch_session = make_launch_session(false, args);
     const auto running = session_stream::shared_stream();
+    const auto consent = shared::decide_consent(
+      config::plank_auth.shared_screen, same_account, admin_override,
+      running && running->owner_can_approve
+    );
     const bool launch_matches = running &&
       launch_session->width == running->width &&
       launch_session->height == running->height &&
@@ -1789,12 +1796,11 @@ namespace nvhttp {
       config::plank_auth.shared_screen_max_viewers,
       launch_matches,
     });
-    if (!admission.admitted() || consent == shared::consent_e::refuse ||
-        consent == shared::consent_e::ask_owner) {
+    if (!admission.admitted() || consent == shared::consent_e::refuse) {
       const int status = !admission.admitted() ? admission.status : 403;
       const std::string message = !admission.admitted() ?
         std::string {admission.message} :
-        std::string {"Watching another account's desktop needs the owner's approval"};
+        std::string {"The owner's client cannot approve viewers"};
       BOOST_LOG(warning) << "Refusing shared screen viewer "sv << identity << ": "sv << message;
       tree.put(result_field, 0);
       tree.put("root.<xmlattr>.status_code", status);
@@ -1811,6 +1817,7 @@ namespace nvhttp {
 
     launch_session->role = shared::role_e::viewer;
     launch_session->admin_observer = consent == shared::consent_e::admit_admin_silently;
+    launch_session->owner_approval_required = consent == shared::consent_e::ask_owner;
     launch_session->authenticated_account = identity;
     launch_session->authentication_session = claim_authentication_session(request);
     if (!launch_session->authentication_session) {
@@ -1883,15 +1890,17 @@ namespace nvhttp {
 
     auto appid = util::from_view(get_arg(args, "appid"));
 
+    // A viewer asks to watch; it never owns the desktop, so it skips the
+    // ownership gate and is admitted (or held for the owner) separately.
+    if (handle_viewer_join(args, request, tree, "root.gamesession")) {
+      return;
+    }
+
     const auto authenticated_uid = authenticated_account_uid_for_desktop(request);
     if (!authenticated_uid) {
       tree.put("root.gamesession", 0);
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "The authenticated account does not own this desktop session");
-      return;
-    }
-
-    if (handle_viewer_join(args, request, tree, "root.gamesession")) {
       return;
     }
 
@@ -2061,15 +2070,15 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
+    if (handle_viewer_join(request->parse_query_string(), request, tree, "root.resume")) {
+      return;
+    }
+
     const auto authenticated_uid = authenticated_account_uid_for_desktop(request);
     if (!authenticated_uid) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "The authenticated account does not own this desktop session");
-      return;
-    }
-
-    if (handle_viewer_join(request->parse_query_string(), request, tree, "root.resume")) {
       return;
     }
 

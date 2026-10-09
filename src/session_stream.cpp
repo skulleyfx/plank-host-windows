@@ -196,11 +196,13 @@ namespace session_stream {
   }
 
   std::optional<shared_stream_t> shared_stream() {
-    shared_stream_t stream;
-    if (!server.controller(&stream)) {
+    shared_stream_t shape;
+    const auto controller = server.controller(&shape);
+    if (!controller) {
       return std::nullopt;
     }
-    return stream;
+    shape.owner_can_approve = stream::session::accepts_shared_messages(*controller);
+    return shape;
   }
 
   void viewer_launch_raise(std::shared_ptr<launch_session_t> launch_session) {
@@ -592,6 +594,38 @@ namespace session_stream {
       result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
       result.message = "The shared screen viewer limit has been reached";
       return result;
+    }
+
+    // Another account's viewer waits here, with its QUIC connection open,
+    // until the owner answers on the controller's client. The HTTP launch
+    // already returned: the HTTPS server must not block for the answer.
+    if (launch_session->owner_approval_required) {
+      if (!stream::session::accepts_shared_messages(*controller)) {
+        result.status = PLANK_TRANSPORT_SETUP_STATUS_AUTHORIZATION_FAILED;
+        result.message = "The owner's client cannot approve viewers";
+        return result;
+      }
+      switch (stream::session::ask_owner_to_admit(controller, launch_session->authenticated_account)) {
+        case stream::session::owner_answer_e::allowed:
+          break;
+        case stream::session::owner_answer_e::declined:
+          result.status = PLANK_TRANSPORT_SETUP_STATUS_AUTHORIZATION_FAILED;
+          result.message = "The owner declined";
+          return result;
+        case stream::session::owner_answer_e::timed_out:
+          result.status = PLANK_TRANSPORT_SETUP_STATUS_AUTHORIZATION_FAILED;
+          result.message = "The owner did not answer";
+          return result;
+        case stream::session::owner_answer_e::gone:
+          result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+          result.message = "There is no PLANK session to watch";
+          return result;
+      }
+      if (stream::session::state(*controller) != stream::session::state_e::RUNNING) {
+        result.status = PLANK_TRANSPORT_SETUP_STATUS_UNSUPPORTED;
+        result.message = "There is no PLANK session to watch";
+        return result;
+      }
     }
 
     // Pace the viewer at the controller's ceiling; the encoder is shared.

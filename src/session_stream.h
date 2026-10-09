@@ -55,6 +55,7 @@ namespace session_stream {
     std::shared_ptr<void> plank_transport_endpoint;  ///< Experimental QUIC data-plane lifetime.
     plank::shared_screen::role_e role {plank::shared_screen::role_e::controller};  ///< Controller, or a shared screen viewer.
     bool admin_observer {};  ///< Viewer admitted through the PLANK admin desktop override.
+    bool owner_approval_required {};  ///< Viewer from another account; the owner must allow it at native setup.
   };
 
   /**
@@ -69,6 +70,7 @@ namespace session_stream {
     std::string encoding_mode;  ///< Accepted PLANK encoding mode.
     std::string capture_source;  ///< Accepted PLANK capture source.
     std::string encoder_backend;  ///< Accepted PLANK encoder backend.
+    bool owner_can_approve {};  ///< The controller's client can answer watch requests.
   };
 
   /**
