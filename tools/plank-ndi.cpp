@@ -27,6 +27,7 @@
 // clang-format off
 #include <Windows.h>
 #include <shellapi.h>
+#include <initguid.h>
 #include <d3d11.h>
 #include <dxgi1_5.h>
 // clang-format on
