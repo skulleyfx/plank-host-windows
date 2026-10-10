@@ -204,3 +204,90 @@ TEST(PlankNdi, HelperCommandLineIsQuoted) {
   EXPECT_EQ(ndi::build_helper_command_line("C:\\Program Files\\PLANK\\tools\\plank-ndi.exe", options),
             "\"C:\\Program Files\\PLANK\\tools\\plank-ndi.exe\" --fps 30 --outputs primary --name \"My Screen\"");
 }
+
+TEST(PlankNdi, ParseModeAcceptsAvailableAndKeepsOnOff) {
+  EXPECT_EQ(ndi::parse_mode("available"), ndi::mode_e::available);
+  EXPECT_EQ(ndi::parse_mode("  Available "), ndi::mode_e::available);
+  EXPECT_EQ(ndi::parse_mode("on"), ndi::mode_e::on);
+  EXPECT_EQ(ndi::parse_mode("true"), ndi::mode_e::on);
+  EXPECT_EQ(ndi::parse_mode("off"), ndi::mode_e::off);
+  EXPECT_EQ(ndi::parse_mode("0"), ndi::mode_e::off);
+  EXPECT_FALSE(ndi::parse_mode("").has_value());
+  EXPECT_FALSE(ndi::parse_mode("sometimes").has_value());
+}
+
+TEST(PlankNdi, AutoOffMinutesIsClamped) {
+  EXPECT_EQ(ndi::clamp_auto_off_minutes(-5), 0);
+  EXPECT_EQ(ndi::clamp_auto_off_minutes(0), 0);
+  EXPECT_EQ(ndi::clamp_auto_off_minutes(120), 120);
+  EXPECT_EQ(ndi::clamp_auto_off_minutes(100000000), ndi::max_auto_off_minutes);
+}
+
+TEST(PlankNdi, ReportState) {
+  using ndi::mode_e;
+  using ndi::report_e;
+  EXPECT_EQ(ndi::report_state(mode_e::off, true, false), report_e::unavailable);
+  EXPECT_EQ(ndi::report_state(mode_e::off, true, true), report_e::unavailable);
+  EXPECT_EQ(ndi::report_state(mode_e::available, false, false), report_e::unavailable);
+  EXPECT_EQ(ndi::report_state(mode_e::available, true, false), report_e::off);
+  EXPECT_EQ(ndi::report_state(mode_e::available, true, true), report_e::on);
+  EXPECT_EQ(ndi::report_state(mode_e::on, true, true), report_e::always);
+  EXPECT_EQ(ndi::report_state(mode_e::on, false, true), report_e::unavailable);
+  EXPECT_EQ(ndi::report_text(report_e::unavailable), "unavailable");
+  EXPECT_EQ(ndi::report_text(report_e::off), "off");
+  EXPECT_EQ(ndi::report_text(report_e::on), "on");
+  EXPECT_EQ(ndi::report_text(report_e::always), "always");
+}
+
+TEST(PlankNdi, OnlyOwnerOrAdminMayToggle) {
+  EXPECT_TRUE(ndi::may_toggle(true, false));
+  EXPECT_TRUE(ndi::may_toggle(false, true));
+  EXPECT_TRUE(ndi::may_toggle(true, true));
+  EXPECT_FALSE(ndi::may_toggle(false, false));
+}
+
+TEST(PlankNdi, AutoOffFollowsTheSessionItWasSwitchedOnFor) {
+  ndi::auto_off_input in;
+  in.switched_on_by_request = true;
+  in.session_was_active = true;
+  in.session_active_now = true;
+  in.elapsed = std::chrono::hours {10};  // long sessions are not cut off by the timeout
+  EXPECT_FALSE(ndi::should_auto_off(in));
+  in.session_active_now = false;
+  EXPECT_TRUE(ndi::should_auto_off(in));
+}
+
+TEST(PlankNdi, AutoOffTimeoutWithoutSession) {
+  ndi::auto_off_input in;
+  in.switched_on_by_request = true;
+  in.session_was_active = false;
+  in.timeout_minutes = 120;
+  in.elapsed = std::chrono::minutes {119};
+  EXPECT_FALSE(ndi::should_auto_off(in));
+  in.elapsed = std::chrono::minutes {120};
+  EXPECT_TRUE(ndi::should_auto_off(in));
+  // A session starting and ending later does not matter here.
+  in.elapsed = std::chrono::minutes {1};
+  in.session_active_now = false;
+  EXPECT_FALSE(ndi::should_auto_off(in));
+  // 0 means never.
+  in.timeout_minutes = 0;
+  in.elapsed = std::chrono::hours {1000};
+  EXPECT_FALSE(ndi::should_auto_off(in));
+}
+
+TEST(PlankNdi, AlwaysOnIsNeverAutoSwitchedOff) {
+  ndi::auto_off_input in;
+  in.switched_on_by_request = false;
+  in.session_was_active = true;
+  in.session_active_now = false;
+  in.elapsed = std::chrono::hours {1000};
+  EXPECT_FALSE(ndi::should_auto_off(in));
+}
+
+TEST(PlankNdi, SourceLabel) {
+  EXPECT_EQ(ndi::source_label("", "BOX", false), "BOX - Screen 1");
+  EXPECT_EQ(ndi::source_label("", "BOX", true), "BOX - Screen N");
+  EXPECT_EQ(ndi::source_label("Colour", "BOX", false), "Colour");
+  EXPECT_EQ(ndi::source_label("Colour", "BOX", true), "Colour N");
+}

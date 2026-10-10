@@ -70,6 +70,9 @@
 #include "network.h"
 #include "nvhttp.h"
 #include "platform/common.h"
+#ifdef _WIN32
+  #include "platform/windows/ndi_output.h"
+#endif
 #include "process.h"
 #include "session_stream.h"
 #include "session/session_context.h"
@@ -1500,6 +1503,72 @@ namespace nvhttp {
     write_auth_json(response, SimpleWeb::StatusCode::success_ok, output_topology_json(client_flags));
   }
 
+#ifdef _WIN32
+  /**
+   * @brief Report or change the optional NDI screen output.
+   *
+   * GET or POST /plank/ndi reports the state; adding state=on or state=off
+   * changes it. Changing is for the account that owns the desktop and for PLANK
+   * administrators only: a viewer in a shared screen session is refused. The
+   * work is handed to the NDI supervisor thread, so this never waits for the
+   * helper to start or stop.
+   */
+  void ndi_control(const resp_https_t &response, const req_https_t &request) {
+    const auto query = request->parse_query_string();
+    const auto requested = query.find("state");
+    const auto identity = authenticated_identity(request);
+
+    auto write_state = [&](SimpleWeb::StatusCode status, const char *error) {
+      const auto current = platf::ndi_output::status();
+      nlohmann::json body;
+      body["state"] = std::string {plank::ndi::report_text(current.report)};
+      if (!current.source_names.empty()) {
+        body["source"] = current.source_names;
+      }
+      if (error) {
+        body["error"] = error;
+      }
+      write_auth_json(response, status, body);
+    };
+
+    if (requested == query.end()) {
+      write_state(SimpleWeb::StatusCode::success_ok, nullptr);
+      return;
+    }
+
+    const auto text = requested->second;
+    bool on = false;
+    if (text == "on") {
+      on = true;
+    } else if (text != "off") {
+      write_state(SimpleWeb::StatusCode::client_error_bad_request, "state must be on or off");
+      return;
+    }
+
+    const bool is_owner = !identity.empty() &&
+                          plank::session::desktop_owner_relation(identity) == plank::session::desktop_owner_e::same;
+    const bool is_admin = !identity.empty() && plank::auth::account_is_plank_admin(identity);
+    if (!plank::ndi::may_toggle(is_owner, is_admin)) {
+      BOOST_LOG(warning) << "Refusing NDI switch "sv << text << " for "sv << identity
+                         << ": only the desktop owner or a PLANK admin may change it"sv;
+      write_state(SimpleWeb::StatusCode::client_error_forbidden, "Only the desktop owner or an administrator can change NDI");
+      return;
+    }
+
+    switch (platf::ndi_output::set_enabled(on, stream::session::running_count() > 0, identity)) {
+      case platf::ndi_output::toggle_result_e::ok:
+        write_state(SimpleWeb::StatusCode::success_ok, nullptr);
+        break;
+      case platf::ndi_output::toggle_result_e::always_on:
+        write_state(SimpleWeb::StatusCode::client_error_conflict, "NDI is always on on this host (ndi_output = on)");
+        break;
+      case platf::ndi_output::toggle_result_e::unavailable:
+        write_state(SimpleWeb::StatusCode::client_error_conflict, "NDI is not available on this host");
+        break;
+    }
+  }
+#endif
+
   bool bind_topology_generation(session_stream::launch_session_t &session,
                                 const std::vector<platf::display_info_t> &outputs,
                                 pt::ptree &tree) {
@@ -2166,6 +2235,14 @@ namespace nvhttp {
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
       if (authorization_status == 1 && plank::auth::account_is_plank_admin(authenticated_identity(request))) {
         tree.put("root.PlankSignedInUser", plank::session::signed_in_account());
+      }
+      // Optional NDI screen output; absent when this host has no NDI support configured.
+      if (authorization_status == 1) {
+        const auto ndi = platf::ndi_output::status();
+        tree.put("root.PlankNdi", std::string {plank::ndi::report_text(ndi.report)});
+        if (!ndi.source_names.empty()) {
+          tree.put("root.PlankNdiSource", ndi.source_names);
+        }
       }
     }
 #endif
@@ -2858,6 +2935,15 @@ namespace nvhttp {
         output_topology(resp, req);
       }
     };
+#ifdef _WIN32
+    for (const char *method : {"GET", "POST"}) {
+      https_server.resource["^/plank/ndi$"][method] = [](auto resp, auto req) {
+        if (require_authentication(resp, req)) {
+          ndi_control(resp, req);
+        }
+      };
+    }
+#endif
     https_server.resource["^/applist$"]["GET"] = [](auto resp, auto req) {
       if (require_authentication(resp, req)) {
         applist(resp, req);

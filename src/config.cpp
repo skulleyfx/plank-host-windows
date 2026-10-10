@@ -713,7 +713,9 @@ namespace config {
     false,  // all_outputs
     {},  // source_name (empty selects "<COMPUTERNAME> - Screen N")
     {},  // groups
-    plank::ndi::default_fps  // fps
+    plank::ndi::default_fps,  // fps
+    false,  // available
+    plank::ndi::default_auto_off_minutes  // auto_off_minutes
   };
 
   /**
@@ -1648,10 +1650,11 @@ namespace config {
     {
       std::string ndi_text;
       string_f(vars, "ndi_output", ndi_text);
-      if (auto enabled = plank::ndi::parse_enabled(ndi_text)) {
-        ndi.enabled = *enabled;
+      if (auto mode = plank::ndi::parse_mode(ndi_text)) {
+        ndi.enabled = *mode == plank::ndi::mode_e::on;
+        ndi.available = *mode == plank::ndi::mode_e::available;
       } else if (!ndi_text.empty()) {
-        BOOST_LOG(warning) << "Ignoring ndi_output = '"sv << ndi_text << "'; use on or off"sv;
+        BOOST_LOG(warning) << "Ignoring ndi_output = '"sv << ndi_text << "'; use on, off or available"sv;
       }
 
       ndi_text.clear();
@@ -1668,6 +1671,10 @@ namespace config {
       int ndi_fps = ndi.fps;
       int_f(vars, "ndi_fps", ndi_fps);
       ndi.fps = plank::ndi::clamp_fps(ndi_fps);
+
+      int ndi_auto_off = ndi.auto_off_minutes;
+      int_f(vars, "ndi_auto_off_minutes", ndi_auto_off);
+      ndi.auto_off_minutes = plank::ndi::clamp_auto_off_minutes(ndi_auto_off);
     }
     string_restricted_f(vars, "startup_layout", sunshine.startup_layout, {"physical"sv, "virtual"sv});
 

@@ -47,7 +47,8 @@ picked up in Evercast's desktop app (Stream, then Stream NDI) or any other NDI
 receiver. Sources are published whether or not a PLANK client is connected, and
 alongside an active PLANK stream.
 
-How it works: with `ndi_output = on` the host starts a small helper program,
+How it works: with `ndi_output = on` (or when someone switches it on, see
+`available` below) the host starts a small helper program,
 `tools\plank-ndi.exe`, and restarts it if it dies. The helper does its own
 screen capture in a separate process (so it never interferes with PLANK's
 capture) and loads the free NDI runtime itself. The NDI runtime is not part of
@@ -66,7 +67,30 @@ NDI(R) is a registered trademark of Vizrt NDI AB. See <https://ndi.video>.
 
 ### ndi_output
 
-Publish NDI sources. Accepted values: `on` or `off`. Default: `off`.
+Publish NDI sources. Accepted values: `on`, `off` or `available`. Default: `off`.
+
+- `off`: NDI is switched off and cannot be turned on.
+- `on`: NDI runs all the time, from the moment the PLANK service starts. This is
+  the original behaviour and nobody can turn it off from a client.
+- `available`: NDI is allowed but starts off. The person sitting at the machine
+  (the account signed in at its desktop) or a PLANK administrator can switch it
+  on and off from the "NDI" button in the PLANK stream toolbar, or from "Turn NDI
+  on" in the right-click menu of the machine in the host list. A viewer who is
+  only watching a shared screen cannot. It also switches itself off again, see
+  `ndi_auto_off_minutes`. The button only shows when NDI Tools is installed on
+  that machine. Use this on machines that have NDI Tools but should not publish
+  their screen all day.
+
+To use it, put `ndi_output = available` in `host.conf` and restart the PLANK
+service once.
+
+### ndi_auto_off_minutes
+
+Only used with `ndi_output = available`. When NDI was switched on during a PLANK
+session, it switches itself off as soon as that session ends. When it was
+switched on with nobody streaming (from the host list), it switches itself off
+after this many minutes. `0` means never switch off by time. Default: `120`.
+With `ndi_output = on` nothing is ever switched off automatically.
 
 ### ndi_outputs
 

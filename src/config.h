@@ -321,11 +321,13 @@ namespace config {
    * @brief Optional NDI screen output (Windows). Off by default.
    */
   struct ndi_t {
-    bool enabled;  ///< Publish the host's screens as NDI sources.
+    bool enabled;  ///< ndi_output = on: publish the screens from service start, always.
     bool all_outputs;  ///< Publish every display, not only the primary.
     std::string source_name;  ///< Custom source name; empty selects "<COMPUTERNAME> - Screen N".
     std::string groups;  ///< NDI groups the sources join; empty means the default group.
     int fps;  ///< Send rate, 1 to 60.
+    bool available;  ///< ndi_output = available: starts off, can be switched on and off at runtime.
+    int auto_off_minutes;  ///< Switch a runtime-enabled NDI off after this long with no session; 0 = never.
   };
 
   extern plank_auth_t plank_auth;

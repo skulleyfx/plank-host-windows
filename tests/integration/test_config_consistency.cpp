@@ -125,6 +125,7 @@ TEST(ConfigConsistencyTest, RuntimeOptionsMatchPlankProductPolicy) {
     "log_path",
     "min_log_level",
     "min_threads",
+    "ndi_auto_off_minutes",
     "ndi_fps",
     "ndi_groups",
     "ndi_output",

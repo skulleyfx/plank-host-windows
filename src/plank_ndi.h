@@ -65,6 +65,110 @@ namespace plank::ndi {
     return std::nullopt;
   }
 
+  /// What `ndi_output` asks for.
+  enum class mode_e {
+    off,  ///< Feature disabled; no toggle.
+    on,  ///< Always on from service start (the original behaviour).
+    available,  ///< Allowed, starts off, can be switched on and off at runtime.
+  };
+
+  /**
+   * @brief Parse `ndi_output`: `available` plus everything parse_enabled accepts.
+   * @return nullopt for anything else, so the caller keeps the default (off).
+   */
+  inline std::optional<mode_e> parse_mode(std::string_view text) {
+    if (detail::lower_trimmed(text) == "available") {
+      return mode_e::available;
+    }
+    if (const auto enabled = parse_enabled(text)) {
+      return *enabled ? mode_e::on : mode_e::off;
+    }
+    return std::nullopt;
+  }
+
+  /// Default for `ndi_auto_off_minutes`.
+  constexpr int default_auto_off_minutes = 120;
+  /// Upper bound for `ndi_auto_off_minutes` (one week); larger values are clamped.
+  constexpr int max_auto_off_minutes = 7 * 24 * 60;
+
+  /// Clamp `ndi_auto_off_minutes` to 0..max (0 = never).
+  inline int clamp_auto_off_minutes(int minutes) {
+    return std::clamp(minutes, 0, max_auto_off_minutes);
+  }
+
+  /// What the host tells clients in serverinfo `<PlankNdi>`.
+  enum class report_e {
+    unavailable,  ///< ndi_output = off, or the NDI runtime / helper is missing.
+    off,  ///< Can be switched on.
+    on,  ///< Running, can be switched off.
+    always,  ///< Running because ndi_output = on; cannot be switched.
+  };
+
+  inline std::string_view report_text(report_e report) {
+    switch (report) {
+      case report_e::off:
+        return "off";
+      case report_e::on:
+        return "on";
+      case report_e::always:
+        return "always";
+      case report_e::unavailable:
+        break;
+    }
+    return "unavailable";
+  }
+
+  /**
+   * @brief Work out what to report.
+   * @param mode Configured mode.
+   * @param usable True when the helper program and the NDI runtime are present.
+   * @param running True when NDI is currently switched on.
+   */
+  inline report_e report_state(mode_e mode, bool usable, bool running) {
+    if (mode == mode_e::off || !usable) {
+      return report_e::unavailable;
+    }
+    if (mode == mode_e::on) {
+      return report_e::always;
+    }
+    return running ? report_e::on : report_e::off;
+  }
+
+  /**
+   * @brief May this caller switch NDI on or off?
+   *
+   * Only the account that owns the desktop, or a PLANK administrator. A viewer
+   * in a shared screen session is neither unless they happen to be one of them.
+   */
+  inline bool may_toggle(bool is_desktop_owner, bool is_admin) {
+    return is_desktop_owner || is_admin;
+  }
+
+  /// Inputs of the auto-off decision.
+  struct auto_off_input {
+    bool switched_on_by_request {};  ///< False for ndi_output = on (always on): never auto-off.
+    bool session_was_active {};  ///< A PLANK controller session was running when it was switched on.
+    bool session_active_now {};  ///< A PLANK controller session is running now.
+    std::chrono::seconds elapsed {};  ///< Time since it was switched on.
+    int timeout_minutes {default_auto_off_minutes};  ///< `ndi_auto_off_minutes`, 0 = never.
+  };
+
+  /**
+   * @brief Should NDI be switched off now?
+   *
+   * Switched on during a session: off as soon as no controller session runs.
+   * Switched on with no session: off after the timeout (0 = never).
+   */
+  inline bool should_auto_off(const auto_off_input &in) {
+    if (!in.switched_on_by_request) {
+      return false;
+    }
+    if (in.session_was_active) {
+      return !in.session_active_now;
+    }
+    return in.timeout_minutes > 0 && in.elapsed >= std::chrono::minutes {in.timeout_minutes};
+  }
+
   /**
    * @brief Parse `ndi_outputs` (`primary` or `all`).
    */
@@ -132,6 +236,19 @@ namespace plank::ndi {
       }
     }
     return name;
+  }
+
+  /**
+   * @brief Source name(s) to show in the UI. One screen: its name. All screens:
+   * the pattern with "N" for the screen number.
+   */
+  inline std::string source_label(std::string_view custom, std::string_view computer, bool all_outputs) {
+    // Reuse source_name so trimming and limits match what is published.
+    const auto first = source_name(custom, computer, 1, all_outputs ? 2 : 1);
+    if (!all_outputs || first.empty()) {
+      return first;
+    }
+    return first.substr(0, first.size() - 1) + "N";
   }
 
   /// One capturable display, as far as output selection cares.

@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <mutex>
@@ -42,6 +43,7 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/plank_ndi.h"
+#include "src/stream.h"
 #include "utf_utils.h"
 
 using namespace std::literals;
@@ -130,44 +132,161 @@ namespace platf::ndi_output {
 
     class ndi_output_t: public platf::deinit_t {
     public:
-      ndi_output_t(std::filesystem::path exe, plank::ndi::helper_options options):
+      /**
+       * @param start_on True for ndi_output = on: run from the start and never switch off.
+       */
+      ndi_output_t(std::filesystem::path exe, plank::ndi::helper_options options, bool start_on):
           exe_ {std::move(exe)},
-          options_ {std::move(options)} {
+          options_ {std::move(options)},
+          always_on_ {start_on},
+          wanted_ {start_on} {
+        {
+          std::lock_guard lock {registry_mutex()};
+          registry() = this;
+        }
         thread_ = std::thread([this] {
           try {
-            supervise();
+            run();
           } catch (const std::exception &e) {
             BOOST_LOG(error) << "NDI supervisor stopped: "sv << e.what();
           } catch (...) {
             BOOST_LOG(error) << "NDI supervisor stopped on an unknown error"sv;
           }
         });
+        if (!always_on_) {
+          watchdog_ = std::thread([this] {
+            try {
+              watch();
+            } catch (...) {
+              BOOST_LOG(error) << "NDI auto-off watcher stopped on an error"sv;
+            }
+          });
+        }
       }
 
       ~ndi_output_t() override {
+        {
+          // Unregister first so no HTTPS handler can reach us while we shut down.
+          std::lock_guard lock {registry_mutex()};
+          registry() = nullptr;
+        }
         {
           std::lock_guard lock {mutex_};
           stop_ = true;
         }
         cv_.notify_all();
+        if (watchdog_.joinable()) {
+          watchdog_.join();
+        }
         if (thread_.joinable()) {
           thread_.join();  // bounded: see run_once()
         }
       }
 
+      static std::mutex &registry_mutex() {
+        static std::mutex m;
+        return m;
+      }
+
+      static ndi_output_t *&registry() {
+        static ndi_output_t *instance = nullptr;
+        return instance;
+      }
+
+      bool always_on() const {
+        return always_on_;
+      }
+
+      bool running() const {
+        std::lock_guard lock {mutex_};
+        return wanted_;
+      }
+
+      const plank::ndi::helper_options &options() const {
+        return options_;
+      }
+
+      /// Request the helper on or off. Never blocks beyond the mutex; the supervisor thread does the work.
+      /// @return True if the requested state differs from the current one.
+      bool request(bool on, bool session_active) {
+        bool changed = false;
+        {
+          std::lock_guard lock {mutex_};
+          changed = wanted_ != on;
+          wanted_ = on;
+          if (on && changed) {
+            switched_on_at_ = std::chrono::steady_clock::now();
+            session_was_active_ = session_active;
+          }
+        }
+        cv_.notify_all();
+        return changed;
+      }
+
     private:
+      /// True when the helper should stop running (shutdown or switched off).
+      bool should_stop() const {
+        std::lock_guard lock {mutex_};
+        return stop_ || !wanted_;
+      }
+
       bool wait(std::chrono::milliseconds period) {
         std::unique_lock lock {mutex_};
         cv_.wait_for(lock, period, [this] {
-          return stop_.load();
+          return stop_ || !wanted_;
         });
-        return stop_;
+        return stop_ || !wanted_;
+      }
+
+      /// Outer loop: sleep while off, supervise the helper while on.
+      void run() {
+        platf::set_thread_name("ndi::supervisor");
+        while (true) {
+          {
+            std::unique_lock lock {mutex_};
+            cv_.wait(lock, [this] {
+              return stop_ || wanted_;
+            });
+            if (stop_) {
+              return;
+            }
+          }
+          supervise();
+        }
+      }
+
+      /// Switches NDI off again when ndi_auto_off_minutes / the session rules say so.
+      void watch() {
+        platf::set_thread_name("ndi::autooff");
+        std::unique_lock lock {mutex_};
+        while (!stop_) {
+          cv_.wait_for(lock, 1s, [this] {
+            return stop_.load();
+          });
+          if (stop_) {
+            return;
+          }
+          if (!wanted_) {
+            continue;
+          }
+          plank::ndi::auto_off_input in;
+          in.switched_on_by_request = !always_on_;
+          in.session_was_active = session_was_active_;
+          in.session_active_now = ::stream::session::running_count() > 0;
+          in.elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - switched_on_at_);
+          in.timeout_minutes = config::ndi.auto_off_minutes;
+          if (plank::ndi::should_auto_off(in)) {
+            wanted_ = false;
+            BOOST_LOG(info) << "NDI switched off automatically ("sv
+                            << (in.session_was_active ? "the PLANK session it was switched on for has ended"sv : "ndi_auto_off_minutes reached"sv) << ')';
+            cv_.notify_all();
+          }
+        }
       }
 
       void supervise() {
-        platf::set_thread_name("ndi::supervisor");
         int failures = 0;
-        while (!stop_) {
+        while (!should_stop()) {
           const auto started = std::chrono::steady_clock::now();
           DWORD exit_code = 0;
           if (!run_once(exit_code)) {
@@ -177,12 +296,15 @@ namespace platf::ndi_output {
             }
             continue;
           }
-          if (stop_) {
+          if (should_stop()) {
             return;
           }
           if (exit_code == exit_bad_arguments) {
             // Restarting with the same command line would fail the same way, forever.
             BOOST_LOG(error) << "NDI helper rejected its command line (exit code 64); check ndi_source_name and ndi_groups. NDI output is disabled until the host restarts"sv;
+            // Back to "off" so the state reported to clients is honest and the outer loop does not spin.
+            std::lock_guard lock {mutex_};
+            wanted_ = false;
             return;
           }
           if (exit_code == exit_runtime_missing) {
@@ -314,7 +436,7 @@ namespace platf::ndi_output {
             exited = true;
             break;
           }
-          if (stop_) {
+          if (should_stop()) {
             break;
           }
         }
@@ -359,15 +481,59 @@ namespace platf::ndi_output {
 
       std::filesystem::path exe_;
       plank::ndi::helper_options options_;
-      std::mutex mutex_;
+      const bool always_on_;
+      mutable std::mutex mutex_;
       std::condition_variable cv_;
       std::atomic<bool> stop_ {false};
+      bool wanted_ {false};  ///< Guarded by mutex_. The helper should be running.
+      bool session_was_active_ {false};  ///< Guarded by mutex_.
+      std::chrono::steady_clock::time_point switched_on_at_ {};  ///< Guarded by mutex_.
       std::thread thread_;
+      std::thread watchdog_;
     };
+
+    std::string env_value(const char *name) {
+      const char *value = std::getenv(name);
+      return value ? std::string {value} : std::string {};
+    }
+
+    /// Is the NDI runtime DLL on disk? Same search order as the helper, without loading it.
+    bool runtime_installed() {
+      static std::mutex m;
+      static std::chrono::steady_clock::time_point checked_at {};
+      static bool cached = false;
+      static bool have_cache = false;
+      std::lock_guard lock {m};
+      const auto now = std::chrono::steady_clock::now();
+      if (have_cache && now - checked_at < 10s) {
+        return cached;
+      }
+      bool found = false;
+      for (const auto &path : plank::ndi::runtime_candidates(env_value)) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(std::filesystem::path {utf_utils::from_utf8(path)}, ec)) {
+          found = true;
+          break;
+        }
+      }
+      cached = found;
+      checked_at = now;
+      have_cache = true;
+      return found;
+    }
+
+    std::string computer_name() {
+      wchar_t buffer[MAX_COMPUTERNAME_LENGTH + 1] {};
+      DWORD size = static_cast<DWORD>(std::size(buffer));
+      if (!GetComputerNameW(buffer, &size)) {
+        return {};
+      }
+      return utf_utils::to_utf8(std::wstring {buffer, size});
+    }
   }  // namespace
 
   std::unique_ptr<platf::deinit_t> start() {
-    if (!config::ndi.enabled) {
+    if (!config::ndi.enabled && !config::ndi.available) {
       return nullptr;
     }
 
@@ -384,9 +550,47 @@ namespace platf::ndi_output {
     options.name = config::ndi.source_name;
     options.groups = config::ndi.groups;
 
-    BOOST_LOG(info) << "NDI output is on: starting the plank-ndi helper for "sv
-                    << (config::ndi.all_outputs ? "all screens"sv : "the primary screen"sv)
-                    << " at up to "sv << options.fps << " fps (no audio)"sv;
-    return std::make_unique<ndi_output_t>(exe, std::move(options));
+    if (config::ndi.available) {
+      BOOST_LOG(info) << "NDI output is available: it stays off until someone switches it on in the PLANK client (ndi_auto_off_minutes = "sv
+                      << config::ndi.auto_off_minutes << ')';
+    } else {
+      BOOST_LOG(info) << "NDI output is on: starting the plank-ndi helper for "sv
+                      << (config::ndi.all_outputs ? "all screens"sv : "the primary screen"sv)
+                      << " at up to "sv << options.fps << " fps (no audio)"sv;
+    }
+    return std::make_unique<ndi_output_t>(exe, std::move(options), config::ndi.enabled);
+  }
+
+  status_t status() {
+    status_t result;
+    std::lock_guard lock {ndi_output_t::registry_mutex()};
+    auto *self = ndi_output_t::registry();
+    if (!self) {
+      return result;
+    }
+    const bool usable = runtime_installed();
+    result.report = plank::ndi::report_state(self->always_on() ? plank::ndi::mode_e::on : plank::ndi::mode_e::available, usable, self->running());
+    if (result.report == plank::ndi::report_e::on || result.report == plank::ndi::report_e::always) {
+      result.source_names = plank::ndi::source_label(self->options().name, computer_name(), self->options().scope == plank::ndi::scope_e::all);
+    }
+    return result;
+  }
+
+  toggle_result_e set_enabled(bool on, bool session_active, std::string_view who) {
+    std::lock_guard lock {ndi_output_t::registry_mutex()};
+    auto *self = ndi_output_t::registry();
+    if (!self) {
+      return toggle_result_e::unavailable;
+    }
+    if (self->always_on()) {
+      return toggle_result_e::always_on;
+    }
+    if (on && !runtime_installed()) {
+      return toggle_result_e::unavailable;
+    }
+    if (self->request(on, session_active)) {
+      BOOST_LOG(info) << "NDI switched "sv << (on ? "on"sv : "off"sv) << " by "sv << who;
+    }
+    return toggle_result_e::ok;
   }
 }  // namespace platf::ndi_output
