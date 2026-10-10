@@ -3107,7 +3107,22 @@ namespace video {
    * @param config Configuration values to apply.
    * @return Constructed port object.
    */
+  namespace {
+    std::mutex capture_area_mutex;  ///< Guards latest_capture_area.
+    std::optional<capture_area_t> latest_capture_area;  ///< Area of the most recently started capture.
+  }  // namespace
+
+  std::optional<capture_area_t> current_capture_area() {
+    std::lock_guard lock {capture_area_mutex};
+    return latest_capture_area;
+  }
+
   input::touch_port_t make_port(platf::display_t *display, const config_t &config) {
+    {
+      // Every capture start and display change builds a touch port here.
+      std::lock_guard lock {capture_area_mutex};
+      latest_capture_area = capture_area_t {display->offset_x, display->offset_y, display->width, display->height};
+    }
     float wd = display->width;
     float hd = display->height;
 

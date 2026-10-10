@@ -26,6 +26,26 @@ extern "C" {
 struct AVPacket;
 
 namespace video {
+  /**
+   * @brief Desktop area the running capture covers, in virtual-desktop pixels from its top-left.
+   */
+  struct capture_area_t {
+    int offset_x {};  ///< Left edge relative to the virtual desktop origin.
+    int offset_y {};  ///< Top edge relative to the virtual desktop origin.
+    int width {};  ///< Width in physical pixels.
+    int height {};  ///< Height in physical pixels.
+  };
+
+  /**
+   * @brief The area the most recently started capture covers.
+   *
+   * Lets the pointer position be mapped into the picture actually streamed
+   * (one output or a span) rather than the whole virtual desktop.
+   *
+   * @return The area, or no value before any capture has started.
+   */
+  std::optional<capture_area_t> current_capture_area();
+
 
   enum class capture_source_e {
     configured,

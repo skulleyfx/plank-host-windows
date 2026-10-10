@@ -1149,22 +1149,38 @@ namespace stream {
       return false;
     }
 
+    // The pointer is sampled in virtual-desktop coordinates, but the stream
+    // shows only what the capture covers: one output, or the span of them.
+    // Map against that area so the position lands where it is in the
+    // picture; on a two-monitor host streaming one screen, mapping against
+    // the whole virtual desktop halved x and shifted y.
+    int area_x = 0;
+    int area_y = 0;
+    int area_width = root_position.desktop_width;
+    int area_height = root_position.desktop_height;
+    if (const auto area = video::current_capture_area(); area && area->width > 0 && area->height > 0) {
+      area_x = area->offset_x;
+      area_y = area->offset_y;
+      area_width = area->width;
+      area_height = area->height;
+    }
+
     const auto frame_width = session->config.monitor.width;
     const auto frame_height = session->config.monitor.height;
     const auto scale = std::min(
-      frame_width / static_cast<double>(root_position.desktop_width),
-      frame_height / static_cast<double>(root_position.desktop_height)
+      frame_width / static_cast<double>(area_width),
+      frame_height / static_cast<double>(area_height)
     );
     const auto content_width = std::max(
-      1, static_cast<int>(root_position.desktop_width * scale));
+      1, static_cast<int>(area_width * scale));
     const auto content_height = std::max(
-      1, static_cast<int>(root_position.desktop_height * scale));
+      1, static_cast<int>(area_height * scale));
     const auto content_x = (frame_width - content_width) / 2;
     const auto content_y = (frame_height - content_height) / 2;
     const auto root_x = std::clamp(
-      root_position.x, 0, root_position.desktop_width - 1);
+      root_position.x - area_x, 0, area_width - 1);
     const auto root_y = std::clamp(
-      root_position.y, 0, root_position.desktop_height - 1);
+      root_position.y - area_y, 0, area_height - 1);
     const auto frame_x = std::clamp(
       content_x + static_cast<int>(std::lround(root_x * scale)), 0, frame_width - 1
     );
