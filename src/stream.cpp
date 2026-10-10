@@ -441,16 +441,22 @@ namespace stream {
         if (!session->broadcast_ref) {
           break;
         }
+        bool removed = false;
         auto viewers = session->broadcast_ref->viewers.lock();
         for (auto *viewer : *session->broadcast_ref->viewers) {
           if (viewer->controller_id == session && viewer->viewer_id == message.id && !viewer->admin_observer) {
             BOOST_LOG(info) << "Shared screen viewer "sv << viewer->authenticated_account << " removed by the owner"sv;
+            removed = true;
 #ifdef PLANK_TRANSPORT
             session::stop(*viewer, PLANK_TRANSPORT_TERMINATION_GRACEFUL);
 #else
             session::stop(*viewer);
 #endif
           }
+        }
+        if (!removed) {
+          BOOST_LOG(info) << "Shared screen: the owner asked to remove viewer "sv << message.id
+                          << ", which is no longer attached"sv;
         }
         break;
       }
