@@ -43,8 +43,12 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/plank_ndi.h"
-#include "src/stream.h"
 #include "utf_utils.h"
+
+// Declared in src/stream.h, which can't be included after <Windows.h> (WinSock order).
+namespace stream::session {
+  unsigned running_count();
+}  // namespace stream::session
 
 using namespace std::literals;
 
