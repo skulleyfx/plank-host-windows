@@ -303,7 +303,9 @@ TEST(PlankTopology, PublishesTheDisplayALiveStreamHolds) {
   // the topology a second client or a viewer reads must keep it.
   EXPECT_TRUE(topology::topology_keeps_output(topology::duplication_probe::capturable));
   EXPECT_TRUE(topology::topology_keeps_output(topology::duplication_probe::held_by_host));
-  // Displays nobody can capture (secure desktop, wrong adapter) stay out.
+  // Access denied right after a rearrangement is transient; the display stays.
+  EXPECT_TRUE(topology::topology_keeps_output(topology::duplication_probe::access_denied));
+  // Displays that cannot be duplicated at all (wrong adapter) stay out.
   EXPECT_FALSE(topology::topology_keeps_output(topology::duplication_probe::unavailable));
   static_assert(topology::topology_keeps_output(topology::duplication_probe::held_by_host));
 }

@@ -1442,6 +1442,15 @@ namespace nvhttp {
       return false;
     }
     if (validation == plank::topology::layout_error::unhealthy) {
+      if (just_transitioned) {
+        // The displays were rearranged a moment ago and the capture does not
+        // list them all yet: let the client retry, as for a mode not yet live,
+        // rather than give the displays back and fail the session.
+        tree.put("root.<xmlattr>.status_code", 425);
+        tree.put("root.<xmlattr>.status_message",
+                 "PLANK host display transition started");
+        return false;
+      }
       tree.put("root.<xmlattr>.status_code", 409);
       tree.put("root.<xmlattr>.status_message", "Configured host display layout is not healthy");
       return false;

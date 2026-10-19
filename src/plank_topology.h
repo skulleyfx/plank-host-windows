@@ -201,7 +201,8 @@ namespace plank::topology {
   enum class duplication_probe {
     capturable,  ///< DuplicateOutput succeeded.
     held_by_host,  ///< DuplicateOutput answered E_INVALIDARG: this process already duplicates the output.
-    unavailable,  ///< Any other failure: access denied, wrong adapter, secure desktop.
+    access_denied,  ///< DuplicateOutput answered E_ACCESSDENIED: a mode change or desktop switch is settling.
+    unavailable,  ///< Any other failure, such as an output on an adapter that cannot duplicate it.
   };
 
   /**
@@ -214,6 +215,13 @@ namespace plank::topology {
    * published the artist's other monitor with the lease's mode, and the client
    * refused it ("Invalid composite source rectangle or output provenance").
    * A display the host itself is streaming is capturable.
+   *
+   * The enumeration probe does not retry access denied. Right after the host
+   * rearranged the displays for a two-screen session, one of them answered
+   * access denied for a moment, the recheck saw one output for a two-screen
+   * lease, and the launch failed as "display layout is not healthy". The
+   * display is still the workstation's screen; the capture itself resyncs the
+   * desktop and retries when it opens it.
    *
    * @param probe What probing the output found.
    * @return True when the output is published.

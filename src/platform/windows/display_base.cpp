@@ -1114,9 +1114,10 @@ namespace platf {
   /**
    * @brief Names of the attached outputs Desktop Duplication can capture.
    *
-   * @param keep_held Also keep outputs this process already duplicates for a
-   *        live stream. The capture's own display selection leaves them out;
-   *        the published topology keeps them (plank::topology::topology_keeps_output()).
+   * @param keep_held Also keep outputs the probe could not duplicate only because
+   *        this process already duplicates them or access is briefly denied.
+   *        The capture's own display selection leaves them out; the published
+   *        topology keeps them (plank::topology::topology_keeps_output()).
    * @return GDI device names, in DXGI enumeration order.
    */
   static std::vector<std::string> duplicable_output_names(bool keep_held) {
@@ -1185,6 +1186,8 @@ namespace platf {
                              plank::topology::duplication_probe::capturable :
                            probe_status == E_INVALIDARG ?
                              plank::topology::duplication_probe::held_by_host :
+                           probe_status == E_ACCESSDENIED ?
+                             plank::topology::duplication_probe::access_denied :
                              plank::topology::duplication_probe::unavailable;
         if (probe == plank::topology::duplication_probe::capturable ||
             (keep_held && plank::topology::topology_keeps_output(probe))) {
