@@ -43,6 +43,7 @@ typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE : DWORD {
 #include "src/display_device.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/plank_topology.h"
 #include "src/video.h"
 
 namespace platf {
@@ -364,10 +365,11 @@ namespace platf::dxgi {
    * @param adapter The DXGI adapter to use for capture.
    * @param output The DXGI output to capture.
    * @param enumeration_only Specifies whether this test is occurring for display enumeration.
+   * @param last_status Optional; receives the last DuplicateOutput() status on failure.
    *
    * @return True when Desktop Duplication can capture the requested output.
    */
-  bool test_dxgi_duplication(adapter_t &adapter, output_t &output, bool enumeration_only) {
+  bool test_dxgi_duplication(adapter_t &adapter, output_t &output, bool enumeration_only, HRESULT *last_status = nullptr) {
     D3D_FEATURE_LEVEL featureLevels[] {
       D3D_FEATURE_LEVEL_11_1,
       D3D_FEATURE_LEVEL_11_0,
@@ -421,13 +423,23 @@ namespace platf::dxgi {
 
       // If we're not resyncing the thread desktop and we don't have permission to
       // capture the current desktop, just bail immediately. Retrying won't help.
-      if (enumeration_only && status == E_ACCESSDENIED) {
+      // E_INVALIDARG means this process already duplicates the output (a live
+      // stream holds it), which a retry cannot change either.
+      if (enumeration_only && (status == E_ACCESSDENIED || status == E_INVALIDARG)) {
         break;
       } else {
         std::this_thread::sleep_for(200ms);
       }
     }
 
+    if (last_status != nullptr) {
+      *last_status = status;
+    }
+    if (enumeration_only && status == E_INVALIDARG) {
+      BOOST_LOG(debug) << "DuplicateOutput() test: output is already duplicated by this host [0x"sv
+                       << util::hex(status).to_string_view() << ']';
+      return false;
+    }
     BOOST_LOG(error) << "DuplicateOutput() test failed [0x"sv << util::hex(status).to_string_view() << ']';
     return false;
   }
@@ -1099,7 +1111,15 @@ namespace platf {
     }
   }  // namespace
 
-  std::vector<std::string> display_names(mem_type_e) {
+  /**
+   * @brief Names of the attached outputs Desktop Duplication can capture.
+   *
+   * @param keep_held Also keep outputs this process already duplicates for a
+   *        live stream. The capture's own display selection leaves them out;
+   *        the published topology keeps them (plank::topology::topology_keeps_output()).
+   * @return GDI device names, in DXGI enumeration order.
+   */
+  static std::vector<std::string> duplicable_output_names(bool keep_held) {
     std::vector<std::string> display_names;
 
     HRESULT status;
@@ -1157,13 +1177,27 @@ namespace platf {
           << std::endl;
 
         // Don't include the display in the list if we can't actually capture it
-        if (desc.AttachedToDesktop && dxgi::test_dxgi_duplication(adapter, output, true)) {
+        if (!desc.AttachedToDesktop) {
+          continue;
+        }
+        HRESULT probe_status = S_OK;
+        const auto probe = dxgi::test_dxgi_duplication(adapter, output, true, &probe_status) ?
+                             plank::topology::duplication_probe::capturable :
+                           probe_status == E_INVALIDARG ?
+                             plank::topology::duplication_probe::held_by_host :
+                             plank::topology::duplication_probe::unavailable;
+        if (probe == plank::topology::duplication_probe::capturable ||
+            (keep_held && plank::topology::topology_keeps_output(probe))) {
           display_names.emplace_back(std::move(device_name));
         }
       }
     }
 
     return display_names;
+  }
+
+  std::vector<std::string> display_names(mem_type_e) {
+    return duplicable_output_names(false);
   }
 
   /**
@@ -1190,7 +1224,10 @@ namespace platf {
 
   std::vector<display_info_t> display_infos(mem_type_e hwdevice_type) {
     std::vector<display_info_t> outputs;
-    for (const auto &name : display_names(hwdevice_type)) {
+    // The topology describes the workstation's screens, including the ones a
+    // live stream is capturing right now; see topology_keeps_output().
+    (void) hwdevice_type;
+    for (const auto &name : duplicable_output_names(true)) {
       // PLANK clients reject outputs without geometry, so read the active mode
       // for each GDI device name DXGI reported.
       DEVMODEW mode {};

@@ -195,6 +195,33 @@ namespace plank::topology {
     return lease_held && !stream_started && armed_generation == current_generation && launch_pending;
   }
 
+  /**
+   * @brief What a Desktop Duplication probe of one output found.
+   */
+  enum class duplication_probe {
+    capturable,  ///< DuplicateOutput succeeded.
+    held_by_host,  ///< DuplicateOutput answered E_INVALIDARG: this process already duplicates the output.
+    unavailable,  ///< Any other failure: access denied, wrong adapter, secure desktop.
+  };
+
+  /**
+   * @brief Whether an output belongs in the published output topology.
+   *
+   * A live stream holds the duplication of every display it captures, so a probe
+   * during it fails for exactly those displays. Dropping them made a second
+   * client, or a second account asking to watch, read a topology without the
+   * leased screen: the lease then matched none of the outputs, the host
+   * published the artist's other monitor with the lease's mode, and the client
+   * refused it ("Invalid composite source rectangle or output provenance").
+   * A display the host itself is streaming is capturable.
+   *
+   * @param probe What probing the output found.
+   * @return True when the output is published.
+   */
+  constexpr bool topology_keeps_output(duplication_probe probe) {
+    return probe != duplication_probe::unavailable;
+  }
+
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {
     return mtu >= 1200 && mtu <= 65527;
   }

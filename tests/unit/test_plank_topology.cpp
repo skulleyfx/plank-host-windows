@@ -296,3 +296,14 @@ TEST(PlankTopology, LeaseTimerWaitsForAnAcceptedLaunch) {
   EXPECT_FALSE(topology::lease_timer_should_rearm(true, true, 4, 4, true));
   EXPECT_FALSE(topology::lease_timer_should_rearm(false, false, 4, 4, true));
 }
+
+TEST(PlankTopology, PublishesTheDisplayALiveStreamHolds) {
+  // A probe during a live stream fails for the display the stream captures
+  // (E_INVALIDARG). That display is still the workstation's leased screen, so
+  // the topology a second client or a viewer reads must keep it.
+  EXPECT_TRUE(topology::topology_keeps_output(topology::duplication_probe::capturable));
+  EXPECT_TRUE(topology::topology_keeps_output(topology::duplication_probe::held_by_host));
+  // Displays nobody can capture (secure desktop, wrong adapter) stay out.
+  EXPECT_FALSE(topology::topology_keeps_output(topology::duplication_probe::unavailable));
+  static_assert(topology::topology_keeps_output(topology::duplication_probe::held_by_host));
+}
