@@ -309,3 +309,17 @@ TEST(PlankTopology, PublishesTheDisplayALiveStreamHolds) {
   EXPECT_FALSE(topology::topology_keeps_output(topology::duplication_probe::unavailable));
   static_assert(topology::topology_keeps_output(topology::duplication_probe::held_by_host));
 }
+
+TEST(PlankTopology, ClassifiesDuplicationProbeResults) {
+  // The HRESULTs the render05 log shows: 0x80070057 while the host's own
+  // stream held the display, 0x80070005 right after a rearrangement.
+  EXPECT_EQ(topology::classify_duplication_probe(true, 0x80070057U), topology::duplication_probe::capturable);
+  EXPECT_EQ(topology::classify_duplication_probe(false, 0x80070057U), topology::duplication_probe::held_by_host);
+  EXPECT_EQ(topology::classify_duplication_probe(false, 0x80070005U), topology::duplication_probe::access_denied);
+  // DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, and the S_OK a
+  // probe leaves when it failed before DuplicateOutput() (no device) stay out.
+  EXPECT_EQ(topology::classify_duplication_probe(false, 0x887A0004U), topology::duplication_probe::unavailable);
+  EXPECT_EQ(topology::classify_duplication_probe(false, 0x887A0022U), topology::duplication_probe::unavailable);
+  EXPECT_EQ(topology::classify_duplication_probe(false, 0U), topology::duplication_probe::unavailable);
+  EXPECT_FALSE(topology::topology_keeps_output(topology::classify_duplication_probe(false, 0x887A0004U)));
+}

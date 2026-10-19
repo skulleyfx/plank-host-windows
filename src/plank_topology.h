@@ -230,6 +230,30 @@ namespace plank::topology {
     return probe != duplication_probe::unavailable;
   }
 
+  /**
+   * @brief Classify one DuplicateOutput() probe from its result.
+   *
+   * Kept free of Windows headers so the mapping is unit tested.
+   *
+   * @param succeeded Whether the probe duplicated the output.
+   * @param status The last DuplicateOutput() HRESULT, as its 32-bit pattern.
+   * @return What the probe found.
+   */
+  constexpr duplication_probe classify_duplication_probe(bool succeeded, std::uint32_t status) {
+    constexpr std::uint32_t e_invalidarg = 0x80070057U;
+    constexpr std::uint32_t e_accessdenied = 0x80070005U;
+    if (succeeded) {
+      return duplication_probe::capturable;
+    }
+    if (status == e_invalidarg) {
+      return duplication_probe::held_by_host;
+    }
+    if (status == e_accessdenied) {
+      return duplication_probe::access_denied;
+    }
+    return duplication_probe::unavailable;
+  }
+
   constexpr bool valid_quic_udp_payload_mtu(std::uint32_t mtu) {
     return mtu >= 1200 && mtu <= 65527;
   }

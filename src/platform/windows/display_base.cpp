@@ -1182,13 +1182,10 @@ namespace platf {
           continue;
         }
         HRESULT probe_status = S_OK;
-        const auto probe = dxgi::test_dxgi_duplication(adapter, output, true, &probe_status) ?
-                             plank::topology::duplication_probe::capturable :
-                           probe_status == E_INVALIDARG ?
-                             plank::topology::duplication_probe::held_by_host :
-                           probe_status == E_ACCESSDENIED ?
-                             plank::topology::duplication_probe::access_denied :
-                             plank::topology::duplication_probe::unavailable;
+        const bool duplicated = dxgi::test_dxgi_duplication(adapter, output, true, &probe_status);
+        const auto probe = plank::topology::classify_duplication_probe(
+          duplicated, static_cast<std::uint32_t>(probe_status)
+        );
         if (probe == plank::topology::duplication_probe::capturable ||
             (keep_held && plank::topology::topology_keeps_output(probe))) {
           display_names.emplace_back(std::move(device_name));
