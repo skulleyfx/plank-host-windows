@@ -1780,8 +1780,17 @@ namespace nvhttp {
 #endif
   }
 
+  /**
+   * @brief Check the client's capture source before a launch.
+   *
+   * @param joins_running_capture True for a shared screen viewer whose source matches the
+   *        running stream: it reuses that capture, so the readiness probe is skipped. The
+   *        probe would fail anyway, because DuplicateOutput is refused for a display this
+   *        process is already duplicating.
+   */
   bool validate_capture_source(session_stream::launch_session_t &session,
-                               pt::ptree &tree) {
+                               pt::ptree &tree,
+                               bool joins_running_capture = false) {
     if (session.plank_protocol_version != plank_topology_version ||
         (session.plank_feature_flags &
          plank_feature_capture_source_selection) == 0) {
@@ -1796,7 +1805,7 @@ namespace nvhttp {
                "Unsupported PLANK capture source");
       return false;
     }
-    if (!plank_capture_source_ready(session.capture_source)) {
+    if (!joins_running_capture && !plank_capture_source_ready(session.capture_source)) {
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message",
                "Requested PLANK capture source is unavailable");
@@ -2372,7 +2381,8 @@ namespace nvhttp {
       return true;
     }
 
-    if (!validate_capture_source(*launch_session, tree) ||
+    // admit_viewer() only admits a launch whose capture source matches the running stream.
+    if (!validate_capture_source(*launch_session, tree, true) ||
         !validate_encoder_backend(*launch_session, tree) ||
         !validate_transport_mtu(*launch_session, tree)) {
       tree.put(result_field, 0);
